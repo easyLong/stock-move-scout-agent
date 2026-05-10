@@ -250,10 +250,24 @@ feed/queries.py
 
 feed/evidence_view.py
   负责证据层归一化、裁剪、摘要卡片和分层展示模型。
+  展示层不完全信任 SQL 里的 layer 字段，会按来源和用途重新划分实时/异步。
 
 scripts/stock_scout_web.py
   /api/feed 为每行附加 evidence_view。
   前端优先读取 evidence_view，旧的 evidence_items/detail 解析逻辑保留兜底。
+```
+
+当前分层规则：
+
+```text
+实时层：
+  实时扫描、扫描触发、同锚扩散、问财区间排名。
+  判断引擎生成的持续性、核心支撑。
+  实时扫描带出的题材证据、个股证据。
+
+异步层：
+  事实卡、龙虎榜、模型总结、核心证据、影响要素。
+  最大瑕疵、证据缺口、持续依据等补充验证内容。
 ```
 
 下一步建议：

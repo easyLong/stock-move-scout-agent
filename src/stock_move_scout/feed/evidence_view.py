@@ -9,7 +9,7 @@ EVIDENCE_VIEW_VERSION = 1
 
 LAYER_META = {
     "realtime": {"key": "实时证据", "title": "实时链路证据", "hint": "随扫描即时产生", "class_name": "realtime"},
-    "async": {"key": "异步证据", "title": "短线决策证据", "hint": "只保留有用信息", "class_name": "async"},
+    "async": {"key": "异步证据", "title": "补充验证证据", "hint": "事实卡/模型/龙虎榜补强", "class_name": "async"},
 }
 
 TYPE_META = {
@@ -88,6 +88,11 @@ ASYNC_DECISION_PRIORITY = {
 
 USEFUL_DECISION_LABELS = {"关键事实", "龙虎榜席位", "区间领头", "主动性", "带动性", "持续依据", "最大瑕疵", "证据缺口", "持续性"}
 
+REALTIME_LABELS = {"实时判断", "区间领头", "主动性", "带动性"}
+JUDGEMENT_REALTIME_LABELS = {"持续性", "核心支撑"}
+REALTIME_SOURCE_PREFIXES = ("实时扫描", "扫描触发", "同锚扩散", "问财区间排名")
+REALTIME_DIRECT_SOURCES = {"题材解释", "个股解释"}
+
 
 def clean(value: Any) -> str:
     return " ".join(str(value or "").replace("\r", "").split())
@@ -128,6 +133,20 @@ def normalize_layer(value: Any) -> str:
     return "实时证据"
 
 
+def display_layer(origin_layer: str, label: str, source: str, evidence_type: str) -> str:
+    if label in REALTIME_LABELS:
+        return "实时证据"
+    if label in JUDGEMENT_REALTIME_LABELS and source.startswith("判断引擎"):
+        return "实时证据"
+    if evidence_type == "realtime":
+        return "实时证据"
+    if source in REALTIME_DIRECT_SOURCES and origin_layer == "实时证据":
+        return "实时证据"
+    if any(source.startswith(prefix) for prefix in REALTIME_SOURCE_PREFIXES):
+        return "实时证据"
+    return origin_layer
+
+
 def normalize_item(item: Any) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
@@ -137,11 +156,14 @@ def normalize_item(item: Any) -> dict[str, Any] | None:
         return None
     evidence_type = clean(item.get("type") or LABEL_TYPE.get(label, "event"))
     meta = meta_for(label, evidence_type)
+    origin_layer = normalize_layer(item.get("layer"))
+    source = clean(item.get("source") or meta["source"])
     return {
-        "layer": normalize_layer(item.get("layer")),
+        "layer": display_layer(origin_layer, label, source, evidence_type),
+        "origin_layer": origin_layer,
         "label": label,
         "type": evidence_type,
-        "source": clean(item.get("source") or meta["source"]),
+        "source": source,
         "body": body,
         "payload": item.get("payload"),
         "priority": int(float(item.get("priority", meta["priority"]) or meta["priority"])),
@@ -236,8 +258,6 @@ def concise_body(item: dict[str, Any]) -> str:
 
 def curate_items(items: list[dict[str, Any]], layer: str) -> list[dict[str, Any]]:
     scoped = [item for item in items if item.get("layer") == layer]
-    if layer == "实时证据" and any(item.get("layer") == "异步证据" and useful_decision_item(item) for item in items):
-        return []
     if layer == "异步证据":
         decision_items = [item for item in scoped if useful_decision_item(item)]
         if decision_items:
@@ -251,7 +271,7 @@ def curate_items(items: list[dict[str, Any]], layer: str) -> list[dict[str, Any]
             scoped = [item for item in scoped if item.get("label") not in {"核心结论", "异动质量", "锚点一致性"}]
         if has_judgement:
             scoped = [item for item in scoped if item.get("label") not in {"公告", "事件", "题材"}]
-    return prepare_sections(scoped, 6 if layer == "异步证据" else 1)
+    return prepare_sections(scoped, 6 if layer == "异步证据" else 5)
 
 
 def prepare_sections(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
