@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "universe": {
+    "source_csv": "data/stock/tdx_a_stock_universe.csv",
+    "cold_universe_csv": "data/stock/stock_scout_cold_universe.csv",
+    "include_markets": [0, 1],
+    "include_code_prefixes": [
+      "000",
+      "001",
+      "002",
+      "003",
+      "300",
+      "301",
+      "600",
+      "601",
+      "603",
+      "605",
+      "688",
+      "689"
+    ],
+    "exclude_st": true,
+    "exclude_delisted": true,
+    "exclude_name_contains": ["ST", "*ST", "退市", "退"]
+  },
+  "sources": {
+    "hot_tdx_window": {
+      "tier": "hot",
+      "enabled": true,
+      "trigger": "external_window_agent",
+      "trading_sessions": ["09:30-11:30", "13:00-15:00"],
+      "note": "15秒扫描和5分钟Top5由前置窗口Agent负责。"
+    },
+    "hot_xueqiu_community": {
+      "tier": "hot",
+      "enabled": true,
+      "mode": "cache",
+      "live_mode_note": "Only manual live refresh should open logged-in Chrome; automatic workers reuse cached DB posts to avoid stealing focus.",
+      "cache_hours": 72,
+      "trigger": "evidence_worker",
+      "scope": "window_evidence_candidates",
+      "interval_seconds": 600
+    },
+    "cold_company_profile": {
+      "tier": "cold",
+      "enabled": true,
+      "scope": "all_sh_sz_a_exclude_st_delisted",
+      "refresh_mode": "manual_init_or_on_demand",
+      "refresh_interval_days": 3650,
+      "batch_size": 100,
+      "sources": ["ths_root_profile"],
+      "output_csv": "data/stock/company_profile_batch_latest.csv",
+      "cache_json": "data/stock/cache/official_site_evidence_cache.json"
+    },
+    "ths_root_extended_items": {
+      "tier": "cold",
+      "enabled": true,
+      "scope": "all_sh_sz_a_exclude_st_delisted",
+      "refresh_mode": "nightly_full_batch",
+      "refresh_interval_seconds": 86400,
+      "preferred_start_time": "22:00:00",
+      "batch_size": 100,
+      "sources": ["ths_root_important_event", "ths_root_announcement", "ths_theme_key_points"],
+      "cache_json": "data/stock/cache/official_site_evidence_cache.json"
+    },
+    "morning_market_news": {
+      "tier": "warm",
+      "enabled": true,
+      "scope": "market_headlines",
+      "refresh_mode": "daily_morning",
+      "preferred_start_time": "08:30:00",
+      "refresh_interval_seconds": 86400,
+      "window": "yesterday_after_close_to_now",
+      "important_only": true,
+      "sources": ["cls_headline", "cls_telegraph_important", "wallstreetcn_headline", "wallstreetcn_live_important"]
+    },
+    "daily_market_themes": {
+      "tier": "warm",
+      "enabled": true,
+      "scope": "market_theme_radar",
+      "refresh_mode": "daily_morning_after_news",
+      "preferred_start_time": "08:35:00",
+      "refresh_interval_seconds": 86400,
+      "depends_on": ["morning_market_news"],
+      "sources": ["market_news_items"]
+    },
+    "auction_candidates": {
+      "tier": "hot",
+      "enabled": true,
+      "scope": "a_share_call_auction",
+      "refresh_mode": "09:20_09:25_minute_radar_then_final_candidates",
+      "preferred_start_time": "09:20:00",
+      "trading_session": "09:20-09:25",
+      "depends_on": ["daily_market_themes"],
+      "minute_analysis": ["pct_top10_theme_hits", "largest_limit_up_sealed_orders", "largest_limit_down_sealed_orders"],
+      "final_score_formula": ["auction_pct", "auction_amount", "theme_matches", "sector_resonance"]
+    }
+  }
+}

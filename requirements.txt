@@ -1,0 +1,8 @@
+akshare
+beautifulsoup4
+fastapi
+pandas
+pytdx
+pywencai
+requests
+uvicorn

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-move-scout-agent"
+version = "0.1.0"
+description = "A-share intraday stock move scouting, theme attribution, evidence analysis, and intelligence feed."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "akshare",
+  "beautifulsoup4",
+  "fastapi",
+  "pandas",
+  "pytdx",
+  "pywencai",
+  "requests",
+  "uvicorn",
+]
+
+[project.scripts]
+stock-move-scout = "stock_move_scout.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
