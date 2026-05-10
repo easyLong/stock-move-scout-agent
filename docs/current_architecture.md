@@ -585,11 +585,11 @@ stock-move-scout <command> [args...]
 常用命令：
 
 ```powershell
-stock-move-scout web --mysql-enabled --mysql-password 123456
-stock-move-scout scheduler --mysql-enabled --mysql-password 123456
-stock-move-scout worker --worker-types hot,warm --mysql-enabled --mysql-password 123456
-stock-move-scout scan-window --once --mysql-primary --mysql-enabled --mysql-password 123456 --no-file-output
-stock-move-scout judgements --trade-date 2026-05-08 --latest-only --mysql-enabled --mysql-password 123456
+stock-move-scout web --mysql-enabled --mysql-password <MYSQL_PASSWORD>
+stock-move-scout scheduler --mysql-enabled --mysql-password <MYSQL_PASSWORD>
+stock-move-scout worker --worker-types hot,warm --mysql-enabled --mysql-password <MYSQL_PASSWORD>
+stock-move-scout scan-window --once --mysql-primary --mysql-enabled --mysql-password <MYSQL_PASSWORD> --no-file-output
+stock-move-scout judgements --trade-date 2026-05-08 --latest-only --mysql-enabled --mysql-password <MYSQL_PASSWORD>
 ```
 
 兼容脚本入口仍保留在 `scripts/`。

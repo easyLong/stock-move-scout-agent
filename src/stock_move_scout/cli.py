@@ -38,9 +38,9 @@ def print_help() -> None:
         "Commands:\n"
         f"{commands}\n\n"
         "Examples:\n"
-        "  stock-move-scout web --mysql-enabled --mysql-password 123456\n"
-        "  stock-move-scout scheduler --mysql-enabled --mysql-password 123456\n"
-        "  stock-move-scout worker --worker-types hot,warm --mysql-enabled --mysql-password 123456\n"
+        "  stock-move-scout web --mysql-enabled --mysql-password <MYSQL_PASSWORD>\n"
+        "  stock-move-scout scheduler --mysql-enabled --mysql-password <MYSQL_PASSWORD>\n"
+        "  stock-move-scout worker --worker-types hot,warm --mysql-enabled --mysql-password <MYSQL_PASSWORD>\n"
         "  stock-move-scout sources\n"
     )
 

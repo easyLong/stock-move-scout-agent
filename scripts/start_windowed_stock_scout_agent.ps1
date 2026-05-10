@@ -16,8 +16,8 @@ $errPath = Join-Path $logDir "windowed_stock_scout_agent.err.log"
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
-$secretPath = "G:\常用\gpt账号密码.txt"
-if (Test-Path -LiteralPath $secretPath) {
+$secretPath = $env:OPENAI_ENV_FILE
+if ($secretPath -and (Test-Path -LiteralPath $secretPath)) {
     $content = Get-Content -LiteralPath $secretPath -Raw -Encoding UTF8
     foreach ($name in @("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL")) {
         $pattern = '(?im)^\s*(?:\$env:)?' + [regex]::Escape($name) + '\s*=\s*["'']?([^"''\r\n]+)["'']?\s*$'

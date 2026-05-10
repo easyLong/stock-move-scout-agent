@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--import-model-config-file", default="")
     parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
     parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or "https://api.openai.com/v1")
-    parser.add_argument("--api-key-file", default=os.environ.get("OPENAI_API_KEY_FILE", r"G:\常用\gpt账号密码.txt"))
+    parser.add_argument("--api-key-file", default=os.environ.get("OPENAI_API_KEY_FILE", ""))
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--fallback-without-model", action="store_true")
     parser.add_argument("--force", action="store_true")

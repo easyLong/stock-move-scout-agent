@@ -35,13 +35,13 @@
 ```powershell
 cd C:\Code\stock-move-scout-agent
 powershell -ExecutionPolicy Bypass -Command "python -m pip install -e ."
-powershell -ExecutionPolicy Bypass -File scripts\init_stock_scout_mysql.ps1 -MysqlUser root -MysqlPassword 123456
+powershell -ExecutionPolicy Bypass -File scripts\init_stock_scout_mysql.ps1 -MysqlUser root -MysqlPassword <MYSQL_PASSWORD>
 ```
 
 启动 Web：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start_stock_scout_web.ps1 -MysqlPassword 123456
+powershell -ExecutionPolicy Bypass -File scripts\start_stock_scout_web.ps1 -MysqlPassword <MYSQL_PASSWORD>
 ```
 
 打开：
@@ -53,21 +53,21 @@ http://127.0.0.1:8788/
 启动盘中扫描主链路：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start_windowed_stock_scout_agent.ps1 -MysqlPassword 123456
+powershell -ExecutionPolicy Bypass -File scripts\start_windowed_stock_scout_agent.ps1 -MysqlPassword <MYSQL_PASSWORD>
 ```
 
 启动调度器：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start_stock_scout_scheduler.ps1 -MysqlPassword 123456
+powershell -ExecutionPolicy Bypass -File scripts\start_stock_scout_scheduler.ps1 -MysqlPassword <MYSQL_PASSWORD>
 ```
 
 也可以使用包入口：
 
 ```powershell
-stock-move-scout web --mysql-enabled --mysql-password 123456
-stock-move-scout scheduler --mysql-enabled --mysql-password 123456
-stock-move-scout worker --worker-types hot,warm --mysql-enabled --mysql-password 123456
+stock-move-scout web --mysql-enabled --mysql-password <MYSQL_PASSWORD>
+stock-move-scout scheduler --mysql-enabled --mysql-password <MYSQL_PASSWORD>
+stock-move-scout worker --worker-types hot,warm --mysql-enabled --mysql-password <MYSQL_PASSWORD>
 ```
 
 ## 备注

@@ -24,13 +24,13 @@ generated_posts
 ## 重建证据层
 
 ```powershell
-python scripts\build_stock_evidence_layer.py --mysql-enabled --mysql-user root --mysql-password 123456 --mysql-window-id 20260507_134934 --mysql-write-evidence-layer --no-file-output
+python scripts\build_stock_evidence_layer.py --mysql-enabled --mysql-user root --mysql-password <MYSQL_PASSWORD> --mysql-window-id 20260507_134934 --mysql-write-evidence-layer --no-file-output
 ```
 
 ## 生成最简文案
 
 ```powershell
-python scripts\render_mysql_dav_info_gap_posts.py --mysql-enabled --mysql-user root --mysql-password 123456 --mysql-window-id 20260507_134934
+python scripts\render_mysql_dav_info_gap_posts.py --mysql-enabled --mysql-user root --mysql-password <MYSQL_PASSWORD> --mysql-window-id 20260507_134934
 ```
 
 文案格式固定为：
