@@ -27,6 +27,11 @@ from stock_scout_mysql import MySqlConfig, add_mysql_args, mysql_config_from_arg
 
 
 APP_TITLE = "AI情报引擎"
+CRITICAL_DATA_TASK_IDS = (
+    "iwencai_period_rankings",
+    "lhb_seat_evidence",
+    "ths_limit_up_review",
+)
 
 
 def project_root() -> Path:
@@ -125,6 +130,70 @@ def attach_evidence_views(feed: object) -> object:
     return feed
 
 
+def data_source_health(config: MySqlConfig) -> list[dict[str, object]]:
+    task_ids = ", ".join(sql_string(task_id) for task_id in CRITICAL_DATA_TASK_IDS)
+    sql = f"""
+    SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+      'task_id', task_id,
+      'task_name', task_name,
+      'task_kind', task_kind,
+      'enabled', enabled,
+      'next_run_after', next_run_after,
+      'last_started_at', last_started_at,
+      'last_status', last_status,
+      'health', health,
+      'message', message
+    )), JSON_ARRAY())
+    FROM (
+      SELECT
+        st.task_id,
+        st.task_name,
+        st.task_kind,
+        st.enabled,
+        COALESCE(DATE_FORMAT(st.next_run_after, '%Y-%m-%d %H:%i:%s'), '') AS next_run_after,
+        COALESCE(DATE_FORMAT(last_run.started_at, '%Y-%m-%d %H:%i:%s'), '') AS last_started_at,
+        COALESCE(last_run.status, '') AS last_status,
+        CASE
+          WHEN st.enabled = 0 THEN 'disabled'
+          WHEN COALESCE(last_run.status, '') IN ('failed', 'timeout', 'dead') THEN 'failed'
+          WHEN last_run.started_at IS NULL THEN 'never_run'
+          WHEN last_run.started_at < DATE_SUB(NOW(), INTERVAL 2 DAY) THEN 'stale'
+          ELSE 'ok'
+        END AS health,
+        CASE
+          WHEN st.enabled = 0 THEN '任务未启用'
+          WHEN COALESCE(last_run.status, '') IN ('failed', 'timeout', 'dead') THEN CONCAT('最近运行异常：', last_run.status)
+          WHEN last_run.started_at IS NULL THEN '尚未运行'
+          WHEN last_run.started_at < DATE_SUB(NOW(), INTERVAL 2 DAY) THEN '超过2天未成功刷新'
+          ELSE ''
+        END AS message
+      FROM scheduled_tasks st
+      LEFT JOIN (
+        SELECT tr.*
+        FROM task_runs tr
+        JOIN (
+          SELECT task_id, MAX(started_at) AS started_at
+          FROM task_runs
+          GROUP BY task_id
+        ) latest ON latest.task_id = tr.task_id AND latest.started_at = tr.started_at
+      ) last_run ON last_run.task_id = st.task_id
+      WHERE st.task_id IN ({task_ids})
+      ORDER BY FIELD(st.task_id, {task_ids})
+    ) health_rows;
+    """
+    result = json_query(config, sql, [])
+    return result if isinstance(result, list) else []
+
+
+def attach_data_source_health(status: object, config: MySqlConfig) -> object:
+    if not isinstance(status, dict):
+        return status
+    health = data_source_health(config)
+    status["data_source_health"] = health
+    status["data_source_alerts"] = [item for item in health if item.get("health") not in {"ok", "disabled"}]
+    return status
+
+
 
 
 
@@ -145,12 +214,13 @@ def create_app(config: MySqlConfig) -> FastAPI:
 
     @app.get("/api/top10")
     def api_top10() -> JSONResponse:
+        status = json_query(config, status_sql(), {})
         payload = {
             "window": json_query(config, latest_window_sql(), {}),
             "window_top10": json_query(config, window_top10_sql(), []),
             "auction_top10": json_query(config, auction_top10_sql(), []),
             "latest_scan": json_query(config, latest_scan_sql(), {"run": None, "rows": []}),
-            "status": json_query(config, status_sql(), {}),
+            "status": attach_data_source_health(status, config),
         }
         return JSONResponse(payload)
 
@@ -158,10 +228,11 @@ def create_app(config: MySqlConfig) -> FastAPI:
     def api_feed(trade_date: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
         feed = json_query(config, intel_feed_sql(target_date), [])
+        status = json_query(config, status_sql(target_date), {})
         payload = {
             "trade_date": target_date,
             "feed": attach_evidence_views(feed),
-            "status": json_query(config, status_sql(target_date), {}),
+            "status": attach_data_source_health(status, config),
             "window": json_query(config, latest_window_sql(target_date), {}),
         }
         return JSONResponse(payload)
@@ -1029,12 +1100,14 @@ HTML = r"""<!doctype html>
       const status = data.status || {};
       const windowInfo = data.window || {};
       const tradeDate = data.trade_date || status.trade_date || "最近交易日";
+      const dataAlerts = Array.isArray(status.data_source_alerts) ? status.data_source_alerts : [];
       $("summarybar").innerHTML = [
         `${tradeDate} 扫描 ${status.scan_count_today || 0}`,
         `窗口 ${status.window_count_today || 0}`,
         `有效锚点 ${status.active_anchors || 0}`,
         `最新 ${status.latest_scan_at || "-"}`,
-        windowInfo.window_id ? `当前窗口 ${windowInfo.window_id}` : ""
+        windowInfo.window_id ? `当前窗口 ${windowInfo.window_id}` : "",
+        dataAlerts.length ? `数据源异常 ${dataAlerts.length}` : ""
       ].filter(Boolean).map(x => `<span>${esc(x)}</span>`).join("");
     }
     const EVIDENCE_LAYER_META = {

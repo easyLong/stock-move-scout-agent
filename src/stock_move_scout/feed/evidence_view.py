@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date, datetime, timedelta
 from typing import Any
 
 
-EVIDENCE_VIEW_VERSION = 1
+EVIDENCE_VIEW_VERSION = 2
 
 LAYER_META = {
-    "realtime": {"key": "实时证据", "title": "实时链路证据", "hint": "随扫描即时产生", "class_name": "realtime"},
-    "async": {"key": "异步证据", "title": "补充验证证据", "hint": "事实卡/模型/龙虎榜补强", "class_name": "async"},
+    "live_market": {"key": "行情实时", "title": "行情实时", "hint": "扫描/窗口/盘口即时产生", "class_name": "realtime"},
+    "today_update": {"key": "今日更新", "title": "今日更新", "hint": "交易日当天新增或确认", "class_name": "realtime"},
+    "prev_trade_day": {"key": "前日确认", "title": "前日确认", "hint": "上一交易日盘后或收盘确认", "class_name": "async"},
+    "historical": {"key": "历史背景", "title": "历史背景", "hint": "低频资料，只做题材和基本面背景", "class_name": "async"},
+    "unknown": {"key": "待核时效", "title": "待核时效", "hint": "缺少明确证据日期", "class_name": "async"},
 }
 
 TYPE_META = {
@@ -93,6 +97,32 @@ JUDGEMENT_REALTIME_LABELS = {"持续性", "核心支撑"}
 REALTIME_SOURCE_PREFIXES = ("实时扫描", "扫描触发", "同锚扩散", "问财区间排名")
 REALTIME_DIRECT_SOURCES = {"题材解释", "个股解释"}
 
+FRESHNESS_PRIORITY = {
+    "live_market": 0,
+    "today_update": 1,
+    "prev_trade_day": 2,
+    "historical": 3,
+    "unknown": 4,
+}
+
+FRESHNESS_LABELS = {
+    "live_market": "行情实时",
+    "today_update": "今日更新",
+    "prev_trade_day": "前日确认",
+    "historical": "历史背景",
+    "unknown": "待核时效",
+}
+
+ROLE_PRIORITY = {
+    "trigger": 0,
+    "structure": 1,
+    "fact": 2,
+    "judgement": 3,
+    "risk": 4,
+    "gap": 5,
+    "background": 6,
+}
+
 
 def clean(value: Any) -> str:
     return " ".join(str(value or "").replace("\r", "").split())
@@ -120,6 +150,122 @@ def parse_json_array(value: Any) -> list[Any]:
             return []
         return parsed if isinstance(parsed, list) else []
     return []
+
+
+def parse_date(value: Any) -> date | None:
+    text = str(value or "")
+    if not text:
+        return None
+    for pattern in (r"(\d{4})-(\d{1,2})-(\d{1,2})", r"(\d{4})年(\d{1,2})月(\d{1,2})日"):
+        matches = re.findall(pattern, text)
+        if matches:
+            parsed = []
+            for year, month, day in matches:
+                try:
+                    parsed.append(date(int(year), int(month), int(day)))
+                except ValueError:
+                    pass
+            if parsed:
+                return max(parsed)
+    return None
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    text = clean(value)
+    if not text:
+        return None
+    for candidate, fmt in ((text[:19], "%Y-%m-%d %H:%M:%S"), (text[:10], "%Y-%m-%d")):
+        try:
+            return datetime.strptime(candidate, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def previous_trade_day(value: date) -> date:
+    current = value - timedelta(days=1)
+    while current.weekday() >= 5:
+        current -= timedelta(days=1)
+    return current
+
+
+def event_date(row: dict[str, Any]) -> date | None:
+    event_time = parse_datetime(row.get("event_time"))
+    return event_time.date() if event_time else None
+
+
+def payload_dates(payload: Any) -> list[date]:
+    values = payload if isinstance(payload, list) else [payload]
+    dates: list[date] = []
+    for value in values:
+        if isinstance(value, dict):
+            for key in ("source_date", "date", "trade_date", "post_time", "updated_at", "collected_at"):
+                parsed = parse_date(value.get(key))
+                if parsed:
+                    dates.append(parsed)
+        else:
+            parsed = parse_date(value)
+            if parsed:
+                dates.append(parsed)
+    return dates
+
+
+def infer_evidence_date(item: dict[str, Any]) -> str:
+    dates = payload_dates(item.get("payload"))
+    body_date = parse_date(item.get("body"))
+    if body_date:
+        dates.append(body_date)
+    return max(dates).isoformat() if dates else ""
+
+
+def infer_source_type(label: str, source: str, evidence_type: str) -> str:
+    if source.startswith(("实时扫描", "扫描触发", "同锚扩散", "行情扫描")):
+        return "market"
+    if source.startswith(("问财", "窗口聚合")):
+        return "market_structure"
+    if "龙虎榜" in source or label == "龙虎榜席位":
+        return "lhb"
+    if source.startswith("事实卡"):
+        return "fact_card"
+    if source.startswith(("模型", "判断引擎")):
+        return "model"
+    if source in {"题材解释", "个股解释"} or evidence_type in {"theme", "stock"}:
+        return "theme"
+    if label in {"公告", "事件"}:
+        return "announcement"
+    return "unknown"
+
+
+def infer_role(label: str, source: str, evidence_type: str) -> str:
+    if label in {"实时判断", "主动性"} or source.startswith(("实时扫描", "扫描触发")):
+        return "trigger"
+    if label in {"带动性", "区间领头", "持续性", "核心支撑"} or source.startswith(("同锚扩散", "问财")):
+        return "structure"
+    if label in {"关键事实", "龙虎榜席位", "核心证据", "影响要素", "公告", "事件"}:
+        return "fact"
+    if label in {"异动解释", "异动质量", "锚点一致性", "核心结论", "时效判断", "异步总结"}:
+        return "judgement"
+    if label in {"最大瑕疵", "瑕疵"}:
+        return "risk"
+    if label == "证据缺口":
+        return "gap"
+    if evidence_type in {"theme", "stock"}:
+        return "background"
+    return "fact"
+
+
+def infer_freshness(item: dict[str, Any], row: dict[str, Any]) -> str:
+    if item.get("layer") == "实时证据":
+        return "live_market"
+    item_date = parse_date(item.get("evidence_date"))
+    row_date = event_date(row)
+    if not item_date or not row_date:
+        return "unknown"
+    if item_date >= row_date:
+        return "today_update"
+    if item_date == previous_trade_day(row_date):
+        return "prev_trade_day"
+    return "historical"
 
 
 def meta_for(label: str = "", evidence_type: str = "") -> dict[str, Any]:
@@ -158,7 +304,7 @@ def normalize_item(item: Any) -> dict[str, Any] | None:
     meta = meta_for(label, evidence_type)
     origin_layer = normalize_layer(item.get("layer"))
     source = clean(item.get("source") or meta["source"])
-    return {
+    normalized = {
         "layer": display_layer(origin_layer, label, source, evidence_type),
         "origin_layer": origin_layer,
         "label": label,
@@ -168,7 +314,15 @@ def normalize_item(item: Any) -> dict[str, Any] | None:
         "payload": item.get("payload"),
         "priority": int(float(item.get("priority", meta["priority"]) or meta["priority"])),
         "class_name": clean(item.get("class_name") or item.get("className") or meta["class_name"]),
+        "evidence_date": clean(item.get("evidence_date") or item.get("source_date")),
+        "collected_at": clean(item.get("collected_at") or item.get("updated_at")),
+        "summarized_at": clean(item.get("summarized_at")),
     }
+    if not normalized["evidence_date"]:
+        normalized["evidence_date"] = infer_evidence_date(normalized)
+    normalized["source_type"] = clean(item.get("source_type") or infer_source_type(label, source, evidence_type))
+    normalized["role"] = clean(item.get("role") or infer_role(label, source, evidence_type))
+    return normalized
 
 
 def normalize_detail_raw(row: dict[str, Any]) -> str:
@@ -216,13 +370,25 @@ def dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def enrich_item_timing(item: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(item)
+    freshness = infer_freshness(enriched, row)
+    enriched["freshness"] = freshness
+    enriched["freshness_label"] = FRESHNESS_LABELS[freshness]
+    if freshness == "live_market" and not enriched.get("collected_at"):
+        enriched["collected_at"] = clean(row.get("event_time"))
+    if not enriched.get("summarized_at"):
+        enriched["summarized_at"] = clean(row.get("evidence_summarized_at") or row.get("summarized_at"))
+    return enriched
+
+
 def evidence_items(row: dict[str, Any]) -> list[dict[str, Any]]:
     structured = [item for item in (normalize_item(raw) for raw in parse_json_array(row.get("evidence_items"))) if item]
-    return dedupe_items(structured or parse_detail_items(row))
+    return [enrich_item_timing(item, row) for item in dedupe_items(structured or parse_detail_items(row))]
 
 
 def item_priority(item: dict[str, Any]) -> int:
-    if item.get("layer") == "异步证据" and item.get("label") in ASYNC_DECISION_PRIORITY:
+    if item.get("freshness") != "live_market" and item.get("label") in ASYNC_DECISION_PRIORITY:
         return ASYNC_DECISION_PRIORITY[str(item["label"])]
     try:
         return int(float(item.get("priority", 100)))
@@ -257,10 +423,10 @@ def concise_body(item: dict[str, Any]) -> str:
 
 
 def curate_items(items: list[dict[str, Any]], layer: str) -> list[dict[str, Any]]:
-    scoped = [item for item in items if item.get("layer") == layer]
-    if layer == "异步证据":
+    scoped = [item for item in items if item.get("freshness") == layer]
+    if layer != "live_market":
         decision_items = [item for item in scoped if useful_decision_item(item)]
-        if decision_items:
+        if decision_items and layer != "historical":
             return prepare_sections(decision_items, 6)
         has_impact = any(item.get("label") == "影响要素" for item in scoped)
         has_core = any(item.get("label") == "核心证据" for item in scoped)
@@ -271,12 +437,12 @@ def curate_items(items: list[dict[str, Any]], layer: str) -> list[dict[str, Any]
             scoped = [item for item in scoped if item.get("label") not in {"核心结论", "异动质量", "锚点一致性"}]
         if has_judgement:
             scoped = [item for item in scoped if item.get("label") not in {"公告", "事件", "题材"}]
-    return prepare_sections(scoped, 6 if layer == "异步证据" else 5)
+    return prepare_sections(scoped, 6 if layer != "live_market" else 5)
 
 
 def prepare_sections(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     sections = []
-    for item in sorted(items, key=item_priority):
+    for item in sorted(items, key=lambda value: (ROLE_PRIORITY.get(str(value.get("role") or ""), 99), item_priority(value))):
         body = concise_body(item)
         if not body:
             continue
@@ -373,9 +539,11 @@ def evidence_level(items: list[dict[str, Any]], row: dict[str, Any]) -> dict[str
     has_announcement = bool(re.search(r"公告|年报|半年报|互动易|问询|回复", raw))
     has_direct = any(item.get("label") in {"题材证据", "个股证据"} for item in items)
     has_impact = any(item.get("label") == "影响要素" for item in items)
-    has_realtime = any(item.get("layer") == "实时证据" for item in items)
-    has_async = any(item.get("layer") == "异步证据" for item in items)
-    source = f"{'实时链路' if has_realtime else ''}{' + ' if has_realtime and has_async else ''}{'异步补充' if has_async else ''}"
+    freshness_labels = []
+    for key in ("live_market", "today_update", "prev_trade_day", "historical"):
+        if any(item.get("freshness") == key for item in items):
+            freshness_labels.append(FRESHNESS_LABELS[key])
+    source = " + ".join(freshness_labels)
     if explicit and explicit != "pending":
         return {"level": explicit, "level_class": "strong" if "强" in explicit else "", "basis": f"{source} · 来自证据层标记"}
     if has_impact:
@@ -438,13 +606,14 @@ def build_summary(items: list[dict[str, Any]], row: dict[str, Any]) -> dict[str,
 def build_evidence_view(row: dict[str, Any]) -> dict[str, Any]:
     items = evidence_items(row)
     layers = []
-    for layer_id in ("realtime", "async"):
+    for layer_id in ("live_market", "today_update", "prev_trade_day", "historical", "unknown"):
         meta = LAYER_META[layer_id]
-        sections = curate_items(items, meta["key"])
+        sections = curate_items(items, layer_id)
         if sections:
             layers.append(
                 {
                     "layer": layer_id,
+                    "freshness": layer_id,
                     "title": meta["title"],
                     "hint": meta["hint"],
                     "class_name": meta["class_name"],
