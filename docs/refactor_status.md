@@ -232,3 +232,34 @@ stock_scout_mysql.py
 新增 UI 展示：尽量读取 display_contract。
 不要让文件重新成为流程状态源。
 ```
+
+## 7. 证据详情解耦进展
+
+已新增：
+
+```text
+src/stock_move_scout/feed/evidence_view.py
+  负责把 feed 行数据整理成 evidence_view 展示视图。
+```
+
+当前边界：
+
+```text
+feed/queries.py
+  继续负责 SQL 查询和原始 evidence_items/detail 字段。
+
+feed/evidence_view.py
+  负责证据层归一化、裁剪、摘要卡片和分层展示模型。
+
+scripts/stock_scout_web.py
+  /api/feed 为每行附加 evidence_view。
+  前端优先读取 evidence_view，旧的 evidence_items/detail 解析逻辑保留兜底。
+```
+
+下一步建议：
+
+```text
+1. 给 evidence_view 增加样例回放测试，锁住关键事实、带动性、龙虎榜等展示排序。
+2. 将前端证据渲染函数从 stock_scout_web.py 拆成静态 JS 文件。
+3. 待 evidence_view 稳定后，再精简 SQL 中重复拼接的 detail/display_contract 展示字段。
+```

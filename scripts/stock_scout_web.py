@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from stock_move_scout.feed import (
     auction_top10_sql,
+    build_evidence_view,
     intel_feed_sql,
     latest_scan_sql,
     latest_window_sql,
@@ -115,6 +116,15 @@ def ensure_async_evidence_summary_column(config: MySqlConfig, column_name: str, 
         run_mysql(config, f"ALTER TABLE async_evidence_summaries ADD COLUMN {column_name} {column_sql};")
 
 
+def attach_evidence_views(feed: object) -> object:
+    if not isinstance(feed, list):
+        return feed
+    for row in feed:
+        if isinstance(row, dict):
+            row["evidence_view"] = build_evidence_view(row)
+    return feed
+
+
 
 
 
@@ -147,9 +157,10 @@ def create_app(config: MySqlConfig) -> FastAPI:
     @app.get("/api/feed")
     def api_feed(trade_date: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
+        feed = json_query(config, intel_feed_sql(target_date), [])
         payload = {
             "trade_date": target_date,
-            "feed": json_query(config, intel_feed_sql(target_date), []),
+            "feed": attach_evidence_views(feed),
             "status": json_query(config, status_sql(target_date), {}),
             "window": json_query(config, latest_window_sql(target_date), {}),
         }
@@ -1181,6 +1192,10 @@ HTML = r"""<!doctype html>
         return {};
       }
     }
+    function evidenceView(row) {
+      const view = parseJsonObject(row.evidence_view);
+      return Number(view.schema_version) >= 1 ? view : {};
+    }
     function normalizeEvidenceLayer(layer) {
       const text = clean(layer);
       if (text === "async" || text === "异步证据" || text === "异步补充证据") return "异步证据";
@@ -1364,6 +1379,8 @@ HTML = r"""<!doctype html>
       return `<div class="evidence-text">${escBlock(part.body)}</div>`;
     }
     function evidenceSectionClass(part) {
+      if (part.class_name) return part.class_name;
+      if (part.className) return part.className;
       return evidenceMeta(part).className;
     }
     function evidenceParts(row) {
@@ -1433,6 +1450,26 @@ HTML = r"""<!doctype html>
       return layer === "异步证据" ? "只保留有用信息" : EVIDENCE_LAYER_META.realtime.hint;
     }
     function evidenceHtml(row) {
+      const view = evidenceView(row);
+      const viewLayers = Array.isArray(view.layers) ? view.layers : [];
+      const renderedLayers = viewLayers
+        .map(group => ({
+          layer: clean(group.layer || ""),
+          title: clean(group.title || ""),
+          hint: clean(group.hint || ""),
+          className: clean(group.class_name || group.className || group.layer || ""),
+          sections: Array.isArray(group.sections) ? group.sections : []
+        }))
+        .filter(group => group.sections.length);
+      if (renderedLayers.length) {
+        return `<div class="evidence-block">${renderedLayers.map(group => `<section class="evidence-layer ${esc(group.className)}">
+          <div class="evidence-layer-title">
+            <span>${esc(group.title || (group.layer === "async" ? "短线决策证据" : "实时链路证据"))}</span>
+            <small>${esc(group.hint || "")}</small>
+          </div>
+          ${group.sections.map(evidenceSectionHtml).join("")}
+        </section>`).join("")}</div>`;
+      }
       const parts = evidenceParts(row);
       if (!parts.length) return `<div class="detail-empty">暂无证据详情</div>`;
       const layers = ["实时证据", "异步证据"].map(layer => ({
@@ -1565,6 +1602,37 @@ HTML = r"""<!doctype html>
       }).join("");
     }
     function evidenceSummaryHtml(row) {
+      const view = evidenceView(row);
+      const summary = view && typeof view.summary === "object" && !Array.isArray(view.summary) ? view.summary : null;
+      if (summary) {
+        const cards = Array.isArray(summary.cards) ? summary.cards : [];
+        const chips = Array.isArray(summary.chips) ? summary.chips : [];
+        const facts = Array.isArray(summary.facts) ? summary.facts.map(clean).filter(Boolean).slice(0, 3) : [];
+        const reason = clampText(summary.reason || "", 90);
+        const flaw = clampText(summary.flaw || "", 90);
+        const gap = clampText(summary.gap || "", 110);
+        return `<div class="evidence-summary">
+          <div class="evidence-verdict">
+            <strong>${esc(clean(summary.title || (reason ? "异动原因" : facts.length ? "关键事实" : "证据强度")))}</strong>
+            <span class="evidence-level ${esc(clean(summary.level_class || ""))}">${esc(clean(summary.level || "待补全"))}</span>
+          </div>
+          ${reason ? `<div class="evidence-judgement"><span>原因</span>${esc(reason)}</div>` : ""}
+          <div class="decision-grid">
+            ${cards.slice(0, 4).map(card => decisionCard(clean(card.label), clean(card.value), clean(card.tone || ""))).join("")}
+          </div>
+          <div class="evidence-chip-row">
+            ${chips.slice(0, 5).map(chip => {
+              const label = clean(chip.label);
+              const value = clean(chip.value);
+              return label && value ? `<span class="evidence-chip ${esc(clean(chip.tone || "weak"))}">${esc(label)} ${esc(value)}</span>` : "";
+            }).join("")}
+          </div>
+          ${facts.length ? `<ul class="evidence-facts">${facts.map(fact => `<li class="evidence-fact">${esc(fact)}</li>`).join("")}</ul>` : ""}
+          ${flaw ? `<div class="evidence-judgement"><span>瑕疵</span>${esc(flaw)}</div>` : ""}
+          <div class="evidence-basis">${esc(clean(summary.basis || ""))}</div>
+          ${gap ? `<div class="evidence-gap">${esc(gap)}</div>` : ""}
+        </div>`;
+      }
       const info = evidenceLevelInfo(row);
       const parts = evidenceParts(row);
       const contract = displayContract(row);
