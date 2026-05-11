@@ -148,6 +148,28 @@ def ensure_incremental_tables(config: MySqlConfig) -> None:
       KEY idx_evidence_dirty_status (status, priority, created_at),
       KEY idx_evidence_dirty_code (code, trade_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+    CREATE TABLE IF NOT EXISTS stock_move_judgement_dirty_queue (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      trade_date DATE NOT NULL,
+      code CHAR(6) NOT NULL,
+      stock_name VARCHAR(64) NOT NULL DEFAULT '',
+      source_hash CHAR(64) NOT NULL DEFAULT '',
+      reason VARCHAR(255) NOT NULL DEFAULT '',
+      changed_sources JSON NULL,
+      impact_hint VARCHAR(255) NOT NULL DEFAULT '',
+      priority INT NOT NULL DEFAULT 50,
+      status ENUM('pending','running','done','failed','ignored') NOT NULL DEFAULT 'pending',
+      attempt_count INT NOT NULL DEFAULT 0,
+      locked_at DATETIME(3) NULL,
+      finished_at DATETIME(3) NULL,
+      last_error TEXT NULL,
+      created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+      UNIQUE KEY uk_judgement_dirty (trade_date, code, source_hash, reason),
+      KEY idx_judgement_dirty_status (status, priority, created_at),
+      KEY idx_judgement_dirty_code (code, trade_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
     """
     run_mysql(config, sql)
     ensure_incremental_column(config, "evidence_source_fingerprints", "component_hashes", "JSON NULL")
@@ -155,6 +177,9 @@ def ensure_incremental_tables(config: MySqlConfig) -> None:
     ensure_incremental_column(config, "evidence_analysis_dirty_queue", "previous_source_hash", "CHAR(64) NOT NULL DEFAULT ''")
     ensure_incremental_column(config, "evidence_analysis_dirty_queue", "changed_sources", "JSON NULL")
     ensure_incremental_column(config, "evidence_analysis_dirty_queue", "impact_hint", "VARCHAR(255) NOT NULL DEFAULT ''")
+    ensure_incremental_column(config, "stock_move_judgement_dirty_queue", "source_hash", "CHAR(64) NOT NULL DEFAULT ''")
+    ensure_incremental_column(config, "stock_move_judgement_dirty_queue", "changed_sources", "JSON NULL")
+    ensure_incremental_column(config, "stock_move_judgement_dirty_queue", "impact_hint", "VARCHAR(255) NOT NULL DEFAULT ''")
 
 
 def ensure_incremental_column(config: MySqlConfig, table_name: str, column_name: str, column_sql: str) -> None:
@@ -176,9 +201,13 @@ def source_hash(payload: dict[str, Any]) -> str:
         "trade_date": payload.get("trade_date"),
         "code": payload.get("code"),
         "profile": payload.get("profile"),
+        "effective_facts": payload.get("effective_facts"),
         "root_items": payload.get("root_items"),
         "evidence_layers": payload.get("evidence_layers"),
         "theme_reason_bank": payload.get("theme_reason_bank"),
+        "lhb_seat_evidence": payload.get("lhb_seat_evidence"),
+        "announcement_effects": payload.get("announcement_effects"),
+        "period_rankings": payload.get("period_rankings"),
         "market_context": payload.get("market_context"),
     }
     raw = json.dumps(slim, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -198,8 +227,12 @@ def source_component_hashes(payload: dict[str, Any]) -> dict[str, str]:
         root_by_kind.setdefault(kind, []).append(item)
     components = {
         "profile": payload.get("profile") or {},
+        "effective_facts": payload.get("effective_facts") or [],
         "evidence_layers": payload.get("evidence_layers") or [],
         "theme_reason_bank": payload.get("theme_reason_bank") or [],
+        "lhb_seat_evidence": payload.get("lhb_seat_evidence") or [],
+        "announcement_effects": payload.get("announcement_effects") or [],
+        "period_rankings": payload.get("period_rankings") or [],
         "market_anchors": (payload.get("market_context") or {}).get("current_anchors", []),
     }
     for kind, items in root_by_kind.items():
@@ -210,8 +243,12 @@ def source_component_hashes(payload: dict[str, Any]) -> dict[str, str]:
 def payload_source_counts(payload: dict[str, Any]) -> dict[str, int]:
     return {
         "root_items": len(payload.get("root_items", [])),
+        "effective_facts": len(payload.get("effective_facts", [])),
         "evidence_layers": len(payload.get("evidence_layers", [])),
         "theme_reason_bank": len(payload.get("theme_reason_bank", [])),
+        "lhb_seat_evidence": len(payload.get("lhb_seat_evidence", [])),
+        "announcement_effects": len(payload.get("announcement_effects", [])),
+        "period_rankings": len(payload.get("period_rankings", [])),
         "current_anchors": len((payload.get("market_context") or {}).get("current_anchors", [])),
     }
 
@@ -249,6 +286,14 @@ def source_impact_priority(changed_sources: list[str], payload: dict[str, Any]) 
     changed = set(changed_sources)
     if any(name in changed for name in ("root_announcement", "root_important_event")):
         return 20, "公告/重要事件更新，优先重算"
+    if "announcement_effects" in changed:
+        return 21, "announcement_effects_updated"
+    if "period_rankings" in changed:
+        return 22, "问财区间排名更新，重算区间强度"
+    if "announcement_effects" in changed:
+        return 22, "announcement_effects_updated"
+    if "lhb_seat_evidence" in changed:
+        return 23, "龙虎榜席位更新，重算资金确认"
     if "evidence_layers" in changed:
         return 25, "热证据层更新，优先重算"
     if "theme_reason_bank" in changed:
@@ -341,6 +386,127 @@ def enqueue_dirty_analysis(
       priority=LEAST(priority, VALUES(priority)),
       status=IF(status IN ('done','ignored'), 'pending', status),
       updated_at=CURRENT_TIMESTAMP(3);
+    """
+    run_mysql(config, sql)
+
+
+def judgement_impact_priority(changed_sources: list[str], reason: str = "") -> tuple[int, str]:
+    changed = set(changed_sources)
+    if "async_evidence_summaries" in changed or reason == "async_summary_updated":
+        return 18, "异步证据摘要更新，重算持续性和硬催化分"
+    if "period_rankings" in changed:
+        return 20, "问财区间排名更新，重算区间领头分"
+    if "lhb_seat_evidence" in changed:
+        return 24, "龙虎榜更新，等待/联动资金证据"
+    if "market_anchors" in changed:
+        return 28, "盘中锚点变化，重算主动性和带动性"
+    if "evidence_layers" in changed:
+        return 30, "热证据层更新，重算硬证据"
+    if any(name.startswith("root_") for name in changed):
+        return 35, "公告/题材根证据更新"
+    if "theme_reason_bank" in changed:
+        return 42, "题材解释更新"
+    if "profile" in changed:
+        return 60, "公司画像更新"
+    return 50, "上游证据变化"
+
+
+def enqueue_dirty_judgement(
+    config: MySqlConfig,
+    *,
+    trade_date: str,
+    code: str,
+    stock_name: str = "",
+    source_hash_value: str = "",
+    reason: str = "source_changed",
+    changed_sources: list[str] | None = None,
+    impact_hint: str = "",
+    priority: int | None = None,
+) -> None:
+    changed_sources = changed_sources or []
+    if priority is None:
+        priority, default_hint = judgement_impact_priority(changed_sources, reason)
+        impact_hint = impact_hint or default_hint
+    source_key = source_hash_value or stable_hash(
+        {
+            "trade_date": trade_date,
+            "code": code,
+            "reason": reason,
+            "changed_sources": changed_sources,
+            "impact_hint": impact_hint,
+        }
+    )
+    sql = f"""
+    INSERT INTO stock_move_judgement_dirty_queue(
+      trade_date, code, stock_name, source_hash, reason, changed_sources, impact_hint, priority, status
+    ) VALUES (
+      {sql_string(trade_date)},
+      {sql_string(code)},
+      {sql_string(stock_name)},
+      {sql_string(source_key)},
+      {sql_string(reason)},
+      {sql_json(changed_sources)},
+      {sql_string(impact_hint)},
+      {int(priority)},
+      'pending'
+    )
+    ON DUPLICATE KEY UPDATE
+      stock_name=COALESCE(NULLIF(VALUES(stock_name), ''), stock_name),
+      changed_sources=VALUES(changed_sources),
+      impact_hint=VALUES(impact_hint),
+      priority=LEAST(priority, VALUES(priority)),
+      status=IF(status IN ('done','ignored'), 'pending', status),
+      updated_at=CURRENT_TIMESTAMP(3);
+    """
+    run_mysql(config, sql)
+
+
+def fetch_dirty_judgement_candidates(config: MySqlConfig, trade_date: str, limit: int, code: str = "") -> list[dict[str, str]]:
+    code_filter = f"AND code={sql_string(code)}" if code else ""
+    sql = f"""
+    SELECT id, code, stock_name, source_hash
+    FROM stock_move_judgement_dirty_queue
+    WHERE trade_date={sql_string(trade_date)}
+      AND (
+        status='pending'
+        OR (status='running' AND locked_at < DATE_SUB(NOW(3), INTERVAL 10 MINUTE))
+      )
+      {code_filter}
+    ORDER BY priority ASC, created_at ASC
+    LIMIT {int(limit)};
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    out: list[dict[str, str]] = []
+    for row in rows:
+        if len(row) >= 4:
+            out.append({"dirty_id": row[0], "code": row[1], "stock_name": row[2], "source_hash": row[3]})
+    ids = [str(item["dirty_id"]) for item in out if str(item.get("dirty_id", "")).isdigit()]
+    if ids:
+        run_mysql(
+            config,
+            f"""
+            UPDATE stock_move_judgement_dirty_queue
+            SET status='running',
+                locked_at=CURRENT_TIMESTAMP(3),
+                updated_at=CURRENT_TIMESTAMP(3)
+            WHERE id IN ({",".join(ids)})
+              AND status IN ('pending','running');
+            """,
+        )
+    return out
+
+
+def mark_dirty_judgement(config: MySqlConfig, dirty_id: str, status: str, error: str = "") -> None:
+    if not dirty_id:
+        return
+    sql = f"""
+    UPDATE stock_move_judgement_dirty_queue
+    SET status={sql_string(status)},
+        finished_at=IF({sql_string(status)} IN ('done','failed','ignored'), CURRENT_TIMESTAMP(3), finished_at),
+        last_error={sql_string(error[:1000])},
+        attempt_count=attempt_count + IF({sql_string(status)}='failed', 1, 0),
+        updated_at=CURRENT_TIMESTAMP(3)
+    WHERE id={int(dirty_id)};
     """
     run_mysql(config, sql)
 
@@ -450,6 +616,7 @@ def write_summary(
           'evidence_layers': len(payload.get('evidence_layers', [])),
           'theme_reason_bank': len(payload.get('theme_reason_bank', [])),
           'lhb_seat_evidence': len(payload.get('lhb_seat_evidence', [])),
+          'announcement_effects': len(payload.get('announcement_effects', [])),
       })},
       {sql_string(json.dumps(payload, ensure_ascii=False))},
       {sql_string(model)},

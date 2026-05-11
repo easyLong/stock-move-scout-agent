@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from stock_move_scout.evidence.effective_facts import fetch_effective_fact_items
 from stock_scout_mysql import MySqlConfig, mysql_rows, run_mysql, sql_string
 
 
@@ -93,29 +94,39 @@ def fetch_candidates(config: MySqlConfig, trade_date: str, code: str = "", limit
 
 def fetch_payload(config: MySqlConfig, trade_date: str, code: str, stock_name: str, per_kind_limit: int) -> dict[str, Any]:
     current_anchors = fetch_current_anchors(config, trade_date, code)
-    root_sql = f"""
-    SELECT item_kind, COALESCE(DATE_FORMAT(item_date, '%Y-%m-%d'), ''), title, COALESCE(content, ''), url, source_section
-    FROM stock_ths_root_items
-    WHERE code={sql_string(code)}
-      AND item_kind IN ('important_event','announcement','theme_point','hot_news')
-    ORDER BY
-      FIELD(item_kind, 'announcement', 'important_event', 'theme_point', 'hot_news'),
-      item_date DESC,
-      source_rank ASC
-    LIMIT {int(per_kind_limit) * 4};
-    """
+    effective_facts = fetch_effective_fact_items(config, trade_date, code, max(8, int(per_kind_limit) * 4))
     root_items = [
         {
-            "kind": row[0],
-            "date": row[1],
-            "title": compact(row[2], 180),
-            "content": compact(row[3], 500),
-            "url": row[4],
-            "section": row[5],
+            "kind": str(fact.get("fact_type") or fact.get("evidence_role") or "effective_fact"),
+            "date": str(fact.get("fact_date") or ""),
+            "title": compact(str(fact.get("title") or ""), 180),
+            "content": compact(str(fact.get("body") or ""), 500),
+            "url": "",
+            "section": str(fact.get("evidence_role") or ""),
+            "source_table": str(fact.get("source_table") or ""),
+            "source_key": str(fact.get("source_key") or ""),
+            "valid_status": str(fact.get("valid_status") or ""),
+            "valid_score": fact.get("valid_score") or 0,
+            "evidence_group": str(fact.get("evidence_group") or ""),
+            "display_level": str(fact.get("display_level") or ""),
         }
-        for row in mysql_rows(run_mysql(config, root_sql, batch=True, raw=True))
-        if len(row) >= 6
+        for fact in effective_facts
     ]
+    announcement_effects = [
+        {
+            "event_date": fact.get("fact_date") or "",
+            "event_type": fact.get("fact_type") or "",
+            "event_subtype": fact.get("fact_subtype") or "",
+            "tag": (fact.get("payload") or {}).get("tag", "") if isinstance(fact.get("payload"), dict) else "",
+            "status": fact.get("valid_status") or "",
+            "verify_score": (fact.get("payload") or {}).get("verify_score", "") if isinstance(fact.get("payload"), dict) else "",
+            "verify_pct": (fact.get("payload") or {}).get("verify_pct", "") if isinstance(fact.get("payload"), dict) else "",
+            "title": compact(str(fact.get("title") or ""), 220),
+            "summary": compact(str(fact.get("body") or ""), 420),
+        }
+        for fact in effective_facts
+        if fact.get("source_table") == "stock_announcement_effects"
+    ][: max(1, int(per_kind_limit))]
     evidence_sql = f"""
     SELECT
       COALESCE(el.hard_evidence_summary, ''),
@@ -170,6 +181,7 @@ def fetch_payload(config: MySqlConfig, trade_date: str, code: str, stock_name: s
     reason_bank = prioritize_reason_bank(reason_bank, current_anchors, per_kind_limit)
     lhb_sql = f"""
     SELECT
+      DATE_FORMAT(trade_date, '%Y-%m-%d'),
       seat_signal_label,
       seat_signal_score,
       famous_trader_count,
@@ -179,32 +191,70 @@ def fetch_payload(config: MySqlConfig, trade_date: str, code: str, stock_name: s
       ROUND(institution_net_buy / 100000000, 2),
       top_buy_seat,
       ROUND(top_buy_amount / 100000000, 2),
-      key_facts
+      key_facts,
+      DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s')
     FROM stock_lhb_seat_evidence
-    WHERE trade_date={sql_string(trade_date)}
+    WHERE trade_date <= {sql_string(trade_date)}
+      AND trade_date >= DATE_SUB(CAST({sql_string(trade_date)} AS DATE), INTERVAL 7 DAY)
       AND code={sql_string(code)}
+    ORDER BY trade_date DESC, updated_at DESC
     LIMIT 1;
     """
     lhb_rows = mysql_rows(run_mysql(config, lhb_sql, batch=True, raw=True))
     lhb_evidence: list[dict[str, Any]] = []
-    if lhb_rows and len(lhb_rows[0]) >= 10:
+    if lhb_rows and len(lhb_rows[0]) >= 12:
         row = lhb_rows[0]
         try:
-            facts = json.loads(row[9] or "[]")
+            facts = json.loads(row[10] or "[]")
         except Exception:
             facts = []
         lhb_evidence.append(
             {
-                "signal_label": row[0],
-                "signal_score": row[1],
-                "famous_trader_count": row[2],
-                "famous_trader_net_buy_yi": row[3],
-                "institution_buy_count": row[4],
-                "institution_sell_count": row[5],
-                "institution_net_buy_yi": row[6],
-                "top_buy_seat": row[7],
-                "top_buy_amount_yi": row[8],
+                "trade_date": row[0],
+                "signal_label": row[1],
+                "signal_score": row[2],
+                "famous_trader_count": row[3],
+                "famous_trader_net_buy_yi": row[4],
+                "institution_buy_count": row[5],
+                "institution_sell_count": row[6],
+                "institution_net_buy_yi": row[7],
+                "top_buy_seat": row[8],
+                "top_buy_amount_yi": row[9],
                 "key_facts": facts,
+                "updated_at": row[11],
+            }
+        )
+    period_sql = f"""
+    SELECT
+      DATE_FORMAT(trade_date, '%Y-%m-%d'),
+      period_days,
+      rank_no,
+      rank_total,
+      period_pct,
+      latest_pct,
+      DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s')
+    FROM stock_period_rankings
+    WHERE trade_date <= {sql_string(trade_date)}
+      AND trade_date >= DATE_SUB(CAST({sql_string(trade_date)} AS DATE), INTERVAL 7 DAY)
+      AND code={sql_string(code)}
+      AND period_days IN (3,5,10)
+    ORDER BY trade_date DESC, period_days ASC, updated_at DESC;
+    """
+    seen_periods: set[str] = set()
+    period_rankings: list[dict[str, Any]] = []
+    for row in mysql_rows(run_mysql(config, period_sql, batch=True, raw=True)):
+        if len(row) < 7 or row[1] in seen_periods:
+            continue
+        seen_periods.add(row[1])
+        period_rankings.append(
+            {
+                "trade_date": row[0],
+                "period_days": row[1],
+                "rank_no": row[2],
+                "rank_total": row[3],
+                "period_pct": row[4],
+                "latest_pct": row[5],
+                "updated_at": row[6],
             }
         )
     profile_sql = f"""
@@ -227,10 +277,74 @@ def fetch_payload(config: MySqlConfig, trade_date: str, code: str, stock_name: s
         "market_context": {"current_anchors": current_anchors},
         "profile": profile,
         "root_items": root_items,
+        "effective_facts": effective_facts,
+        "announcement_effects": announcement_effects,
         "evidence_layers": evidence_layers,
         "theme_reason_bank": reason_bank,
         "lhb_seat_evidence": lhb_evidence,
+        "period_rankings": period_rankings,
     }
+
+
+def fetch_announcement_effects(config: MySqlConfig, trade_date: str, code: str, limit: int) -> list[dict[str, Any]]:
+    sql = f"""
+    SELECT
+      DATE_FORMAT(event_date, '%Y-%m-%d'),
+      event_type,
+      event_subtype,
+      tag,
+      effect_status,
+      verify_score,
+      effect_score,
+      verify_pct,
+      current_pct_from_base,
+      avg_pct_from_base,
+      COALESCE(DATE_FORMAT(base_trade_date, '%Y-%m-%d'), ''),
+      COALESCE(DATE_FORMAT(verify_trade_date, '%Y-%m-%d'), ''),
+      COALESCE(DATE_FORMAT(faded_trade_date, '%Y-%m-%d'), ''),
+      title,
+      summary
+    FROM stock_announcement_effects
+    WHERE code={sql_string(code)}
+      AND event_date <= {sql_string(trade_date)}
+      AND event_date >= DATE_SUB(CAST({sql_string(trade_date)} AS DATE), INTERVAL 240 DAY)
+    ORDER BY
+      FIELD(effect_status, 'active', 'faded', 'ignored', 'unverified'),
+      verify_score DESC,
+      effect_score DESC,
+      event_date DESC,
+      updated_at DESC
+    LIMIT {max(1, int(limit)) * 3};
+    """
+    try:
+        rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if len(row) < 15:
+            continue
+        values = ["" if str(value or "") == "NULL" else value for value in row]
+        out.append(
+            {
+                "event_date": values[0],
+                "event_type": values[1],
+                "event_subtype": values[2],
+                "tag": values[3],
+                "status": values[4],
+                "verify_score": values[5],
+                "effect_score": values[6],
+                "verify_pct": values[7],
+                "current_pct_from_base": values[8],
+                "avg_pct_from_base": values[9],
+                "base_trade_date": values[10],
+                "verify_trade_date": values[11],
+                "faded_trade_date": values[12],
+                "title": compact(values[13], 220),
+                "summary": compact(values[14], 420),
+            }
+        )
+    return out
 
 
 def fetch_current_anchors(config: MySqlConfig, trade_date: str, code: str) -> list[str]:

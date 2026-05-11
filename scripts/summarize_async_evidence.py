@@ -21,6 +21,7 @@ from stock_move_scout.evidence.payload import fetch_candidates, fetch_payload
 from stock_move_scout.evidence.schema import SUMMARY_SCHEMA, evidence_hash
 from stock_move_scout.evidence.storage import (
     enqueue_dirty_analysis,
+    enqueue_dirty_judgement,
     ensure_incremental_tables,
     ensure_summary_table,
     existing_evidence_hash,
@@ -31,6 +32,7 @@ from stock_move_scout.evidence.storage import (
     write_summary,
 )
 from stock_move_scout.evidence.summary import fallback_summary
+from stock_move_scout.web import resolve_trade_date
 
 from stock_scout_mysql import (
     add_mysql_args,
@@ -40,7 +42,7 @@ from stock_scout_mysql import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Summarize asynchronous stock evidence into MySQL.")
-    parser.add_argument("--trade-date", default=date.today().strftime("%Y-%m-%d"))
+    parser.add_argument("--trade-date", default="latest")
     parser.add_argument("--code", default="")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--per-kind-limit", type=int, default=8)
@@ -66,6 +68,7 @@ def main() -> int:
         pass
     args = parse_args()
     config = mysql_config_from_args(args)
+    args.trade_date = resolve_trade_date(config, args.trade_date)
     ensure_summary_table(config)
     ensure_incremental_tables(config)
     ensure_model_config_table(config)
@@ -88,6 +91,7 @@ def main() -> int:
             h, is_changed, change_meta = record_source_fingerprint(config, payload)
             if is_changed:
                 priority, impact_hint = source_impact_priority(change_meta.get("changed_sources", []), payload)
+                changed_sources = list(change_meta.get("changed_sources") or [])
                 enqueue_dirty_analysis(
                     config,
                     payload,
@@ -95,9 +99,23 @@ def main() -> int:
                     "source_changed",
                     priority,
                     str(change_meta.get("previous_hash") or ""),
-                    list(change_meta.get("changed_sources") or []),
+                    changed_sources,
                     impact_hint,
                 )
+                if any(
+                    source in set(changed_sources)
+                    for source in ("period_rankings", "market_anchors", "evidence_layers", "theme_reason_bank", "profile")
+                ):
+                    enqueue_dirty_judgement(
+                        config,
+                        trade_date=args.trade_date,
+                        code=item["code"],
+                        stock_name=item["stock_name"],
+                        source_hash_value=h,
+                        reason="source_changed",
+                        changed_sources=changed_sources,
+                        impact_hint=impact_hint,
+                    )
                 changed += 1
             else:
                 unchanged += 1
@@ -137,6 +155,15 @@ def main() -> int:
                 schema=SUMMARY_SCHEMA,
             )
             write_summary(config, payload, summary, model_runtime.model, "ready")
+            enqueue_dirty_judgement(
+                config,
+                trade_date=args.trade_date,
+                code=item["code"],
+                stock_name=item["stock_name"],
+                source_hash_value=evidence_hash(payload),
+                reason="async_summary_updated",
+                changed_sources=["async_evidence_summaries"],
+            )
             if args.dirty_only:
                 mark_dirty(config, item.get("dirty_id", ""), "done")
             written += 1
@@ -149,6 +176,16 @@ def main() -> int:
                 continue
             summary = fallback_summary(payload)
             write_summary(config, payload, summary, "fallback_without_model", "fallback", str(exc))
+            enqueue_dirty_judgement(
+                config,
+                trade_date=args.trade_date,
+                code=item["code"],
+                stock_name=item["stock_name"],
+                source_hash_value=evidence_hash(payload),
+                reason="async_summary_updated",
+                changed_sources=["async_evidence_summaries"],
+                impact_hint="异步证据摘要已用 fallback 更新",
+            )
             if args.dirty_only:
                 mark_dirty(config, item.get("dirty_id", ""), "done")
             written += 1

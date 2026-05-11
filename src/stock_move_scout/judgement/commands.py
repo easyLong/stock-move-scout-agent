@@ -29,8 +29,12 @@ def build_judgement_command(
             "--limit",
             str(int(payload.get("limit", 500))),
         ]
+        if payload.get("code"):
+            command.extend(["--code", str(payload.get("code"))])
         if payload.get("latest_only", True):
             command.append("--latest-only")
+        if payload.get("dirty_only"):
+            command.append("--dirty-only")
         return command + mysql_args
 
     return None

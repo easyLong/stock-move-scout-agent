@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from stock_move_scout.feed import (
     auction_top10_sql,
     build_evidence_view,
+    intel_feed_list_sql,
     intel_feed_sql,
     latest_scan_sql,
     latest_window_sql,
@@ -21,6 +22,7 @@ from stock_move_scout.feed import (
     trade_dates_sql,
     window_top10_sql,
 )
+from stock_move_scout.feed import root_cache
 from stock_move_scout.web import json_query, latest_data_date, resolve_trade_date
 
 from stock_scout_mysql import MySqlConfig, add_mysql_args, mysql_config_from_args, run_mysql, sql_string
@@ -31,6 +33,8 @@ CRITICAL_DATA_TASK_IDS = (
     "iwencai_period_rankings",
     "lhb_seat_evidence",
     "ths_limit_up_review",
+    "announcement_effects",
+    "effective_facts",
 )
 
 
@@ -126,7 +130,10 @@ def attach_evidence_views(feed: object) -> object:
         return feed
     for row in feed:
         if isinstance(row, dict):
-            row["evidence_view"] = build_evidence_view(row)
+            view = build_evidence_view(row)
+            row["evidence_view"] = view
+            row["evidence_version"] = view.get("evidence_version", "")
+            row["latest_source_updated_at"] = view.get("latest_source_updated_at") or row.get("latest_source_updated_at", "")
     return feed
 
 
@@ -206,6 +213,7 @@ def attach_data_source_health(status: object, config: MySqlConfig) -> object:
 
 def create_app(config: MySqlConfig) -> FastAPI:
     ensure_async_evidence_summary_table(config)
+    root_cache.ensure_root_evidence_cache_table(config)
     app = FastAPI(title=APP_TITLE)
 
     @app.get("/", response_class=HTMLResponse)
@@ -227,15 +235,32 @@ def create_app(config: MySqlConfig) -> FastAPI:
     @app.get("/api/feed")
     def api_feed(trade_date: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
-        feed = json_query(config, intel_feed_sql(target_date), [])
+        root_cache.process_root_evidence_cache_dirty(config, target_date, limit=50)
+        root_cache.refresh_root_evidence_cache(config, target_date)
+        feed = json_query(config, intel_feed_list_sql(target_date), [])
         status = json_query(config, status_sql(target_date), {})
         payload = {
             "trade_date": target_date,
-            "feed": attach_evidence_views(feed),
+            "feed": feed,
             "status": attach_data_source_health(status, config),
             "window": json_query(config, latest_window_sql(target_date), {}),
         }
         return JSONResponse(payload)
+
+    @app.get("/api/feed/detail")
+    def api_feed_detail(trade_date: str = "", kind: str = "", event_time: str = "", code: str = "") -> JSONResponse:
+        target_date = resolve_trade_date(config, trade_date)
+        if code:
+            root_cache.process_root_evidence_cache_dirty(config, target_date, limit=10, code=code)
+            if not root_cache.root_evidence_cache_code_exists(config, target_date, code):
+                root_cache.refresh_root_evidence_cache(config, target_date, codes=[code], force=True)
+        else:
+            root_cache.process_root_evidence_cache_dirty(config, target_date, limit=20)
+            root_cache.refresh_root_evidence_cache(config, target_date)
+        feed = json_query(config, intel_feed_sql(target_date, kind=kind, event_time=event_time, code=code), [])
+        rows = attach_evidence_views(feed)
+        row = rows[0] if isinstance(rows, list) and rows else {}
+        return JSONResponse({"trade_date": target_date, "row": row})
 
     @app.get("/api/trade_dates")
     def api_trade_dates() -> JSONResponse:
@@ -467,11 +492,11 @@ HTML = r"""<!doctype html>
       color: var(--muted);
     }
     .evidence-summary {
-      border: 1px solid #e4ddf4;
+      border: 1px solid #e5e7eb;
       border-radius: 8px;
-      background: linear-gradient(180deg, #fdfcff 0%, #faf8ff 100%);
-      padding: 10px;
-      margin-bottom: 10px;
+      background: #fff;
+      padding: 12px;
+      margin-bottom: 12px;
       color: #374151;
       font-size: 13px;
       line-height: 1.5;
@@ -481,10 +506,13 @@ HTML = r"""<!doctype html>
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      margin-bottom: 6px;
+      padding-bottom: 8px;
+      margin-bottom: 8px;
+      border-bottom: 1px solid #eef2f7;
     }
     .evidence-verdict strong {
-      color: #211b37;
+      color: #111827;
+      font-size: 14px;
     }
     .evidence-level {
       border-radius: 999px;
@@ -508,30 +536,103 @@ HTML = r"""<!doctype html>
     }
     .evidence-basis {
       color: #536174;
+      margin-top: 8px;
+    }
+    .evidence-focus-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 6px;
+      margin: 9px 0 10px;
+    }
+    .evidence-focus {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: 82px minmax(0, 1fr);
+      column-gap: 10px;
+      border: 1px solid #e5e7eb;
+      border-left: 3px solid #d8dee9;
+      border-radius: 8px;
+      background: #fbfcfe;
+      padding: 8px 9px;
+    }
+    .evidence-focus.good {
+      border-left-color: #4f9d7e;
+    }
+    .evidence-focus.hot {
+      border-left-color: #cf6f62;
+    }
+    .evidence-focus.rank {
+      border-left-color: #7c8cc7;
+    }
+    .evidence-focus-title {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: flex-start;
+      gap: 3px;
+      color: #1f2937;
+      font-size: 12px;
+      font-weight: 800;
+      padding-top: 1px;
+    }
+    .evidence-focus-title small {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+      line-height: 1.35;
+    }
+    .evidence-focus-lines {
+      display: grid;
+      gap: 4px;
+      color: #374151;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .evidence-focus-line {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      overflow: hidden;
+    }
+    .evidence-flow {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin: 8px 0 0;
+    }
+    .evidence-flow-chip {
+      border: 1px solid #e2e8f0;
+      background: #f8fafc;
+      color: #475569;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
     }
     .decision-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 7px;
-      margin: 8px 0 8px;
+      gap: 6px;
+      margin: 9px 0 7px;
     }
     .decision-card {
-      border: 1px solid #e8e2f7;
+      border: 1px solid #e5e7eb;
       border-radius: 8px;
-      background: rgba(255, 255, 255, 0.78);
+      background: #f9fafb;
       padding: 7px 8px;
       min-width: 0;
     }
     .decision-label {
       display: block;
-      color: #7a718d;
+      color: #64748b;
       font-size: 11px;
       font-weight: 700;
       margin-bottom: 2px;
     }
     .decision-value {
       display: block;
-      color: #211b37;
+      color: #111827;
       font-size: 13px;
       font-weight: 750;
       overflow: hidden;
@@ -542,16 +643,16 @@ HTML = r"""<!doctype html>
       display: flex;
       flex-wrap: wrap;
       gap: 5px;
-      margin-top: 7px;
+      margin-top: 6px;
     }
     .evidence-chip {
       display: inline-flex;
       align-items: center;
       max-width: 100%;
       border-radius: 999px;
-      border: 1px solid #d8d0ef;
+      border: 1px solid #e2e8f0;
       background: #fff;
-      color: #4c4661;
+      color: #475569;
       padding: 2px 8px;
       font-size: 12px;
       font-weight: 650;
@@ -588,7 +689,7 @@ HTML = r"""<!doctype html>
       position: relative;
       padding-left: 12px;
       color: #1f2937;
-      font-weight: 650;
+      font-weight: 600;
       line-height: 1.55;
     }
     .evidence-fact::before {
@@ -599,7 +700,7 @@ HTML = r"""<!doctype html>
       width: 4px;
       height: 4px;
       border-radius: 999px;
-      background: #8b5cf6;
+      background: #64748b;
     }
     .evidence-judgement {
       margin-top: 7px;
@@ -614,7 +715,7 @@ HTML = r"""<!doctype html>
     }
     .evidence-block {
       display: grid;
-      gap: 10px;
+      gap: 14px;
     }
     .evidence-layer {
       display: grid;
@@ -625,23 +726,52 @@ HTML = r"""<!doctype html>
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      color: #334155;
+      color: #0f172a;
       font-size: 12px;
-      font-weight: 700;
-      padding: 0 2px;
+      font-weight: 800;
+      padding: 0 2px 2px;
+      border-bottom: 1px solid #edf1f5;
     }
     .evidence-layer-title small {
       color: var(--muted);
       font-weight: 500;
-    }
-    .evidence-layer.async .evidence-layer-title {
-      color: #6d5f95;
+      line-height: 1.35;
+      text-align: right;
     }
     .evidence-section {
-      border: 1px solid var(--line);
+      border: 1px solid #e5e7eb;
       border-radius: 8px;
-      background: #fbfcfe;
-      padding: 9px 10px;
+      background: #fff;
+      padding: 10px 11px;
+      box-shadow: 0 1px 0 rgba(15, 23, 42, 0.03);
+    }
+    .evidence-layer.current-effective .evidence-layer-title {
+      border-color: #dbe7df;
+    }
+    .evidence-layer.current-effective .evidence-section {
+      border-color: #dbe7df;
+      background: #fbfefd;
+    }
+    .evidence-layer.after-close .evidence-layer-title {
+      border-color: #dde5f3;
+    }
+    .evidence-layer.after-close .evidence-section {
+      border-color: #dde5f3;
+      background: #fbfdff;
+    }
+    .evidence-layer.background-fact .evidence-layer-title {
+      border-color: #e5e7eb;
+    }
+    .evidence-layer.background-fact .evidence-section {
+      border-color: #e5e7eb;
+      background: #fcfcfd;
+    }
+    .evidence-layer.historical-tag {
+      opacity: 0.88;
+    }
+    .evidence-layer.historical-tag .evidence-section {
+      border-style: dashed;
+      background: #fafafa;
     }
     .evidence-section.theme {
       border-left: 3px solid var(--anchor-line);
@@ -654,7 +784,7 @@ HTML = r"""<!doctype html>
     }
     .evidence-section.summary {
       border-left: 3px solid #c4b5fd;
-      background: #f8f6ff;
+      background: #fbfaff;
     }
     .evidence-section.impact {
       border-left: 3px solid #f0b86a;
@@ -738,6 +868,192 @@ HTML = r"""<!doctype html>
       line-height: 1.65;
       background: #fdfcff;
     }
+    .sequence-card {
+      border: 1px solid #e3e8ef;
+      border-radius: 8px;
+      background: #ffffff;
+      overflow: hidden;
+    }
+    .sequence-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 7px 9px;
+      border-bottom: 1px solid #eef2f7;
+      color: #1f2937;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .sequence-head small {
+      color: #7b8495;
+      font-size: 11px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .sequence-summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1fr);
+      align-items: stretch;
+      gap: 6px;
+      padding: 8px 9px;
+      background: #f8fafc;
+      border-bottom: 1px solid #eef2f7;
+    }
+    .sequence-summary.single {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .sequence-summary-one {
+      min-width: 0;
+      padding: 6px 7px;
+      border: 1px solid #e5e7eb;
+      border-radius: 7px;
+      background: #ffffff;
+    }
+    .sequence-summary-one.current {
+      border-color: #a7d8d2;
+      background: #f4fbfa;
+    }
+    .sequence-summary-label {
+      display: block;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 750;
+      line-height: 1.2;
+    }
+    .sequence-summary-stock {
+      display: block;
+      margin-top: 2px;
+      color: #111827;
+      font-size: 12px;
+      font-weight: 850;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .sequence-summary-meta {
+      display: block;
+      margin-top: 2px;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 750;
+      line-height: 1.2;
+    }
+    .sequence-summary-arrow {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #94a3b8;
+      font-size: 13px;
+      font-weight: 850;
+    }
+    .sequence-flow {
+      display: grid;
+      gap: 0;
+    }
+    .sequence-row {
+      position: relative;
+      display: grid;
+      grid-template-columns: 34px minmax(96px, 1fr) 44px 62px;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+      padding: 6px 9px;
+      border-top: 1px solid #f1f5f9;
+      background: #ffffff;
+    }
+    .sequence-row:first-child {
+      border-top: 0;
+    }
+    .sequence-row.current {
+      background: #f2fbf9;
+    }
+    .sequence-row.current::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 3px;
+      background: #0f766e;
+    }
+    .sequence-rank {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 26px;
+      height: 20px;
+      border-radius: 999px;
+      color: #334155;
+      background: #f1f5f9;
+      font-size: 11px;
+      font-weight: 850;
+      font-variant-numeric: tabular-nums;
+    }
+    .sequence-row.current .sequence-rank {
+      color: #ffffff;
+      background: #0f766e;
+    }
+    .sequence-main {
+      min-width: 0;
+    }
+    .sequence-name {
+      color: #111827;
+      font-size: 12px;
+      font-weight: 800;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+    }
+    .sequence-code {
+      margin-top: 2px;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0;
+      font-variant-numeric: tabular-nums;
+    }
+    .sequence-meta {
+      justify-self: end;
+      color: #586474;
+      font-size: 11px;
+      font-weight: 750;
+      line-height: 1.35;
+      white-space: nowrap;
+      padding-left: 4px;
+      font-variant-numeric: tabular-nums;
+    }
+    .sequence-badge {
+      display: inline-flex;
+      justify-self: start;
+      padding: 1px 5px;
+      border-radius: 999px;
+      color: #64748b;
+      background: #f1f5f9;
+      font-size: 10px;
+      font-weight: 800;
+      line-height: 1.35;
+      white-space: nowrap;
+    }
+    .sequence-row.current .sequence-badge {
+      color: #0f766e;
+      background: #dff5f1;
+    }
+    .sequence-row.strong .sequence-badge.strong {
+      color: #8a5a10;
+      background: #fff1c2;
+    }
+    @media (max-width: 760px) {
+      .sequence-summary {
+        grid-template-columns: 1fr;
+      }
+      .sequence-summary-arrow {
+        display: none;
+      }
+      .sequence-row {
+        grid-template-columns: 30px minmax(84px, 1fr) 38px 56px;
+        gap: 5px;
+        padding: 6px 8px;
+      }
+    }
     .evidence-fold {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -787,6 +1103,34 @@ HTML = r"""<!doctype html>
       color: var(--muted);
       font-size: 12px;
       font-weight: 500;
+      white-space: nowrap;
+    }
+    .evidence-source-wrap {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+    .evidence-date-chip {
+      color: #5b6472;
+      background: #eef2f7;
+      border: 1px solid #e2e8f0;
+      border-radius: 999px;
+      padding: 1px 7px;
+      font-size: 11px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .evidence-cycle-chip {
+      color: #46615d;
+      background: #eef8f6;
+      border: 1px solid #cfe8e3;
+      border-radius: 999px;
+      padding: 1px 7px;
+      font-size: 11px;
+      font-weight: 650;
       white-space: nowrap;
     }
     .evidence-text {
@@ -1008,6 +1352,9 @@ HTML = r"""<!doctype html>
         height: auto;
         overflow: visible;
       }
+      .evidence-focus-grid {
+        grid-template-columns: 1fr;
+      }
       .stream-item {
         grid-template-columns: minmax(0, 1fr) auto;
         grid-template-areas:
@@ -1066,6 +1413,8 @@ HTML = r"""<!doctype html>
     }
     let currentFeed = [];
     let selectedKey = "";
+    const detailCache = new Map();
+    let detailRequestSeq = 0;
     function rowKey(row) {
       return [row.kind, row.event_time, row.code, row.title].map(clean).join("|");
     }
@@ -1285,7 +1634,8 @@ HTML = r"""<!doctype html>
         source: clean(item.source || ""),
         type: clean(item.type || evidenceType(label)),
         priority: Number(item.priority ?? evidenceMeta(evidenceType(label)).priority),
-        payload: item.payload ?? null
+        payload: item.payload ?? null,
+        structured_payload: item.structured_payload ?? null
       };
     }
     function clampText(text, limit) {
@@ -1386,10 +1736,116 @@ HTML = r"""<!doctype html>
         <div class="impact-evidence">${esc(evidence)}</div>
       </div>`;
     }
+    function sequenceNode(raw) {
+      const text = clean(raw);
+      if (!text) return null;
+      const orderMatch = text.match(/^(\d+)\s+(.+)$/);
+      const order = orderMatch ? orderMatch[1] : "";
+      const rest = orderMatch ? orderMatch[2] : text;
+      const isCurrent = /(^|\s)本股\s/.test(rest);
+      const isStrong = /强势榜/.test(rest);
+      const timeMatch = rest.match(/(\d{2}:\d{2}:\d{2})$/);
+      const countMatch = rest.match(/\sx\d+$/);
+      const meta = clean((timeMatch ? timeMatch[1] : countMatch ? countMatch[0].trim() : ""));
+      let name = rest
+        .replace(/^本股\s+/, "")
+        .replace(/\((强势榜|非强势)\)/g, "")
+        .replace(/(\d{2}:\d{2}:\d{2})$/, "")
+        .replace(/\sx\d+$/, "")
+        .trim();
+      const codeMatch = name.match(/\b(\d{6})$/);
+      const code = codeMatch ? codeMatch[1] : "";
+      if (code) name = name.replace(/\b\d{6}$/, "").trim();
+      return { order, name: name || rest, code, meta, isCurrent, isStrong, raw: text };
+    }
+    function sequenceNodeHtml(node) {
+      if (!node) return "";
+      const tags = [
+        node.isCurrent ? `<span class="sequence-badge">本股</span>` : "",
+        node.isStrong ? `<span class="sequence-badge strong">强势</span>` : ""
+      ].filter(Boolean).join("");
+      return `<div class="sequence-row ${node.isCurrent ? "current" : ""} ${node.isStrong ? "strong" : ""}">
+        ${node.order ? `<span class="sequence-rank">${esc(node.order)}</span>` : `<span></span>`}
+        <div class="sequence-main">
+          <div class="sequence-name" title="${esc([node.name, node.code].filter(Boolean).join(' '))}">${esc(node.name)}</div>
+          ${node.code ? `<div class="sequence-code">${esc(node.code)}</div>` : ""}
+        </div>
+        ${tags || `<span></span>`}
+        ${node.meta ? `<div class="sequence-meta">${esc(node.meta)}</div>` : `<span></span>`}
+      </div>`;
+    }
+    function sequenceSummaryHtml(title, nodes) {
+      if (!nodes.length) return "";
+      const leader = nodes[0];
+      const current = nodes.find(node => node.isCurrent) || nodes[nodes.length - 1];
+      const leaderLabel = title === "时间序列" ? "首发" : "榜首";
+      const currentLabel = current?.isCurrent ? "本股" : "末位";
+      const one = (label, node, cls = "") => node ? `<div class="sequence-summary-one ${cls}">
+        <span class="sequence-summary-label">${esc(label)} ${node.order ? `#${esc(node.order)}` : ""}</span>
+        <span class="sequence-summary-stock">${esc(node.name)}${node.code ? ` ${esc(node.code)}` : ""}</span>
+        ${node.meta ? `<span class="sequence-summary-meta">${esc(node.meta)}</span>` : ""}
+      </div>` : "";
+      if (!leader || !current) return "";
+      if (leader === current) {
+        return `<div class="sequence-summary single">${one(leaderLabel, leader, leader.isCurrent ? "current" : "")}</div>`;
+      }
+      return `<div class="sequence-summary">
+        ${one(leaderLabel, leader, leader.isCurrent ? "current" : "")}
+        <div class="sequence-summary-arrow">&rarr;</div>
+        ${one(currentLabel, current, current.isCurrent ? "current" : "")}
+      </div>`;
+    }
+    function sequenceFlowHtml(title, rawBody) {
+      const nodes = rawBody.split("；").map(sequenceNode).filter(Boolean);
+      return sequenceFlowFromNodesHtml(title, nodes);
+    }
+    function sequenceFlowFromNodesHtml(title, nodes) {
+      if (!nodes.length) return "";
+      const hint = title === "时间序列" ? "触发先后" : "出现频次";
+      return `<section class="sequence-card">
+        <div class="sequence-head"><span>${esc(title)}</span><small>${esc(hint)} · ${nodes.length}条</small></div>
+        ${sequenceSummaryHtml(title, nodes)}
+        <div class="sequence-flow">${nodes.map(sequenceNodeHtml).join("")}</div>
+      </section>`;
+    }
+    function structuredSequenceNodes(items, active = false) {
+      return (Array.isArray(items) ? items : []).map(item => ({
+        order: clean(item.rank || item.order || ""),
+        name: clean(item.name || item.stock_name || "未知"),
+        code: clean(item.code || ""),
+        meta: active ? (Number(item.count) ? `x${Number(item.count)}` : "") : clean(item.time || ""),
+        isCurrent: Boolean(item.current || item.is_current),
+        isStrong: Boolean(item.strong || item.is_strong),
+        raw: ""
+      })).filter(item => item.name || item.code);
+    }
+    function structuredInfluenceHtml(payload, fallbackLines) {
+      const data = parseJsonObject(payload);
+      if (!Object.keys(data).length) return "";
+      const lines = Array.isArray(data.lines) ? data.lines.map(clean).filter(Boolean) : fallbackLines;
+      const headline = lines
+        .filter(line => !line.startsWith("时间序列：") && !line.startsWith("活跃序列：") && !line.startsWith("扩散股：") && !line.startsWith("扩散："))
+        .slice(0, 4);
+      const timeNodes = structuredSequenceNodes(data.time_sequence, false);
+      const activeNodes = structuredSequenceNodes(data.active_sequence, true);
+      const spread = data.spread && typeof data.spread === "object" ? data.spread : {};
+      const spreadLine = clean(spread.label ? `扩散：3分钟+${Number(spread.m3 || 0)}，5分钟+${Number(spread.m5 || 0)}，10分钟+${Number(spread.m10 || 0)}；${spread.label}` : "");
+      return [
+        headline.length ? `<div class="evidence-chip-row">${headline.map(influenceLineHtml).join("")}</div>` : "",
+        spreadLine ? `<div class="evidence-chip-row">${influenceLineHtml(spreadLine)}</div>` : "",
+        sequenceFlowFromNodesHtml("时间序列", timeNodes),
+        sequenceFlowFromNodesHtml("活跃序列", activeNodes)
+      ].filter(Boolean).join("");
+    }
     function influenceLineHtml(line) {
       const text = clean(line);
       if (!text) return "";
-      if (text.startsWith("时间序列：") || text.startsWith("活跃序列：") || text.startsWith("扩散股：")) {
+      if (text.startsWith("时间序列：") || text.startsWith("活跃序列：")) {
+        const [title, ...rest] = text.split("：");
+        const rawBody = rest.join("：");
+        return sequenceFlowHtml(title, rawBody);
+      }
+      if (text.startsWith("扩散股：")) {
         const [title, ...rest] = text.split("：");
         const body = rest.join("：");
         return `<details class="mini-fold">
@@ -1411,6 +1867,8 @@ HTML = r"""<!doctype html>
     function evidenceBodyHtml(part) {
       if (part.label === "带动性") {
         const structured = Array.isArray(part.payload) ? part.payload : [];
+        const structuredHtml = structuredInfluenceHtml(part.structured_payload || (!Array.isArray(part.payload) ? part.payload : null), structured);
+        if (structuredHtml) return `<div class="impact-list compact">${structuredHtml}</div>`;
         const lines = structured.length
           ? structured.slice(0, 8).map(item => clampText(typeof item === "string" ? item : item.reason || item.evidence || "", 150)).filter(Boolean)
           : String(part.body || "").split(/\n+/).map(clean).filter(Boolean);
@@ -1456,6 +1914,33 @@ HTML = r"""<!doctype html>
       if (part.className) return part.className;
       return evidenceMeta(part).className;
     }
+    function sourceCycleLabel(part) {
+      const registry = parseJsonObject(part.source_registry);
+      if (!Object.keys(registry).length) return "";
+      if (registry.mutable_intraday) return "盘中可变";
+      const cycle = clean(registry.update_cycle || "");
+      const labels = {
+        after_close_daily: "盘后日更",
+        dirty_or_manual: "变更刷新",
+        dirty_or_minute: "分钟/变更",
+        daily_or_manual: "日更/手动",
+        manual_or_batch: "批量维护",
+        on_demand: "按需更新",
+        scan_loop: "扫描实时",
+        window_loop: "窗口实时"
+      };
+      return labels[cycle] || "";
+    }
+    function sourceCycleTitle(part) {
+      const registry = parseJsonObject(part.source_registry);
+      if (!Object.keys(registry).length) return "";
+      return [
+        clean(registry.source_table || ""),
+        clean(registry.source_generation || ""),
+        clean(registry.update_cycle || ""),
+        clean(registry.data_date_policy || "")
+      ].filter(Boolean).join(" · ");
+    }
     function evidenceParts(row) {
       const structured = parseJsonArray(row.evidence_items)
         .map(normalizeEvidenceItem)
@@ -1495,14 +1980,25 @@ HTML = r"""<!doctype html>
       return parts;
     }
     function sectionCollapsed(part) {
+      if (part.collapsed) return true;
       if (part.layer !== "异步证据") return false;
       return ["核心支撑", "核心证据", "影响要素", "锚点一致性", "异动质量", "时效判断", "核心结论"].includes(part.label);
     }
     function evidenceSectionHtml(part) {
       const title = part.label === "题材" ? "题材要点" : part.label;
+      const dataDate = part.availability === "intraday" ? "" : clean(part.data_date || part.evidence_date || "");
+      const relation = clean(part.data_relation_label || "");
+      const dateChip = dataDate ? `<span class="evidence-date-chip">${esc(relation && relation !== "待核数据日" ? `${relation} ${dataDate}` : `数据日 ${dataDate}`)}</span>` : "";
+      const cycleLabel = sourceCycleLabel(part);
+      const cycleTitle = sourceCycleTitle(part);
+      const cycleChip = cycleLabel ? `<span class="evidence-cycle-chip" title="${esc(cycleTitle)}">${esc(cycleLabel)}</span>` : "";
       const head = `<div class="evidence-heading">
         <span>${esc(title)}</span>
-        <span class="evidence-source">${esc(part.source || evidenceSource(part.label, part.body))}</span>
+        <span class="evidence-source-wrap">
+          ${dateChip}
+          ${cycleChip}
+          <span class="evidence-source">${esc(part.source || evidenceSource(part.label, part.body))}</span>
+        </span>
       </div>`;
       const body = evidenceBodyHtml(part);
       if (sectionCollapsed(part)) {
@@ -1674,6 +2170,85 @@ HTML = r"""<!doctype html>
         return `<span class="evidence-chip ${esc(clean(chip.tone || "weak"))}">${esc(label)} ${esc(value)}</span>`;
       }).join("");
     }
+    function allEvidenceSections(row) {
+      const view = evidenceView(row);
+      const layers = Array.isArray(view.layers) ? view.layers : [];
+      return layers.flatMap(layer =>
+        (Array.isArray(layer.sections) ? layer.sections : []).map(section => ({
+          ...section,
+          groupTitle: clean(layer.title || ""),
+          groupAvailability: clean(layer.availability || layer.layer || "")
+        }))
+      );
+    }
+    function sectionLines(part, max = 3, limit = 118) {
+      if (!part) return [];
+      const payload = Array.isArray(part.payload) ? part.payload : [];
+      const fromPayload = payload.map(item => clean(typeof item === "string" ? item : item?.reason || item?.evidence || item?.title || "")).filter(Boolean);
+      const fromBody = String(part.body || "").split(/\n+/).map(clean).filter(Boolean);
+      const lines = [...fromPayload, ...fromBody];
+      const out = [];
+      for (const line of lines) {
+        const text = clampText(line, limit);
+        if (text && !out.some(item => item === text || item.includes(text) || text.includes(item))) out.push(text);
+        if (out.length >= max) break;
+      }
+      return out;
+    }
+    function sectionDateLabel(part) {
+      if (!part || part.availability === "intraday") return "";
+      const date = clean(part.data_date || part.evidence_date || "");
+      const relation = clean(part.data_relation_label || "");
+      if (!date) return relation && relation !== "待核数据日" ? relation : "";
+      return relation && relation !== "待核数据日" ? `${relation} ${date}` : `数据日 ${date}`;
+    }
+    function focusGroupHtml(title, tone, meta, lines) {
+      const useful = lines.map(line => clean(line)).filter(Boolean).slice(0, 3);
+      if (!useful.length) return "";
+      return `<div class="evidence-focus ${esc(tone)}">
+        <div class="evidence-focus-title"><span>${esc(title)}</span>${meta ? `<small>${esc(meta)}</small>` : ""}</div>
+        <div class="evidence-focus-lines">
+          ${useful.map(line => `<div class="evidence-focus-line" title="${esc(line)}">${esc(line)}</div>`).join("")}
+        </div>
+      </div>`;
+    }
+    function hardEvidenceFocusHtml(row) {
+      const sections = allEvidenceSections(row);
+      if (!sections.length) return "";
+      const byLabel = label => sections.find(part => part.label === label);
+      const keyFacts = byLabel("关键事实");
+      const support = byLabel("持续依据") || byLabel("核心支撑");
+      const lhb = byLabel("龙虎榜席位");
+      const period = byLabel("区间领头");
+      const initiative = byLabel("主动性");
+      const hardPattern = /净利|营收|同比|订单|合同|中标|客户|供货|公告|互动易|财报|季报|年报|龙虎榜|机构|股通|游资|问财|全市场|锚点内/;
+      const hardLines = [...sectionLines(support, 2), ...sectionLines(keyFacts, 3)]
+        .filter(line => hardPattern.test(line))
+        .slice(0, 3);
+      const fundLines = sectionLines(lhb, 3, 124);
+      const rankLines = [...sectionLines(period, 3, 108), ...sectionLines(initiative, 1, 108)].slice(0, 3);
+      const html = [
+        focusGroupHtml("硬催化", "good", sectionDateLabel(keyFacts || support), hardLines),
+        focusGroupHtml("资金确认", "hot", sectionDateLabel(lhb), fundLines),
+        focusGroupHtml("强度位置", "rank", sectionDateLabel(period), rankLines)
+      ].join("");
+      return html ? `<div class="evidence-focus-grid">${html}</div>` : "";
+    }
+    function evidenceFlowHtml(row) {
+      const view = evidenceView(row);
+      const layers = Array.isArray(view.layers) ? view.layers : [];
+      const sourceTime = clean(view.latest_source_updated_at || row.latest_source_updated_at || "");
+      const sourceChip = sourceTime ? `<span class="evidence-flow-chip">来源更新 ${esc(timeText(sourceTime))}</span>` : "";
+      const chips = layers
+        .map(layer => {
+          const title = clean(layer.title || layer.availability_label || "");
+          const count = Array.isArray(layer.sections) ? layer.sections.length : 0;
+          return title && count ? `<span class="evidence-flow-chip">${esc(title)} ${count}</span>` : "";
+        })
+        .filter(Boolean)
+        .join("") + sourceChip;
+      return chips ? `<div class="evidence-flow">${chips}</div>` : "";
+    }
     function evidenceSummaryHtml(row) {
       const view = evidenceView(row);
       const summary = view && typeof view.summary === "object" && !Array.isArray(view.summary) ? view.summary : null;
@@ -1684,12 +2259,15 @@ HTML = r"""<!doctype html>
         const reason = clampText(summary.reason || "", 90);
         const flaw = clampText(summary.flaw || "", 90);
         const gap = clampText(summary.gap || "", 110);
+        const focus = hardEvidenceFocusHtml(row);
+        const flow = evidenceFlowHtml(row);
         return `<div class="evidence-summary">
           <div class="evidence-verdict">
             <strong>${esc(clean(summary.title || (reason ? "异动原因" : facts.length ? "关键事实" : "证据强度")))}</strong>
             <span class="evidence-level ${esc(clean(summary.level_class || ""))}">${esc(clean(summary.level || "待补全"))}</span>
           </div>
           ${reason ? `<div class="evidence-judgement"><span>原因</span>${esc(reason)}</div>` : ""}
+          ${focus}
           <div class="decision-grid">
             ${cards.slice(0, 4).map(card => decisionCard(clean(card.label), clean(card.value), clean(card.tone || ""))).join("")}
           </div>
@@ -1700,8 +2278,9 @@ HTML = r"""<!doctype html>
               return label && value ? `<span class="evidence-chip ${esc(clean(chip.tone || "weak"))}">${esc(label)} ${esc(value)}</span>` : "";
             }).join("")}
           </div>
-          ${facts.length ? `<ul class="evidence-facts">${facts.map(fact => `<li class="evidence-fact">${esc(fact)}</li>`).join("")}</ul>` : ""}
+          ${!focus && facts.length ? `<ul class="evidence-facts">${facts.map(fact => `<li class="evidence-fact">${esc(fact)}</li>`).join("")}</ul>` : ""}
           ${flaw ? `<div class="evidence-judgement"><span>瑕疵</span>${esc(flaw)}</div>` : ""}
+          ${flow}
           <div class="evidence-basis">${esc(clean(summary.basis || ""))}</div>
           ${gap ? `<div class="evidence-gap">${esc(gap)}</div>` : ""}
         </div>`;
@@ -1741,12 +2320,15 @@ HTML = r"""<!doctype html>
         : flaw || firstGap ? "" : impact ? "" : parts.some(part => ["公告", "事件"].includes(part.label)) ? "" : "可继续补充公告/互动易作为硬证据。";
       const contractCards = contractDecisionCards(contract);
       const contractChipHtml = contractChips(contract);
+      const focus = hardEvidenceFocusHtml(row);
+      const flow = evidenceFlowHtml(row);
       return `<div class="evidence-summary">
         <div class="evidence-verdict">
           <strong>${judgement ? "异动原因" : facts.length ? "关键事实" : "证据强度"}</strong>
           <span class="evidence-level ${esc(info.cls)}">${esc(info.level)}</span>
         </div>
         ${judgement ? `<div class="evidence-judgement"><span>原因</span>${esc(judgement)}</div>` : ""}
+        ${focus}
         <div class="decision-grid">
           ${contractCards || `
             ${decisionCard("持续性", firstLine(qualityPart) || info.level)}
@@ -1762,8 +2344,9 @@ HTML = r"""<!doctype html>
             ${tapeLine ? `<span class="evidence-chip weak">盘口/资金 ${esc(tapeLine)}</span>` : ""}
           `}
         </div>
-        ${facts.length ? `<ul class="evidence-facts">${facts.map(fact => `<li class="evidence-fact">${esc(fact)}</li>`).join("")}</ul>` : ""}
+        ${!focus && facts.length ? `<ul class="evidence-facts">${facts.map(fact => `<li class="evidence-fact">${esc(fact)}</li>`).join("")}</ul>` : ""}
         ${flaw ? `<div class="evidence-judgement"><span>瑕疵</span>${esc(flaw)}</div>` : firstGap ? `<div class="evidence-judgement"><span>缺口</span>${esc(firstGap)}</div>` : ""}
+        ${flow}
         <div class="evidence-basis">${esc(info.basis)}</div>
         ${gap ? `<div class="evidence-gap">${esc(gap)}</div>` : ""}
       </div>`;
@@ -1871,6 +2454,54 @@ HTML = r"""<!doctype html>
       if (!tradeDate) return "/api/feed";
       return `/api/feed?trade_date=${encodeURIComponent(tradeDate)}`;
     }
+    function detailUrl(row) {
+      const tradeDate = clean($("tradeDateSelect").value || queryTradeDate());
+      const params = new URLSearchParams();
+      if (tradeDate) params.set("trade_date", tradeDate);
+      params.set("kind", clean(row.kind));
+      params.set("event_time", clean(row.event_time));
+      params.set("code", clean(row.code));
+      return `/api/feed/detail?${params.toString()}`;
+    }
+    function renderDetailLoading(row) {
+      if (!row) {
+        renderDetail(row);
+        return;
+      }
+      $("detailTime").textContent = `${stockTitleText(row)} · ${timeText(row.event_time)}`;
+      $("detailPanel").innerHTML = `<div class="detail-empty">证据详情加载中...</div>`;
+    }
+    function mergeDetailRow(base, detail) {
+      return { ...(base || {}), ...(detail || {}), detail_loaded: true };
+    }
+    async function loadDetail(row) {
+      if (!row) {
+        renderDetail(row);
+        return;
+      }
+      const key = rowKey(row);
+      const cached = detailCache.get(key);
+      if (cached && clean(cached.latest_source_updated_at) === clean(row.latest_source_updated_at)) {
+        renderDetail(mergeDetailRow(row, cached));
+        return;
+      }
+      renderDetailLoading(row);
+      const requestSeq = ++detailRequestSeq;
+      try {
+        const response = await fetch(detailUrl(row), { cache: "no-store" });
+        const data = await response.json();
+        const detail = data.row || {};
+        if (requestSeq !== detailRequestSeq || selectedKey !== key) return;
+        detail.latest_source_updated_at = clean(detail.latest_source_updated_at || row.latest_source_updated_at);
+        const merged = mergeDetailRow(row, detail);
+        detailCache.set(key, detail);
+        currentFeed = currentFeed.map(item => rowKey(item) === key ? merged : item);
+        renderDetail(merged);
+      } catch (error) {
+        if (requestSeq !== detailRequestSeq || selectedKey !== key) return;
+        $("detailPanel").innerHTML = `<div class="error">${esc(error)}</div>`;
+      }
+    }
     function renderTradeDates(selectedDate) {
       const select = $("tradeDateSelect");
       const dates = availableDates.length ? availableDates : [selectedDate].filter(Boolean);
@@ -1902,7 +2533,7 @@ HTML = r"""<!doctype html>
         if (!currentFeed.some(row => rowKey(row) === selectedKey)) {
           selectedKey = rowKey(currentFeed[0] || {});
         }
-        renderDetail(currentFeed.find(row => rowKey(row) === selectedKey) || currentFeed[0]);
+        loadDetail(currentFeed.find(row => rowKey(row) === selectedKey) || currentFeed[0]);
         renderList("feed", feed, "暂无情报");
         $("refreshText").textContent = `已刷新 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
       } catch (error) {
@@ -1924,7 +2555,7 @@ HTML = r"""<!doctype html>
       const target = event.target.closest("[data-select-key]");
       if (!target) return;
       selectedKey = target.dataset.selectKey || "";
-      renderDetail(currentFeed.find(row => rowKey(row) === selectedKey));
+      loadDetail(currentFeed.find(row => rowKey(row) === selectedKey));
       renderList("feed", currentFeed, "暂无情报");
     });
     loadTradeDates().then(refresh);

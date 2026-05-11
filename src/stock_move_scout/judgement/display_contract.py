@@ -67,7 +67,7 @@ def build_display_contract(row: dict[str, Any], scored: dict[str, Any], texts: d
         "influence": [compact(item, 140) for item in influence_reasons[:8]],
         "period": [compact(item, 120) for item in leadership_reasons[:4]],
         "tape": [compact(item, 100) for item in tape_reasons[:3]],
-        "support": [compact(item, 120) for item in (texts.get("support_items") or [])[:5]],
+        "support": [compact(item, 120) for item in (texts.get("support_items") or [])[:7]],
     }
     return {
         "schema_version": DISPLAY_CONTRACT_VERSION,

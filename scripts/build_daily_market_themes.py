@@ -5,7 +5,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from stock_scout_mysql import (
     run_mysql,
     sql_string,
 )
+from stock_move_scout.calendar import previous_trade_close_window
 
 
 THEME_RULES = [
@@ -112,7 +113,22 @@ def parse_time(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
 
 
-def time_window(args: argparse.Namespace) -> tuple[date, datetime, datetime]:
+def known_trade_dates(config: Any, trade_date: date) -> list[str]:
+    sql = f"""
+    SELECT DISTINCT DATE(scanned_at) AS trade_day
+    FROM scan_runs
+    WHERE accepted=1
+      AND DATE(scanned_at) < {sql_string(trade_date.isoformat())}
+    ORDER BY trade_day DESC
+    LIMIT 30;
+    """
+    try:
+        return [row[0] for row in mysql_rows(run_mysql(config, sql, batch=True)) if row and row[0]]
+    except Exception:
+        return []
+
+
+def time_window(args: argparse.Namespace, config: Any | None) -> tuple[date, datetime, datetime]:
     end = datetime.now()
     if args.until:
         end = parse_time(args.until)
@@ -122,7 +138,11 @@ def time_window(args: argparse.Namespace) -> tuple[date, datetime, datetime]:
     if args.since:
         start = parse_time(args.since)
     else:
-        start = (datetime.combine(trade_date, datetime.min.time()) - timedelta(days=1)).replace(hour=args.after_close_hour)
+        _, start, _ = previous_trade_close_window(
+            datetime.combine(trade_date, end.time()),
+            after_close_hour=args.after_close_hour,
+            known_trade_dates=known_trade_dates(config, trade_date) if config else None,
+        )
     return trade_date, start, end
 
 
@@ -145,6 +165,31 @@ def read_market_news(config: Any, start: datetime, end: datetime, min_importance
     """
     keys = ["source", "source_item_id", "item_kind", "published_at", "title", "content", "url", "importance"]
     return [dict(zip(keys, row)) for row in mysql_rows(run_mysql(config, sql, batch=True)) if len(row) >= len(keys)]
+
+
+def read_market_news_json(path: Path, start: datetime, end: datetime, min_importance: int) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rows = payload.get("rows") if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            published = parse_time(str(row.get("published_at") or ""))
+        except Exception:
+            published = None
+        if published and not (start <= published <= end):
+            continue
+        if int(float(row.get("importance") or 0)) < min_importance:
+            continue
+        result.append(row)
+    result.sort(key=lambda item: (int(float(item.get("importance") or 0)), str(item.get("published_at") or "")), reverse=True)
+    return result
 
 
 def matched_keywords(text: str, keywords: list[str]) -> list[str]:
@@ -242,6 +287,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--after-close-hour", type=int, default=15)
     parser.add_argument("--min-importance", type=int, default=2)
     parser.add_argument("--limit-titles", type=int, default=5)
+    parser.add_argument("--input-json", type=Path, default=root / "runs" / "data_tasks" / "morning_market_news.json")
     parser.add_argument("--output-json", type=Path, default=root / "runs" / "data_tasks" / "daily_market_themes.json")
     return parser.parse_args()
 
@@ -252,11 +298,9 @@ def main() -> int:
     except Exception:
         pass
     args = parse_args()
-    if not args.mysql_enabled:
-        raise SystemExit("--mysql-enabled is required")
-    config = mysql_config_from_args(args)
-    trade_date, start, end = time_window(args)
-    news_rows = read_market_news(config, start, end, args.min_importance)
+    config = mysql_config_from_args(args) if args.mysql_enabled else None
+    trade_date, start, end = time_window(args, config)
+    news_rows = read_market_news(config, start, end, args.min_importance) if config else read_market_news_json(args.input_json, start, end, args.min_importance)
     rows = build_themes(news_rows, trade_date, args.limit_titles)
     payload = {
         "built_at": now_text(),
@@ -269,7 +313,7 @@ def main() -> int:
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    imported = import_daily_market_theme_rows(config, rows)
+    imported = import_daily_market_theme_rows(config, rows) if config else 0
     print(json.dumps({"ok": True, "news_count": len(news_rows), "themes": len(rows), "imported": imported, "output_json": str(args.output_json)}, ensure_ascii=False))
     return 0
 

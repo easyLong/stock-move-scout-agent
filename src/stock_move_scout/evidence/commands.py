@@ -47,6 +47,41 @@ def build_evidence_command(
             command.append("--dirty-only")
         return command + mysql_args
 
+    if kind == "root_evidence_cache_dirty":
+        command = [
+            python_executable,
+            str(root / "scripts" / "refresh_root_evidence_cache.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--limit",
+            str(int(payload.get("limit", 50))),
+            "--dirty-only",
+        ]
+        if payload.get("code"):
+            command.extend(["--code", str(payload.get("code"))])
+        return command + mysql_args
+
+    if kind in {"stock_move_events", "derived_signals", "stock_move_evidence", "event_engine"}:
+        stage = {
+            "stock_move_events": "events",
+            "derived_signals": "signals",
+            "stock_move_evidence": "evidence",
+            "event_engine": "all",
+        }[kind]
+        command = [
+            python_executable,
+            str(root / "scripts" / "build_event_engine.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--stage",
+            stage,
+        ]
+        if payload.get("limit"):
+            command.extend(["--limit", str(int(payload.get("limit", 0)))])
+        if payload.get("code"):
+            command.extend(["--code", str(payload.get("code"))])
+        return command + mysql_args
+
     if kind == "hot_evidence_worker":
         command = [
             python_executable,

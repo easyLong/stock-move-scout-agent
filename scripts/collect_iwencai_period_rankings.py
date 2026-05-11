@@ -81,6 +81,20 @@ def clean_code(value: Any) -> str:
     return match.group(1) if match else ""
 
 
+BEIJING_EXCHANGE_MARKET_CODES = {"BJ", "BSE", "北交所", "北证"}
+BEIJING_EXCHANGE_MARKET_MARKERS = ("北交", "北证", "北京证券")
+
+
+def is_beijing_exchange_code(code: str, market_code: Any = "") -> bool:
+    code_text = clean_code(code) or str(code or "").strip()
+    market_text = str(market_code or "").strip().upper()
+    if market_text in BEIJING_EXCHANGE_MARKET_CODES or any(
+        marker in market_text for marker in BEIJING_EXCHANGE_MARKET_MARKERS
+    ):
+        return True
+    return code_text.startswith(("4", "8", "920"))
+
+
 def find_column(columns: list[str], *needles: str) -> str:
     for col in columns:
         if all(needle in col for needle in needles):
@@ -114,7 +128,13 @@ def query_iwencai(period_days: int, top: int, universe: str) -> tuple[str, pd.Da
     for value in [universe, "沪深A股", "A股"]:
         if value and value not in universes:
             universes.append(value)
-    suffixes = ["非ST，未退市", "非ST"]
+    suffixes = [
+        "非ST，未退市，剔除北交所",
+        "非ST，未退市，非北交所",
+        "非ST，剔除北交所",
+        "非ST，未退市",
+        "非ST",
+    ]
     errors: list[str] = []
     for current_top in top_values:
         for current_universe in universes:
@@ -143,9 +163,11 @@ def normalize_rows(df: pd.DataFrame, period_days: int, source_query: str, trade_
         code = clean_code(raw.get(code_col) or raw.get("code"))
         if not code:
             continue
-        rank_no, rank_total = parse_rank(raw.get(period_rank_col))
-        if not rank_no:
-            rank_no = len(rows) + 1
+        market_code = str(raw.get(market_code_col) or "").strip()
+        if is_beijing_exchange_code(code, market_code):
+            continue
+        _, rank_total = parse_rank(raw.get(period_rank_col))
+        rank_no = len(rows) + 1
         rows.append(
             {
                 "trade_date": actual_trade_date,
@@ -157,7 +179,7 @@ def normalize_rows(df: pd.DataFrame, period_days: int, source_query: str, trade_
                 "period_pct": to_float(raw.get(period_pct_col)),
                 "latest_pct": to_float(raw.get(latest_pct_col)),
                 "latest_price": to_float(raw.get(latest_price_col)),
-                "market_code": str(raw.get(market_code_col) or "").strip(),
+                "market_code": market_code,
                 "source_query": source_query,
                 "raw_json": raw,
             }
@@ -208,12 +230,31 @@ def upsert_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> int:
     return len(rows)
 
 
+def delete_beijing_exchange_rows(config: MySqlConfig, trade_date: str, period_days: int) -> None:
+    sql = f"""
+    DELETE FROM stock_period_rankings
+    WHERE trade_date={sql_string(trade_date)}
+      AND period_days={int(period_days)}
+      AND (
+        code LIKE '4%%'
+        OR code LIKE '8%%'
+        OR code LIKE '920%%'
+        OR UPPER(market_code) IN ('BJ', 'BSE')
+        OR market_code LIKE '%%北交%%'
+        OR market_code LIKE '%%北证%%'
+        OR market_code LIKE '%%北京证券%%'
+      );
+    """
+    run_mysql(config, sql)
+
+
 def collect(config: MySqlConfig, periods: list[int], top: int, universe: str, trade_date: str = "") -> dict[str, Any]:
     ensure_table(config)
     result: dict[str, Any] = {"periods": {}, "written": 0}
     for period in periods:
         source_query, df = query_iwencai(period, top, universe)
         actual_trade_date, rows = normalize_rows(df, period, source_query, trade_date)
+        delete_beijing_exchange_rows(config, actual_trade_date, period)
         written = upsert_rows(config, rows)
         result["periods"][str(period)] = {
             "trade_date": actual_trade_date,

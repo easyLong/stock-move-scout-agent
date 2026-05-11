@@ -27,6 +27,10 @@ from stock_move_scout.db import (
     sql_number,
     sql_string,
 )
+from stock_move_scout.feed.root_cache import (
+    enqueue_root_evidence_cache_dirty_many,
+    latest_root_evidence_trade_date,
+)
 
 
 UNANCHORED_TYPE = "unanchored"
@@ -1527,6 +1531,8 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
     if not isinstance(rows, list) or not rows:
         return {"snapshots": 0, "items": 0}
     statements: list[str] = []
+    affected_cache_rows: list[dict[str, Any]] = []
+    affected_codes: set[str] = set()
     snapshot_count = 0
     item_count = 0
     for row in rows:
@@ -1567,6 +1573,14 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
             )
             snapshot_count += 1
         items = row.get("ths_root_items") if isinstance(row.get("ths_root_items"), list) else []
+        if items and code not in affected_codes:
+            affected_codes.add(code)
+            affected_cache_rows.append(
+                {
+                    "code": code,
+                    "stock_name": text_value(row, "stock_name") or text_value(row, "name"),
+                }
+            )
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1618,7 +1632,17 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
     if not statements:
         return {"snapshots": 0, "items": 0}
     run_mysql(config, "START TRANSACTION;\n" + "\n".join(statements) + "\nCOMMIT;")
-    return {"snapshots": snapshot_count, "items": item_count}
+    dirty_cache = 0
+    if affected_cache_rows:
+        trade_date = latest_root_evidence_trade_date(config) or date.today().strftime("%Y-%m-%d")
+        dirty_cache = enqueue_root_evidence_cache_dirty_many(
+            config,
+            trade_date,
+            affected_cache_rows,
+            reason="stock_ths_root_items_updated",
+            priority=25,
+        )
+    return {"snapshots": snapshot_count, "items": item_count, "dirty_cache": dirty_cache}
 
 
 def import_market_news_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> int:

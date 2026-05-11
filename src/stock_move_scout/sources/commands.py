@@ -100,6 +100,43 @@ def build_source_command(
             command.extend(["--until", str(payload.get("until"))])
         return command + mysql_args
 
+    if kind == "morning_reference_post":
+        command = [
+            python_executable,
+            str(root / "scripts" / "build_morning_reference_post.py"),
+            "--after-close-hour",
+            str(int(payload.get("after_close_hour", 15))),
+            "--theme-limit",
+            str(int(payload.get("theme_limit", 8))),
+            "--news-limit",
+            str(int(payload.get("news_limit", 30))),
+            "--min-importance",
+            str(int(payload.get("min_importance", 2))),
+            "--output-dir",
+            str(root / "runs" / "posts"),
+            "--model-config",
+            str(payload.get("model_config", "default")),
+            "--model-timeout",
+            str(int(payload.get("model_timeout", payload.get("timeout", 60)))),
+        ]
+        if payload.get("model"):
+            command.extend(["--model", str(payload.get("model"))])
+        if payload.get("base_url"):
+            command.extend(["--base-url", str(payload.get("base_url"))])
+        if payload.get("api_key_file"):
+            command.extend(["--api-key-file", str(payload.get("api_key_file"))])
+        if payload.get("fallback_without_model", True):
+            command.append("--fallback-without-model")
+        else:
+            command.append("--no-fallback-without-model")
+        if payload.get("trade_date"):
+            command.extend(["--trade-date", str(payload.get("trade_date"))])
+        if payload.get("since"):
+            command.extend(["--since", str(payload.get("since"))])
+        if payload.get("until"):
+            command.extend(["--until", str(payload.get("until"))])
+        return command + mysql_args
+
     if kind == "ths_hot_concepts":
         command = [
             python_executable,
@@ -198,6 +235,40 @@ def build_source_command(
             command.append("--judgement-codes")
         if payload.get("codes"):
             command.extend(["--codes", str(payload.get("codes"))])
+        return command + mysql_args
+
+    if kind == "announcement_effects":
+        command = [
+            python_executable,
+            str(root / "scripts" / "build_announcement_effects.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--lookback-days",
+            str(int(payload.get("lookback_days", 240))),
+            "--stale-after-days",
+            str(int(payload.get("stale_after_days", 31))),
+            "--sleep-seconds",
+            str(float(payload.get("sleep_seconds", 0.15))),
+        ]
+        if payload.get("code"):
+            command.extend(["--code", str(payload.get("code"))])
+        if payload.get("limit"):
+            command.extend(["--limit", str(int(payload.get("limit", 0)))])
+        if payload.get("refresh_bars", True) is False:
+            command.append("--no-refresh-bars")
+        if payload.get("allow_local_fallback", False):
+            command.append("--allow-local-fallback")
+        return command + mysql_args
+
+    if kind == "effective_facts":
+        command = [
+            python_executable,
+            str(root / "scripts" / "build_effective_facts.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+        ]
+        if payload.get("code"):
+            command.extend(["--code", str(payload.get("code"))])
         return command + mysql_args
 
     if kind == "auction_candidates":

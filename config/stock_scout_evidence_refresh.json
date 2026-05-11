@@ -69,7 +69,7 @@
       "refresh_mode": "daily_morning",
       "preferred_start_time": "08:30:00",
       "refresh_interval_seconds": 86400,
-      "window": "yesterday_after_close_to_now",
+      "window": "previous_trade_close_to_now",
       "important_only": true,
       "sources": ["cls_headline", "cls_telegraph_important", "wallstreetcn_headline", "wallstreetcn_live_important"]
     },
@@ -78,10 +78,22 @@
       "enabled": true,
       "scope": "market_theme_radar",
       "refresh_mode": "daily_morning_after_news",
-      "preferred_start_time": "08:35:00",
+      "preferred_start_time": "08:32:00",
       "refresh_interval_seconds": 86400,
       "depends_on": ["morning_market_news"],
       "sources": ["market_news_items"]
+    },
+    "morning_reference_post": {
+      "tier": "warm",
+      "enabled": true,
+      "scope": "morning_reference_text",
+      "refresh_mode": "daily_morning_after_themes",
+      "preferred_start_time": "08:35:00",
+      "refresh_interval_seconds": 86400,
+      "depends_on": ["morning_market_news", "daily_market_themes"],
+      "window": "previous_trade_close_to_now",
+      "generation": "model_summary_with_rule_fallback",
+      "output": "runs/posts/morning_reference_latest.txt"
     },
     "auction_candidates": {
       "tier": "hot",

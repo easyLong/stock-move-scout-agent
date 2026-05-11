@@ -26,7 +26,8 @@ def initiative_score(activity_context: dict[str, Any]) -> tuple[float, str, list
         return 0.0, "未知", []
     score = 0.0
     reasons: list[str] = []
-    trigger_order = _as_int(activity_context.get("trigger_order"), 9999)
+    day_trigger_order = _as_int(activity_context.get("day_trigger_order") or activity_context.get("trigger_order"), 9999)
+    trigger_order = _as_int(activity_context.get("wave_trigger_order") or day_trigger_order, 9999)
     first_rank = _as_int(activity_context.get("first_rank_speed"), 9999)
     first_speed = _as_float(activity_context.get("first_speed"))
     first_amount_delta = _as_float(activity_context.get("first_amount_delta_15s"))
@@ -34,17 +35,19 @@ def initiative_score(activity_context: dict[str, Any]) -> tuple[float, str, list
     peers_total = _as_int(activity_context.get("peers_total_until_event"), 0)
     first_at = str(activity_context.get("stock_first_at") or "")
     trigger_percent = _as_float(activity_context.get("trigger_percent"))
+    wave_no = _as_int(activity_context.get("wave_no"), 1)
+    wave_prefix = "当前波段" if wave_no > 1 else "同锚点"
 
     if trigger_order == 1:
         score += 14
-        reasons.append("同锚点最早触发")
+        reasons.append(f"{wave_prefix}最早触发")
     elif trigger_order <= 3:
         score += 10
-        reasons.append(f"同锚点第{trigger_order}个触发")
+        reasons.append(f"{wave_prefix}第{trigger_order}个触发")
     elif trigger_order <= 5:
         score += 6
-        reasons.append(f"同锚点第{trigger_order}个触发")
-    elif peers_total and trigger_percent <= 0.1 and trigger_order <= 15:
+        reasons.append(f"{wave_prefix}第{trigger_order}个触发")
+    elif peers_total and trigger_percent <= 0.1 and day_trigger_order <= 15:
         score += 3
         reasons.append(f"同锚点前{trigger_percent * 100:.0f}%触发")
 
@@ -83,19 +86,23 @@ def influence_score(activity_context: dict[str, Any]) -> tuple[float, str, list[
     n3 = _as_int(activity_context.get("new_after_3m"))
     n5 = _as_int(activity_context.get("new_after_5m"))
     n10 = _as_int(activity_context.get("new_after_10m"))
-    trigger_order = _as_int(activity_context.get("trigger_order"), 9999)
+    day_trigger_order = _as_int(activity_context.get("day_trigger_order") or activity_context.get("trigger_order"), 9999)
+    trigger_order = _as_int(activity_context.get("wave_trigger_order") or day_trigger_order, 9999)
     expansion_rate = _as_float(activity_context.get("new_after_10m_rate"))
-    first_code = str(activity_context.get("anchor_first_code") or "").strip()
-    first_name = str(activity_context.get("anchor_first_name") or "").strip()
-    first_at = str(activity_context.get("anchor_first_at") or "").strip()
+    first_code = str(activity_context.get("wave_first_code") or activity_context.get("anchor_first_code") or "").strip()
+    first_name = str(activity_context.get("wave_first_name") or activity_context.get("anchor_first_name") or "").strip()
+    first_at = str(activity_context.get("wave_first_at") or activity_context.get("anchor_first_at") or "").strip()
     first_time = first_at.split(" ")[-1] if first_at else ""
-    first_rank = _as_int(activity_context.get("anchor_first_rank_speed"), 0)
-    first_speed = _as_float(activity_context.get("anchor_first_speed"))
+    first_rank = _as_int(activity_context.get("wave_first_rank_speed") or activity_context.get("anchor_first_rank_speed"), 0)
+    first_speed = _as_float(activity_context.get("wave_first_speed") or activity_context.get("anchor_first_speed"))
     first_is_strong = bool(activity_context.get("anchor_first_is_strong"))
     first_active_rank = _as_int(activity_context.get("anchor_first_active_rank"), 0)
     first_active_count = _as_int(activity_context.get("anchor_first_active_count"), 0)
-    delay_text = str(activity_context.get("delay_from_anchor_first_text") or "").strip()
-    delay_seconds = _as_int(activity_context.get("delay_from_anchor_first_seconds"), 0)
+    delay_text = str(activity_context.get("delay_from_wave_first_text") or activity_context.get("delay_from_anchor_first_text") or "").strip()
+    delay_seconds = _as_int(activity_context.get("delay_from_wave_first_seconds") or activity_context.get("delay_from_anchor_first_seconds"), 0)
+    wave_no = _as_int(activity_context.get("wave_no"), 1)
+    day_delay_text = str(activity_context.get("delay_from_anchor_first_text") or "").strip()
+    day_first_name = str(activity_context.get("anchor_first_name") or activity_context.get("anchor_first_code") or "").strip()
     before_10m_count = _as_int(activity_context.get("before_10m_count"), 0)
     before_10m_label = str(activity_context.get("before_10m_label") or "").strip()
     movers_10m = activity_context.get("movers_after_10m") if isinstance(activity_context.get("movers_after_10m"), list) else []
@@ -191,9 +198,14 @@ def influence_score(activity_context: dict[str, Any]) -> tuple[float, str, list[
         label = "弱"
 
     if position_label == "首发":
-        position_line = f"带动定位：首发；本股为同锚全天首触发{(' ' + first_time) if first_time else ''}"
+        if wave_no > 1:
+            day_hint = f"；全天首发为{day_first_name}，本股晚于全天首发{day_delay_text}" if day_first_name and day_delay_text else ""
+            position_line = f"带动定位：当前波段首发；本股为第{wave_no}波首触发{(' ' + first_time) if first_time else ''}{day_hint}"
+        else:
+            position_line = f"带动定位：首发；本股为同锚全天首触发{(' ' + first_time) if first_time else ''}"
     else:
-        position_line = f"带动定位：{position_label}；本股第{trigger_order}个触发，晚于首发{delay_text or '未知'}"
+        wave_text = "当前波段" if wave_no > 1 else "同锚"
+        position_line = f"带动定位：{position_label}；本股{wave_text}第{trigger_order}个触发，晚于波段首发{delay_text or '未知'}"
 
     def strong_mark(item: dict[str, Any]) -> str:
         return "强势榜" if bool(item.get("is_strong")) else "非强势"
@@ -263,6 +275,92 @@ def influence_score(activity_context: dict[str, Any]) -> tuple[float, str, list[
     return min(score, 20.0), label, reasons[:8]
 
 
+def influence_payload(activity_context: dict[str, Any], label: str = "", reasons: list[str] | None = None) -> dict[str, Any]:
+    if not activity_context:
+        return {}
+
+    def short_time(value: Any) -> str:
+        return str(value or "").split(" ")[-1]
+
+    def sequence_item(item: dict[str, Any], *, active: bool = False) -> dict[str, Any]:
+        out = {
+            "code": str(item.get("code") or "").strip(),
+            "name": str(item.get("stock_name") or "").strip(),
+            "current": bool(item.get("is_current")),
+            "strong": bool(item.get("is_strong")),
+        }
+        if active:
+            out["rank"] = _as_int(item.get("rank"), 0)
+            out["count"] = _as_int(item.get("count"), 0)
+        else:
+            out["rank"] = _as_int(item.get("order"), 0)
+            out["time"] = short_time(item.get("first_at"))
+        return out
+
+    time_top = activity_context.get("time_top3_plus_self") if isinstance(activity_context.get("time_top3_plus_self"), list) else []
+    quantity_top = (
+        activity_context.get("quantity_top3_plus_self") if isinstance(activity_context.get("quantity_top3_plus_self"), list) else []
+    )
+    movers_10m = activity_context.get("movers_after_10m") if isinstance(activity_context.get("movers_after_10m"), list) else []
+    n3 = _as_int(activity_context.get("new_after_3m"))
+    n5 = _as_int(activity_context.get("new_after_5m"))
+    n10 = _as_int(activity_context.get("new_after_10m"))
+    trigger_order = _as_int(activity_context.get("wave_trigger_order") or activity_context.get("day_trigger_order") or activity_context.get("trigger_order"), 0)
+    wave_no = _as_int(activity_context.get("wave_no"), 1)
+    delay_seconds = _as_int(activity_context.get("delay_from_wave_first_seconds") or activity_context.get("delay_from_anchor_first_seconds"), 0)
+    delay_text = str(activity_context.get("delay_from_wave_first_text") or activity_context.get("delay_from_anchor_first_text") or "").strip()
+    before_10m_count = _as_int(activity_context.get("before_10m_count"), 0)
+    before_10m_label = str(activity_context.get("before_10m_label") or "").strip()
+
+    first_code = str(activity_context.get("wave_first_code") or activity_context.get("anchor_first_code") or "").strip()
+    first_name = str(activity_context.get("wave_first_name") or activity_context.get("anchor_first_name") or "").strip()
+    first_at = str(activity_context.get("wave_first_at") or activity_context.get("anchor_first_at") or "").strip()
+    first = {
+        "code": first_code,
+        "name": first_name,
+        "time": short_time(first_at),
+        "strong": bool(activity_context.get("anchor_first_is_strong")),
+        "rank_speed": _as_int(activity_context.get("wave_first_rank_speed") or activity_context.get("anchor_first_rank_speed"), 0),
+        "speed": _as_float(activity_context.get("wave_first_speed") or activity_context.get("anchor_first_speed")),
+        "active_rank": _as_int(activity_context.get("anchor_first_active_rank"), 0),
+        "active_count": _as_int(activity_context.get("anchor_first_active_count"), 0),
+    }
+
+    spread_label = "强扩散" if n3 >= 3 else "中强扩散" if n5 >= 5 or n10 >= 8 else "普通扩散" if n10 >= 4 or n3 >= 1 else "弱扩散"
+    current_time_item = next((item for item in time_top if isinstance(item, dict) and item.get("is_current")), {})
+    current_active_item = next((item for item in quantity_top if isinstance(item, dict) and item.get("is_current")), {})
+
+    return {
+        "label": label,
+        "position": {
+            "trigger_order": trigger_order,
+            "wave_no": wave_no,
+            "delay_seconds": delay_seconds,
+            "delay_text": delay_text,
+        },
+        "preheat": {
+            "before_10m_count": before_10m_count,
+            "label": before_10m_label,
+        },
+        "first": first,
+        "current": {
+            "time_rank": _as_int(current_time_item.get("order"), trigger_order) if isinstance(current_time_item, dict) else trigger_order,
+            "active_rank": _as_int(current_active_item.get("rank"), 0) if isinstance(current_active_item, dict) else 0,
+            "active_count": _as_int(current_active_item.get("count"), 0) if isinstance(current_active_item, dict) else 0,
+        },
+        "time_sequence": [sequence_item(item) for item in time_top if isinstance(item, dict)],
+        "active_sequence": [sequence_item(item, active=True) for item in quantity_top if isinstance(item, dict)],
+        "spread": {
+            "m3": n3,
+            "m5": n5,
+            "m10": n10,
+            "label": spread_label,
+            "movers": [sequence_item(item) for item in movers_10m[:10] if isinstance(item, dict)],
+        },
+        "lines": list(reasons or []),
+    }
+
+
 def short_term_behavior_score(
     initiative: float,
     initiative_label: str,
@@ -299,6 +397,7 @@ def short_term_behavior_score(
 
 __all__ = [
     "influence_score",
+    "influence_payload",
     "initiative_score",
     "short_term_behavior_score",
 ]

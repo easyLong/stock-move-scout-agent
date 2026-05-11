@@ -83,6 +83,8 @@ def build_activity_index(
                 "first_rank_speed": _as_int(row[4]),
                 "first_speed": _as_float(row[5]),
                 "first_amount_delta_15s": _as_float(row[6]),
+                "anchor_confidence": _as_float(row[7], 70.0) if len(row) > 7 else 70.0,
+                "anchor_source": str(row[8] or "") if len(row) > 8 else "",
             }
         )
 
@@ -106,6 +108,8 @@ def build_activity_index(
                 "rank_speed": _as_int(row[4]),
                 "speed": _as_float(row[5]),
                 "amount_delta_15s": _as_float(row[6]),
+                "anchor_confidence": _as_float(row[7], 70.0) if len(row) > 7 else 70.0,
+                "anchor_source": str(row[8] or "") if len(row) > 8 else "",
             }
         )
 
@@ -308,6 +312,8 @@ def activity_context_from_index(
         "anchor": anchor_name,
         "stock_first_at": hit.get("first_at"),
         "is_strong": bool(hit.get("is_strong")),
+        "anchor_match_confidence": _as_float(hit.get("anchor_confidence"), 70.0),
+        "anchor_source": hit.get("anchor_source") or "",
         "first_rank_speed": _as_int(hit.get("first_rank_speed")),
         "first_speed": _as_float(hit.get("first_speed")),
         "first_amount_delta_15s": _as_float(hit.get("first_amount_delta_15s")),
@@ -334,6 +340,7 @@ def activity_context_from_index(
         "quiet_before_wave_text": format_seconds(wave_quiet_before_seconds),
         "is_restart_wave": wave_quiet_before_seconds >= 60 * 60,
         "wave_count_at_start": wave_trigger_order,
+        "day_trigger_order": trigger_order,
         "trigger_order": trigger_order,
         "peers_before": peers_before,
         "peers_total_until_event": peers_total,

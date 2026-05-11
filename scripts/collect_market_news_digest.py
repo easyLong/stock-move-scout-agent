@@ -7,13 +7,15 @@ import html
 import json
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import requests
 
 from stock_scout_mysql import add_mysql_args, import_market_news_rows, mysql_config_from_args
+from stock_move_scout.calendar import previous_trade_close_window
+from stock_move_scout.db import mysql_rows, run_mysql
 
 
 HEADERS = {
@@ -88,14 +90,33 @@ def timestamp_to_text(value: Any) -> str:
         return ""
 
 
-def parse_time_range(args: argparse.Namespace) -> tuple[datetime, datetime]:
+def known_trade_dates(config: Any, until: datetime) -> list[str]:
+    sql = f"""
+    SELECT DISTINCT DATE(scanned_at) AS trade_day
+    FROM scan_runs
+    WHERE accepted=1
+      AND scanned_at < '{until.strftime("%Y-%m-%d 00:00:00")}'
+    ORDER BY trade_day DESC
+    LIMIT 30;
+    """
+    try:
+        return [row[0] for row in mysql_rows(run_mysql(config, sql, batch=True)) if row and row[0]]
+    except Exception:
+        return []
+
+
+def parse_time_range(args: argparse.Namespace, config: Any | None = None) -> tuple[datetime, datetime]:
     end = datetime.now()
+    if args.until:
+        end = datetime.strptime(args.until, "%Y-%m-%d %H:%M:%S")
     if args.since:
         start = datetime.strptime(args.since, "%Y-%m-%d %H:%M:%S")
     else:
-        start = (end - timedelta(days=1)).replace(hour=args.after_close_hour, minute=0, second=0, microsecond=0)
-    if args.until:
-        end = datetime.strptime(args.until, "%Y-%m-%d %H:%M:%S")
+        _, start, _ = previous_trade_close_window(
+            end,
+            after_close_hour=args.after_close_hour,
+            known_trade_dates=known_trade_dates(config, end) if config else None,
+        )
     return start, end
 
 
@@ -276,8 +297,8 @@ def wscn_live_items(timeout: int) -> list[dict[str, Any]]:
     return result
 
 
-def collect(args: argparse.Namespace) -> dict[str, Any]:
-    start, end = parse_time_range(args)
+def collect(args: argparse.Namespace, config: Any | None = None) -> dict[str, Any]:
+    start, end = parse_time_range(args, config)
     rows: list[dict[str, Any]] = []
     statuses: list[str] = []
     collectors = [
@@ -339,12 +360,13 @@ def main() -> int:
     except Exception:
         pass
     args = parse_args()
-    payload = collect(args)
+    config = mysql_config_from_args(args) if args.mysql_enabled else None
+    payload = collect(args, config)
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     imported = 0
-    if args.mysql_enabled:
-        imported = import_market_news_rows(mysql_config_from_args(args), payload["rows"])
+    if args.mysql_enabled and config is not None:
+        imported = import_market_news_rows(config, payload["rows"])
     print(json.dumps({"ok": True, "rows": payload["row_count"], "imported": imported, "output_json": str(args.output_json)}, ensure_ascii=False))
     return 0
 
