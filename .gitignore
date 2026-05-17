@@ -10,6 +10,8 @@ runs/*
 !runs/logs/
 !runs/logs/.gitkeep
 
+output/
+
 data/stock/*
 !data/stock/.gitkeep
 

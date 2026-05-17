@@ -1,102 +1,44 @@
-# Data Sources
+# 数据源
 
-数据源层已经迁移到：
+## 实时行情
 
-```text
-src/stock_move_scout/sources/
-  definitions.py
-  commands.py
-```
+| 数据源 | 采集方式 | 用途 |
+| --- | --- | --- |
+| 通达信快照 | `get_security_quotes` | 异动情报流、窗口强度、市场概览 |
+| 上证指数快照 | 通达信指数符号 | 市场概览指数展示 |
 
-## 1. Layer Contract
+盘中实时任务只服务当天交易日。
 
-数据源层负责回答三件事：
+## 盘后确认
 
-```text
-这个源是什么
-它属于 hot / warm / cold 哪一层
-它由哪个脚本采集，产出哪些 MySQL 表
-它是否需要按股票池分批入队
-```
+| 数据源 | 表 | 用途 |
+| --- | --- | --- |
+| 东方财富涨停池 | `limit_up_pool_items` | 研究池、领头羊封板维度 |
+| AkShare 日K | `stock_daily_bars` | 5日涨幅、收盘市场宽度 |
+| 同花顺盘后小结 | `ths_market_after_close_summaries` | 早参市场背景 |
 
-调度器不再直接硬编码这些数据源脚本参数，而是调用：
+领头羊快照必须等涨停池、日K、收盘市场宽度齐备后生成。
 
-```python
-stock_move_scout.sources.build_source_command(...)
-stock_move_scout.sources.is_batched_source_task(...)
-```
+## 同花顺 F10
 
-## 2. Current Sources
+| 数据 | 表 | 用途 |
+| --- | --- | --- |
+| 近期重要事件 | `stock_ths_root_items` | 有效事实候选 |
+| 个股概念解释 | `ths_stock_concept_explanations` | 题材解释、领头羊展示 |
+| 首页头条题材 | `ths_homepage_headline_themes` | 多题材关联 |
+| 头条题材成分 | `ths_homepage_headline_theme_members` | 题材内领涨和成员关系 |
 
-```text
-tdx_market
-  tier: hot
-  tables: stocks, scan_runs, scan_movers, windows, window_movers
-  role: 通达信行情、股票池、15秒异动扫描、5分钟窗口聚合
+## 模型输入
 
-ths_root
-  tier: cold
-  tables: stock_company_profiles, stock_ths_root_items
-  role: 同花顺F10根页面，公司画像、亮点、近期事件、公告、题材要点
-
-market_news
-  tier: warm
-  tables: market_news_items, daily_market_themes
-  role: 财联社/华尔街见闻盘前资讯，以及每日主题加工
-
-ths_theme
-  tier: cold
-  tables: ths_hot_concept_events, ths_hot_concept_members,
-          ths_limit_up_review_items, ths_stock_concept_explanations,
-          stock_theme_reason_bank, active_market_anchors,
-          active_market_anchor_members, active_market_anchor_relations,
-          active_anchor_match_candidates
-  role: 同花顺题材、涨停复盘、个股概念解释和题材理由库
-
-iwencai_period_rankings
-  tier: warm
-  tables: stock_period_rankings
-  role: 问财3/5/10日区间强度排名
-
-lhb_seat
-  tier: warm
-  tables: stock_lhb_seat_evidence
-  role: 龙虎榜席位结构
-
-auction_market
-  tier: hot
-  tables: auction_candidates, auction_minute_analysis, auction_trend_summary
-  role: 集合竞价分钟雷达和趋势总结
-```
-
-## 3. Inspect Sources
-
-```powershell
-stock-move-scout sources
-stock-move-scout sources --json
-```
-
-当前需要分批入队的 source 任务：
+模型只处理已经进入有效事实层的候选事实。没有有效事实时不调用模型。
 
 ```text
-cold_company_profile
-cold_company_profile_batch
-ths_root_extended_items
-ths_stock_concepts
+原始事实 -> 近10日有效候选 -> 有效事实总结 -> 根证据缓存 / 页面展示
 ```
 
-调度器只调用 `is_batched_source_task()`，不再直接硬编码这些同花顺/公司画像任务名。
+## 已不作为主数据源
 
-## 4. Next Boundary
-
-后续如果新增数据源，优先改：
-
-```text
-src/stock_move_scout/sources/definitions.py
-src/stock_move_scout/sources/commands.py
-src/stock_move_scout/scheduler/task_definitions.py
-```
-
-不要直接把新源写进 `stock_scout_task_scheduler.py`。
-
-MySQL 是唯一业务状态源。`runs/`、临时 JSON、CSV 只作为日志、缓存或旧脚本兼容输出，不参与业务状态流转。
+- 问财 Top50 排名
+- 同花顺涨停复盘表
+- 题材理由银行 `stock_theme_reason_bank`
+- 独立公告影响评分表

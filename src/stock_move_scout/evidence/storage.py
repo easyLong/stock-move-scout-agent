@@ -105,6 +105,163 @@ def existing_evidence_hash(config: MySqlConfig, trade_date: str, code: str) -> s
     return rows[0][0] if rows and rows[0] else ""
 
 
+def existing_evidence_hashes(config: MySqlConfig, trade_date: str, codes: list[str]) -> dict[str, str]:
+    clean_codes = sorted({str(code or "").strip() for code in codes if str(code or "").strip()})
+    if not clean_codes:
+        return {}
+    sql = f"""
+    SELECT code, evidence_hash
+    FROM async_evidence_summaries
+    WHERE trade_date={sql_string(trade_date)}
+      AND code IN ({",".join(sql_string(code) for code in clean_codes)});
+    """
+    return {
+        row[0]: row[1]
+        for row in mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+        if len(row) >= 2 and row[0]
+    }
+
+
+def reuse_summary_by_hash(config: MySqlConfig, payload: dict[str, Any], current_hash: str) -> bool:
+    trade_date = str(payload.get("trade_date") or "")
+    code = str(payload.get("code") or "")
+    if not trade_date or not code or not current_hash:
+        return False
+    sql = f"""
+    INSERT INTO async_evidence_summaries(
+      trade_date, code, stock_name, evidence_hash, summary_text, key_points,
+      evidence_filter_summary, key_facts, move_reason, sustainability_basis, main_flaw, missing_evidence,
+      core_evidence_items, timeliness_label, timeliness_reason, final_analysis,
+      move_explanation, explanation_strength, anchor_match, anchor_match_reason, quality_label, core_support, counterpoints, final_view,
+      hard_catalysts, impact_factors, impact_summary_text, risks, evidence_strength, evidence_gaps, source_counts,
+      source_payload, model, status, error_message, raw_json
+    )
+    SELECT
+      {sql_string(trade_date)},
+      {sql_string(code)},
+      {sql_string(str(payload.get("stock_name") or ""))},
+      evidence_hash,
+      summary_text,
+      key_points,
+      evidence_filter_summary,
+      key_facts,
+      move_reason,
+      sustainability_basis,
+      main_flaw,
+      missing_evidence,
+      core_evidence_items,
+      timeliness_label,
+      timeliness_reason,
+      final_analysis,
+      move_explanation,
+      explanation_strength,
+      anchor_match,
+      anchor_match_reason,
+      quality_label,
+      core_support,
+      counterpoints,
+      final_view,
+      hard_catalysts,
+      impact_factors,
+      impact_summary_text,
+      risks,
+      evidence_strength,
+      evidence_gaps,
+      {sql_json({'current_facts': len(payload.get('current_facts', []))})},
+      {sql_string(json.dumps(payload, ensure_ascii=False))},
+      IF(model LIKE '%reused%', model, CONCAT(model, '+reused')),
+      status,
+      '',
+      raw_json
+    FROM async_evidence_summaries
+    WHERE code={sql_string(code)}
+      AND evidence_hash={sql_string(current_hash)}
+      AND trade_date < {sql_string(trade_date)}
+      AND status IN ('ready', 'fallback')
+    ORDER BY trade_date DESC, updated_at DESC
+    LIMIT 1
+    ON DUPLICATE KEY UPDATE
+      stock_name=VALUES(stock_name),
+      evidence_hash=VALUES(evidence_hash),
+      summary_text=VALUES(summary_text),
+      key_points=VALUES(key_points),
+      evidence_filter_summary=VALUES(evidence_filter_summary),
+      key_facts=VALUES(key_facts),
+      move_reason=VALUES(move_reason),
+      sustainability_basis=VALUES(sustainability_basis),
+      main_flaw=VALUES(main_flaw),
+      missing_evidence=VALUES(missing_evidence),
+      core_evidence_items=VALUES(core_evidence_items),
+      timeliness_label=VALUES(timeliness_label),
+      timeliness_reason=VALUES(timeliness_reason),
+      final_analysis=VALUES(final_analysis),
+      move_explanation=VALUES(move_explanation),
+      explanation_strength=VALUES(explanation_strength),
+      anchor_match=VALUES(anchor_match),
+      anchor_match_reason=VALUES(anchor_match_reason),
+      quality_label=VALUES(quality_label),
+      core_support=VALUES(core_support),
+      counterpoints=VALUES(counterpoints),
+      final_view=VALUES(final_view),
+      hard_catalysts=VALUES(hard_catalysts),
+      impact_factors=VALUES(impact_factors),
+      impact_summary_text=VALUES(impact_summary_text),
+      risks=VALUES(risks),
+      evidence_strength=VALUES(evidence_strength),
+      evidence_gaps=VALUES(evidence_gaps),
+      source_counts=VALUES(source_counts),
+      source_payload=VALUES(source_payload),
+      model=VALUES(model),
+      status=VALUES(status),
+      error_message=VALUES(error_message),
+      raw_json=VALUES(raw_json),
+      summarized_at=CURRENT_TIMESTAMP(3),
+      updated_at=CURRENT_TIMESTAMP(3);
+
+    SELECT ROW_COUNT();
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    try:
+        return bool(rows and int(float(rows[-1][0] or 0)) > 0)
+    except Exception:
+        return False
+
+
+def delete_summary(config: MySqlConfig, trade_date: str, code: str) -> None:
+    sql = f"""
+    DELETE FROM async_evidence_summaries
+    WHERE trade_date={sql_string(trade_date)}
+      AND code={sql_string(code)};
+    """
+    run_mysql(config, sql)
+
+
+def delete_summaries_without_current_facts(config: MySqlConfig, trade_date: str, codes: list[str]) -> int:
+    clean_codes = sorted({str(code or "").strip() for code in codes if str(code or "").strip()})
+    if not clean_codes:
+        return 0
+    codes_sql = ",".join(sql_string(code) for code in clean_codes)
+    sql = f"""
+    DELETE aes
+    FROM async_evidence_summaries aes
+    LEFT JOIN stock_effective_facts ef
+      ON ef.trade_date=aes.trade_date
+     AND ef.code=aes.code
+     AND ef.evidence_group='current_effective'
+     AND ef.valid_status='active'
+     AND ef.display_level IN ('primary','secondary')
+    WHERE aes.trade_date={sql_string(trade_date)}
+      AND aes.code IN ({codes_sql})
+      AND ef.code IS NULL;
+    SELECT ROW_COUNT();
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    try:
+        return int(float(rows[-1][0] or 0)) if rows and rows[-1] else 0
+    except Exception:
+        return 0
+
+
 def ensure_incremental_tables(config: MySqlConfig) -> None:
     sql = """
     CREATE TABLE IF NOT EXISTS evidence_source_fingerprints (
@@ -149,27 +306,6 @@ def ensure_incremental_tables(config: MySqlConfig) -> None:
       KEY idx_evidence_dirty_code (code, trade_date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
-    CREATE TABLE IF NOT EXISTS stock_move_judgement_dirty_queue (
-      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-      trade_date DATE NOT NULL,
-      code CHAR(6) NOT NULL,
-      stock_name VARCHAR(64) NOT NULL DEFAULT '',
-      source_hash CHAR(64) NOT NULL DEFAULT '',
-      reason VARCHAR(255) NOT NULL DEFAULT '',
-      changed_sources JSON NULL,
-      impact_hint VARCHAR(255) NOT NULL DEFAULT '',
-      priority INT NOT NULL DEFAULT 50,
-      status ENUM('pending','running','done','failed','ignored') NOT NULL DEFAULT 'pending',
-      attempt_count INT NOT NULL DEFAULT 0,
-      locked_at DATETIME(3) NULL,
-      finished_at DATETIME(3) NULL,
-      last_error TEXT NULL,
-      created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-      updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-      UNIQUE KEY uk_judgement_dirty (trade_date, code, source_hash, reason),
-      KEY idx_judgement_dirty_status (status, priority, created_at),
-      KEY idx_judgement_dirty_code (code, trade_date)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
     """
     run_mysql(config, sql)
     ensure_incremental_column(config, "evidence_source_fingerprints", "component_hashes", "JSON NULL")
@@ -177,9 +313,6 @@ def ensure_incremental_tables(config: MySqlConfig) -> None:
     ensure_incremental_column(config, "evidence_analysis_dirty_queue", "previous_source_hash", "CHAR(64) NOT NULL DEFAULT ''")
     ensure_incremental_column(config, "evidence_analysis_dirty_queue", "changed_sources", "JSON NULL")
     ensure_incremental_column(config, "evidence_analysis_dirty_queue", "impact_hint", "VARCHAR(255) NOT NULL DEFAULT ''")
-    ensure_incremental_column(config, "stock_move_judgement_dirty_queue", "source_hash", "CHAR(64) NOT NULL DEFAULT ''")
-    ensure_incremental_column(config, "stock_move_judgement_dirty_queue", "changed_sources", "JSON NULL")
-    ensure_incremental_column(config, "stock_move_judgement_dirty_queue", "impact_hint", "VARCHAR(255) NOT NULL DEFAULT ''")
 
 
 def ensure_incremental_column(config: MySqlConfig, table_name: str, column_name: str, column_sql: str) -> None:
@@ -200,15 +333,7 @@ def source_hash(payload: dict[str, Any]) -> str:
     slim = {
         "trade_date": payload.get("trade_date"),
         "code": payload.get("code"),
-        "profile": payload.get("profile"),
-        "effective_facts": payload.get("effective_facts"),
-        "root_items": payload.get("root_items"),
-        "evidence_layers": payload.get("evidence_layers"),
-        "theme_reason_bank": payload.get("theme_reason_bank"),
-        "lhb_seat_evidence": payload.get("lhb_seat_evidence"),
-        "announcement_effects": payload.get("announcement_effects"),
-        "period_rankings": payload.get("period_rankings"),
-        "market_context": payload.get("market_context"),
+        "current_facts": payload.get("current_facts"),
     }
     raw = json.dumps(slim, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -220,36 +345,15 @@ def stable_hash(value: Any) -> str:
 
 
 def source_component_hashes(payload: dict[str, Any]) -> dict[str, str]:
-    root_items = payload.get("root_items") or []
-    root_by_kind: dict[str, list[dict[str, Any]]] = {}
-    for item in root_items:
-        kind = str(item.get("kind") or "unknown")
-        root_by_kind.setdefault(kind, []).append(item)
     components = {
-        "profile": payload.get("profile") or {},
-        "effective_facts": payload.get("effective_facts") or [],
-        "evidence_layers": payload.get("evidence_layers") or [],
-        "theme_reason_bank": payload.get("theme_reason_bank") or [],
-        "lhb_seat_evidence": payload.get("lhb_seat_evidence") or [],
-        "announcement_effects": payload.get("announcement_effects") or [],
-        "period_rankings": payload.get("period_rankings") or [],
-        "market_anchors": (payload.get("market_context") or {}).get("current_anchors", []),
+        "current_facts": payload.get("current_facts") or [],
     }
-    for kind, items in root_by_kind.items():
-        components[f"root_{kind}"] = items
     return {name: stable_hash(value) for name, value in components.items()}
 
 
 def payload_source_counts(payload: dict[str, Any]) -> dict[str, int]:
     return {
-        "root_items": len(payload.get("root_items", [])),
-        "effective_facts": len(payload.get("effective_facts", [])),
-        "evidence_layers": len(payload.get("evidence_layers", [])),
-        "theme_reason_bank": len(payload.get("theme_reason_bank", [])),
-        "lhb_seat_evidence": len(payload.get("lhb_seat_evidence", [])),
-        "announcement_effects": len(payload.get("announcement_effects", [])),
-        "period_rankings": len(payload.get("period_rankings", [])),
-        "current_anchors": len((payload.get("market_context") or {}).get("current_anchors", [])),
+        "current_facts": len(payload.get("current_facts", [])),
     }
 
 
@@ -278,35 +382,15 @@ def existing_source_state(config: MySqlConfig, trade_date: str, code: str) -> di
 
 
 def changed_source_names(old_components: dict[str, str], new_components: dict[str, str]) -> list[str]:
-    names = sorted(set(old_components) | set(new_components))
+    names = sorted(new_components)
     return [name for name in names if old_components.get(name) != new_components.get(name)]
 
 
 def source_impact_priority(changed_sources: list[str], payload: dict[str, Any]) -> tuple[int, str]:
     changed = set(changed_sources)
-    if any(name in changed for name in ("root_announcement", "root_important_event")):
-        return 20, "公告/重要事件更新，优先重算"
-    if "announcement_effects" in changed:
-        return 21, "announcement_effects_updated"
-    if "period_rankings" in changed:
-        return 22, "问财区间排名更新，重算区间强度"
-    if "announcement_effects" in changed:
-        return 22, "announcement_effects_updated"
-    if "lhb_seat_evidence" in changed:
-        return 23, "龙虎榜席位更新，重算资金确认"
-    if "evidence_layers" in changed:
-        return 25, "热证据层更新，优先重算"
-    if "theme_reason_bank" in changed:
-        return 30, "题材解释更新，重算锚点证据"
-    if "market_anchors" in changed:
-        return 35, "盘中锚点变化，重算一致性"
-    if "root_hot_news" in changed or "root_theme_point" in changed:
-        return 40, "新闻/题材要点更新"
-    if "profile" in changed:
-        return 60, "公司画像更新，低优先级重算"
-    if payload.get("market_context", {}).get("current_anchors"):
-        return 45, "证据源首次入库"
-    return 55, "证据源变化"
+    if "current_facts" in changed:
+        return 20, "current_facts_updated"
+    return 55, "current_facts_updated"
 
 
 def record_source_fingerprint(config: MySqlConfig, payload: dict[str, Any]) -> tuple[str, bool, dict[str, Any]]:
@@ -390,129 +474,23 @@ def enqueue_dirty_analysis(
     run_mysql(config, sql)
 
 
-def judgement_impact_priority(changed_sources: list[str], reason: str = "") -> tuple[int, str]:
-    changed = set(changed_sources)
-    if "async_evidence_summaries" in changed or reason == "async_summary_updated":
-        return 18, "异步证据摘要更新，重算持续性和硬催化分"
-    if "period_rankings" in changed:
-        return 20, "问财区间排名更新，重算区间领头分"
-    if "lhb_seat_evidence" in changed:
-        return 24, "龙虎榜更新，等待/联动资金证据"
-    if "market_anchors" in changed:
-        return 28, "盘中锚点变化，重算主动性和带动性"
-    if "evidence_layers" in changed:
-        return 30, "热证据层更新，重算硬证据"
-    if any(name.startswith("root_") for name in changed):
-        return 35, "公告/题材根证据更新"
-    if "theme_reason_bank" in changed:
-        return 42, "题材解释更新"
-    if "profile" in changed:
-        return 60, "公司画像更新"
-    return 50, "上游证据变化"
+def _dirty_code_filter(code: str = "", codes: list[str] | None = None) -> str:
+    if code:
+        return f"AND code={sql_string(code)}"
+    clean_codes = sorted({str(item or "").strip() for item in (codes or []) if str(item or "").strip()})
+    if not clean_codes:
+        return "AND 1=0" if codes is not None else ""
+    return f"AND code IN ({','.join(sql_string(item) for item in clean_codes)})"
 
 
-def enqueue_dirty_judgement(
+def fetch_dirty_candidates(
     config: MySqlConfig,
-    *,
     trade_date: str,
-    code: str,
-    stock_name: str = "",
-    source_hash_value: str = "",
-    reason: str = "source_changed",
-    changed_sources: list[str] | None = None,
-    impact_hint: str = "",
-    priority: int | None = None,
-) -> None:
-    changed_sources = changed_sources or []
-    if priority is None:
-        priority, default_hint = judgement_impact_priority(changed_sources, reason)
-        impact_hint = impact_hint or default_hint
-    source_key = source_hash_value or stable_hash(
-        {
-            "trade_date": trade_date,
-            "code": code,
-            "reason": reason,
-            "changed_sources": changed_sources,
-            "impact_hint": impact_hint,
-        }
-    )
-    sql = f"""
-    INSERT INTO stock_move_judgement_dirty_queue(
-      trade_date, code, stock_name, source_hash, reason, changed_sources, impact_hint, priority, status
-    ) VALUES (
-      {sql_string(trade_date)},
-      {sql_string(code)},
-      {sql_string(stock_name)},
-      {sql_string(source_key)},
-      {sql_string(reason)},
-      {sql_json(changed_sources)},
-      {sql_string(impact_hint)},
-      {int(priority)},
-      'pending'
-    )
-    ON DUPLICATE KEY UPDATE
-      stock_name=COALESCE(NULLIF(VALUES(stock_name), ''), stock_name),
-      changed_sources=VALUES(changed_sources),
-      impact_hint=VALUES(impact_hint),
-      priority=LEAST(priority, VALUES(priority)),
-      status=IF(status IN ('done','ignored'), 'pending', status),
-      updated_at=CURRENT_TIMESTAMP(3);
-    """
-    run_mysql(config, sql)
-
-
-def fetch_dirty_judgement_candidates(config: MySqlConfig, trade_date: str, limit: int, code: str = "") -> list[dict[str, str]]:
-    code_filter = f"AND code={sql_string(code)}" if code else ""
-    sql = f"""
-    SELECT id, code, stock_name, source_hash
-    FROM stock_move_judgement_dirty_queue
-    WHERE trade_date={sql_string(trade_date)}
-      AND (
-        status='pending'
-        OR (status='running' AND locked_at < DATE_SUB(NOW(3), INTERVAL 10 MINUTE))
-      )
-      {code_filter}
-    ORDER BY priority ASC, created_at ASC
-    LIMIT {int(limit)};
-    """
-    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
-    out: list[dict[str, str]] = []
-    for row in rows:
-        if len(row) >= 4:
-            out.append({"dirty_id": row[0], "code": row[1], "stock_name": row[2], "source_hash": row[3]})
-    ids = [str(item["dirty_id"]) for item in out if str(item.get("dirty_id", "")).isdigit()]
-    if ids:
-        run_mysql(
-            config,
-            f"""
-            UPDATE stock_move_judgement_dirty_queue
-            SET status='running',
-                locked_at=CURRENT_TIMESTAMP(3),
-                updated_at=CURRENT_TIMESTAMP(3)
-            WHERE id IN ({",".join(ids)})
-              AND status IN ('pending','running');
-            """,
-        )
-    return out
-
-
-def mark_dirty_judgement(config: MySqlConfig, dirty_id: str, status: str, error: str = "") -> None:
-    if not dirty_id:
-        return
-    sql = f"""
-    UPDATE stock_move_judgement_dirty_queue
-    SET status={sql_string(status)},
-        finished_at=IF({sql_string(status)} IN ('done','failed','ignored'), CURRENT_TIMESTAMP(3), finished_at),
-        last_error={sql_string(error[:1000])},
-        attempt_count=attempt_count + IF({sql_string(status)}='failed', 1, 0),
-        updated_at=CURRENT_TIMESTAMP(3)
-    WHERE id={int(dirty_id)};
-    """
-    run_mysql(config, sql)
-
-
-def fetch_dirty_candidates(config: MySqlConfig, trade_date: str, limit: int, code: str = "") -> list[dict[str, str]]:
-    code_filter = f"AND code={sql_string(code)}" if code else ""
+    limit: int,
+    code: str = "",
+    codes: list[str] | None = None,
+) -> list[dict[str, str]]:
+    code_filter = _dirty_code_filter(code, codes)
     sql = f"""
     SELECT id, code, stock_name, source_hash
     FROM evidence_analysis_dirty_queue
@@ -612,11 +590,7 @@ def write_summary(
       {sql_string(summary.get('evidence_strength', 'pending'))},
       {sql_json(summary.get('evidence_gaps', []))},
       {sql_json({
-          'root_items': len(payload.get('root_items', [])),
-          'evidence_layers': len(payload.get('evidence_layers', [])),
-          'theme_reason_bank': len(payload.get('theme_reason_bank', [])),
-          'lhb_seat_evidence': len(payload.get('lhb_seat_evidence', [])),
-          'announcement_effects': len(payload.get('announcement_effects', [])),
+          'current_facts': len(payload.get('current_facts', [])),
       })},
       {sql_string(json.dumps(payload, ensure_ascii=False))},
       {sql_string(model)},

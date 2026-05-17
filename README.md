@@ -1,46 +1,35 @@
 # stock-move-scout-agent
 
-这是一个独立的股票异动侦查项目，目标是盘中快速发现 A 股异动，并把“为什么动、强度如何、是否带动同题材、是否有持续性”整理成可读的 AI 情报流。
+个股异动侦查项目。核心目标是：在研究池范围内快速发现异动，定位还有效的硬事实，并把实时异动、题材角色、有效事实时间线和市场概览展示出来。
 
-## 核心链路
+## 当前主链路
 
-1. 通达信行情扫描：`scripts/windowed_stock_scout_agent.py`
-2. 5 分钟窗口聚合：同一主链路内完成
-3. 题材锚点与角色判断：`scripts/build_anchor_realtime_roles.py`
-4. 异步证据层：`scripts/run_mysql_window_evidence_worker.py`、`scripts/summarize_async_evidence.py`
-5. 异动解释与持续性判断：`scripts/build_stock_move_judgements.py`
-6. Web 展示：`scripts/stock_scout_web.py`
+```text
+研究池
+  -> 实时行情扫描
+  -> 异动情报流 / 稳定异动 / 实时领涨
+  -> 头条题材角色与带动性
+  -> F10 重要事件有效事实
+  -> 事实时间线摘要
+  -> 证据详情 / 领头羊 / 市场概览 / 早参帖子
+```
 
-## 目录说明
+## 目录
 
-- `src/stock_move_scout/`：Python 包入口和逐步迁移后的共享模块
-- `scripts/`：stock-move-scout-agent 全部执行脚本
-- `database/mysql/stock_scout_schema.sql`：MySQL 表结构
-- `config/stock_scout_evidence_refresh.json`：证据层刷新任务配置
-- `docs/`：当前架构、数据源、证据层、MySQL、评估体系等项目文档
-- `docs/images/`：股票异动侦查架构图
-- `data/stock/`：运行时数据目录，默认不带历史缓存
-- `runs/`：日志、pid、临时输出目录，默认不带历史运行产物
-
-当前架构见：[`docs/current_architecture.md`](docs/current_architecture.md)
-数据源层见：[`docs/data_sources.md`](docs/data_sources.md)
-证据层见：[`docs/evidence_layer.md`](docs/evidence_layer.md)
-评估体系见：[`docs/evaluation_system.md`](docs/evaluation_system.md)
-重构进度见：[`docs/refactor_status.md`](docs/refactor_status.md)
+- `src/stock_move_scout/`：可复用业务模块。
+- `scripts/`：任务入口和兼容脚本。
+- `database/mysql/stock_scout_schema.sql`：MySQL 表结构。
+- `config/stock_scout_evidence_refresh.json`：F10 增量刷新配置。
+- `docs/`：当前架构、数据源、证据层和维护说明。
+- `data/stock/`：运行缓存目录，不提交历史数据。
+- `runs/`：日志、帖子、临时运行产物，不提交历史产物。
+- `output/`：UI 审查截图和临时导出，已忽略。
 
 ## 快速启动
 
-先初始化数据库：
-
 ```powershell
 cd C:\Code\stock-move-scout-agent
-powershell -ExecutionPolicy Bypass -Command "python -m pip install -e ."
-powershell -ExecutionPolicy Bypass -File scripts\init_stock_scout_mysql.ps1 -MysqlUser root -MysqlPassword <MYSQL_PASSWORD>
-```
-
-启动 Web：
-
-```powershell
+python -m pip install -e .
 powershell -ExecutionPolicy Bypass -File scripts\start_stock_scout_web.ps1 -MysqlPassword <MYSQL_PASSWORD>
 ```
 
@@ -50,29 +39,32 @@ powershell -ExecutionPolicy Bypass -File scripts\start_stock_scout_web.ps1 -Mysq
 http://127.0.0.1:8788/
 ```
 
-启动盘中扫描主链路：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start_windowed_stock_scout_agent.ps1 -MysqlPassword <MYSQL_PASSWORD>
-```
-
 启动调度器：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\start_stock_scout_scheduler.ps1 -MysqlPassword <MYSQL_PASSWORD>
 ```
 
-也可以使用包入口：
+手动重跑核心证据链：
 
 ```powershell
-stock-move-scout web --mysql-enabled --mysql-password <MYSQL_PASSWORD>
-stock-move-scout scheduler --mysql-enabled --mysql-password <MYSQL_PASSWORD>
-stock-move-scout worker --worker-types hot,warm --mysql-enabled --mysql-password <MYSQL_PASSWORD>
+$env:PYTHONPATH='src;scripts'
+python scripts\build_effective_facts.py --mysql-enabled --mysql-password <MYSQL_PASSWORD> --trade-date 2026-05-15 --research-pool-only
+python scripts\summarize_async_evidence.py --mysql-enabled --mysql-password <MYSQL_PASSWORD> --trade-date 2026-05-15 --research-pool-only --force --fallback-only --limit 500
+python scripts\refresh_root_evidence_cache.py --mysql-enabled --mysql-password <MYSQL_PASSWORD> --trade-date 2026-05-15 --force --research-pool-only
 ```
 
-## 备注
+## 关键约束
 
-- 本次拆分没有复制历史 `runs/` 和大批量 `data/stock/` 缓存。
-- 没有复制 `xueqiu_cookie.txt` 这类敏感文件。
-- 默认仍使用 MySQL 数据库 `stock_scout`，如需完全隔离，可通过 `--mysql-database` 改库名。
-- MySQL 是唯一业务状态源；日志、缓存、临时 JSON/CSV 只用于运行辅助和旧脚本兼容。
+- MySQL 是唯一业务状态源，文件只用于日志、缓存和导出。
+- 研究范围统一走 `research_pool_items`。
+- 有效事实只从 `stock_ths_root_items` 的 F10 重要事件生成。
+- 独立龙虎榜证据链已退役；如果 F10 重要事件里包含龙虎榜，则作为 F10 事实展示。
+- `ths_stock_concept_explanations` 只用于题材成员、头条题材角色和领头羊关系，不再作为证据详情背景证据。
+
+## 文档
+
+- [当前架构](docs/project_architecture.md)
+- [数据源](docs/data_sources.md)
+- [证据层](docs/evidence_layer.md)
+- [重构状态](docs/refactor_status.md)

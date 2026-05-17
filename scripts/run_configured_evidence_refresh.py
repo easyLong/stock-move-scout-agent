@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,11 @@ from stock_scout_mysql import (
     import_hard_evidence_csv,
     import_ths_root_evidence_json,
     mysql_config_from_args,
+    mysql_rows,
+    run_mysql,
+    sql_string,
 )
+from stock_move_scout.research_pool import ResearchPoolProvider
 
 
 def project_root() -> Path:
@@ -76,6 +81,101 @@ def run_command(command: list[str], root: Path, timeout: int) -> dict[str, Any]:
 def configured_path(root: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else root / path
+
+
+def write_empty_official_outputs(output_csv: Path, output_json: Path, input_csv: Path, cache_json: Path) -> None:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "code",
+                "stock_name",
+                "company_highlights",
+                "main_business",
+                "sw_industry",
+                "concept_tags",
+                "latest_management_business_plan",
+            ],
+        )
+        writer.writeheader()
+    output_json.write_text(
+        json.dumps(
+            {
+                "built_at": now_text(),
+                "source": "csv",
+                "top10_csv": str(input_csv),
+                "cache_json": str(cache_json),
+                "row_count": 0,
+                "rows": [],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_research_pool_csv(config: Any, trade_date: str, path: Path, *, skip_fetched_today: bool = False) -> dict[str, Any]:
+    codes = ResearchPoolProvider(config).latest_codes(trade_date)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not codes:
+        with path.open("w", encoding="utf-8-sig", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=["code", "name", "stock_name"])
+            writer.writeheader()
+        return {"ok": True, "path": str(path), "codes": 0, "rows": 0, "skipped_fetched_today": 0}
+    code_sql = ",".join(sql_string(code) for code in codes)
+    skip_join = ""
+    skip_where = ""
+    if skip_fetched_today:
+        skip_join = """
+            LEFT JOIN (
+              SELECT DISTINCT code
+              FROM ths_root_snapshots
+              WHERE DATE(fetched_at)=CURDATE()
+            ) fetched_today ON fetched_today.code=s.code
+        """
+        skip_where = "AND fetched_today.code IS NULL"
+    rows = mysql_rows(
+        run_mysql(
+            config,
+            f"""
+            SELECT
+              s.code,
+              COALESCE(
+                CASE WHEN COALESCE(s.name, '') <> '' AND s.name NOT REGEXP '^[?]+$' THEN s.name END,
+                (
+                  SELECT cp.stock_name
+                  FROM stock_company_profiles cp
+                  WHERE cp.code=s.code
+                    AND COALESCE(cp.stock_name, '') <> ''
+                    AND cp.stock_name NOT REGEXP '^[?]+$'
+                  LIMIT 1
+                ),
+                s.name
+              ) AS name
+            FROM stocks s
+            {skip_join}
+            WHERE s.code IN ({code_sql})
+              {skip_where}
+            ORDER BY FIELD(s.code, {code_sql});
+            """,
+            batch=True,
+            raw=True,
+        )
+    )
+    with path.open("w", encoding="utf-8-sig", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=["code", "name", "stock_name"])
+        writer.writeheader()
+        for code, name in rows:
+            writer.writerow({"code": code, "name": name, "stock_name": name})
+    return {
+        "ok": True,
+        "path": str(path),
+        "codes": len(codes),
+        "rows": len(rows),
+        "skipped_fetched_today": len(codes) - len(rows) if skip_fetched_today else 0,
+    }
 
 
 def run_cold_company_profile(args: argparse.Namespace, root: Path, policy: dict[str, Any]) -> dict[str, Any]:
@@ -149,23 +249,60 @@ def run_ths_root_extended_items(args: argparse.Namespace, root: Path, policy: di
     universe_config = policy.get("universe") or {}
     batch_size = int(args.batch_size or source_config.get("batch_size") or 100)
     offset = int(args.offset)
-    cold_universe_csv = configured_path(root, str(universe_config.get("cold_universe_csv", "data/stock/stock_scout_cold_universe.csv")))
     cache_json = configured_path(root, str(source_config.get("cache_json", "data/stock/cache/official_site_evidence_cache.json")))
     work_dir = root / "runs" / "data_tasks" / "ths_root_extended_items"
     output_csv = work_dir / f"ths_root_extended_items_{offset:06d}.csv"
     output_json = work_dir / f"ths_root_extended_items_{offset:06d}.json"
 
     steps: dict[str, Any] = {}
-    steps["build_universe"] = run_command(
-        [sys.executable, str(root / "scripts" / "build_stock_scout_universe.py"), "--config", str(args.config)],
-        root,
-        args.timeout,
-    )
+    if args.research_pool_only:
+        if not args.mysql_enabled:
+            return {"task": "ths_root_extended_items", "ok": False, "reason": "--mysql-enabled is required for research-pool incremental mode"}
+        pool_csv = work_dir / f"research_pool_{args.trade_date}.csv"
+        pool_result = write_research_pool_csv(
+            mysql_config_from_args(args),
+            str(args.trade_date),
+            pool_csv,
+            skip_fetched_today=bool(args.skip_fetched_today),
+        )
+        steps["build_research_pool_universe"] = {"ok": bool(pool_result.get("ok", True)), **pool_result}
+        input_csv = pool_csv
+    else:
+        input_csv = configured_path(root, str(universe_config.get("cold_universe_csv", "data/stock/stock_scout_cold_universe.csv")))
+        steps["build_universe"] = run_command(
+            [sys.executable, str(root / "scripts" / "build_stock_scout_universe.py"), "--config", str(args.config)],
+            root,
+            args.timeout,
+        )
+    if args.research_pool_only and int(steps.get("build_research_pool_universe", {}).get("rows") or 0) == 0:
+        write_empty_official_outputs(output_csv, output_json, input_csv, cache_json)
+        steps["collect_ths_root"] = {
+            "ok": True,
+            "returncode": 0,
+            "duration_ms": 0,
+            "output_tail": f"rows=0 skipped_fetched_today={steps['build_research_pool_universe'].get('skipped_fetched_today', 0)}",
+        }
+        mysql_result = {"enabled": bool(args.mysql_enabled), "ok": True, "ths_root": {"snapshots": 0, "items": 0}}
+        return {
+            "task": "ths_root_extended_items",
+            "ok": True,
+            "offset": offset,
+            "batch_size": batch_size,
+            "next_offset": offset + batch_size,
+            "universe_csv": str(input_csv),
+            "research_pool_only": bool(args.research_pool_only),
+            "trade_date": str(args.trade_date),
+            "output_json": str(output_json),
+            "steps": steps,
+            "mysql": mysql_result,
+            "ran_at": now_text(),
+            "config": str(args.config),
+        }
     command = [
         sys.executable,
         str(root / "scripts" / "collect_official_site_evidence.py"),
         "--top10-csv",
-        str(cold_universe_csv),
+        str(input_csv),
         "--output-csv",
         str(output_csv),
         "--output-json",
@@ -204,7 +341,9 @@ def run_ths_root_extended_items(args: argparse.Namespace, root: Path, policy: di
         "offset": offset,
         "batch_size": batch_size,
         "next_offset": offset + batch_size,
-        "universe_csv": str(cold_universe_csv),
+        "universe_csv": str(input_csv),
+        "research_pool_only": bool(args.research_pool_only),
+        "trade_date": str(args.trade_date),
         "output_json": str(output_json),
         "steps": steps,
         "mysql": mysql_result,
@@ -269,6 +408,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=["cold_company_profile", "ths_root_extended_items", "warm_hard_evidence"], required=True)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=0)
+    parser.add_argument("--trade-date", default=date.today().isoformat())
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--slot", choices=["auto", "noon", "evening"], default="auto")
@@ -276,6 +416,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=int, default=8)
     parser.add_argument("--max-pages", type=int, default=4)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--research-pool-only", dest="research_pool_only", action="store_true", help="Process only active research pool stocks for incremental F10 refresh.")
+    parser.add_argument("--skip-fetched-today", action="store_true", help="In research-pool mode, skip stocks whose THS root snapshot was already fetched today.")
     parser.add_argument("--state-json", type=Path, default=root / "data" / "stock" / "configured_evidence_refresh_state.json")
     add_mysql_args(parser)
     return parser.parse_args()

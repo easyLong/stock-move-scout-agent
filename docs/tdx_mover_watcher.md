@@ -1,107 +1,128 @@
-# 通达信全市场异动监控
+# 通达信盘中异动扫描
 
-用途：每 60 秒通过通达信行情服务器抓取全市场 A 股行情，生成全市场行情表、涨速榜、涨幅榜，并补充行业/概念标签。
+## 职责
 
-## 脚本
+通达信扫描链路负责盘中热数据，不负责拉 F10、不负责模型总结、不负责重建研究池。
 
-```text
-../../scripts/tdx_mover_watcher.py
-```
+主要目标：
 
-## 数据来源
+- 发现研究池股票的实时异动。
+- 保存每个扫描点的涨速、成交额、成交额增量等指标。
+- 聚合窗口强度。
+- 为异动情报流、实时领涨、稳定异动提供数据。
 
-```text
-实时行情：通达信行情服务器
-行业映射：G:\D盘迁移\Tools\tdx\T0002\hq_cache\tdxhy.cfg
-行业名称：G:\D盘迁移\Tools\tdx\T0002\hq_cache\tdxzs.cfg / tdxzs3.cfg
-概念标签：G:\D盘迁移\Tools\tdx\T0002\hq_cache\specgpsxzt.txt / infoharbor_block.dat
-```
+## 当前扫描范围
 
-## 输出
+底层扫描范围以研究池为核心，并额外保留指数等辅助标的，方便后续开发区间 Top 和市场共振。
+
+研究池来自：
 
 ```text
-../../data/stock/tdx_full_market_latest.csv
-../../data/stock/tdx_mover_speed_top10_latest.csv
-../../data/stock/tdx_mover_speed_top10_history.csv
-../../data/stock/tdx_mover_pct_top10_latest.csv
-../../data/stock/tdx_mover_judgement_latest.csv
-../../data/stock/tdx_mover_judgement_history.csv
-../../data/stock/tdx_mover_last_snapshot.json
-../../data/stock/tdx_mover_seen.json
-../../data/stock/tdx_mover_meta.json
+research_pool_items
 ```
 
-## 使用
+不是问财 Top50。
 
-单次测试：
-
-```powershell
-python scripts\tdx_mover_watcher.py --once --top 10
-```
-
-持续每 60 秒运行：
-
-```powershell
-python scripts\tdx_mover_watcher.py --interval 60 --top 10
-```
-
-后台启动：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\start_tdx_mover_watcher.ps1
-```
-
-停止：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\stop_tdx_mover_watcher.ps1
-```
-
-## 说明
-
-第一轮没有历史快照，`speed` 使用今日涨幅作为临时基准，`basis=pct_change_first_run`。
-
-第二轮开始，`speed` 使用当前价和上一轮快照价计算：
+## 数据链路
 
 ```text
-speed = 当前价 / 上一轮价格 - 1
+tdx_mover_watcher.py
+  -> scan_runs
+  -> scan_movers
+  -> windowed_stock_scout_agent.py
+  -> windows
+  -> window_movers
+  -> build_event_engine.py
+  -> stock_move_events / derived_signals / stock_move_evidence
+  -> build_stock_move_judgements.py
+  -> stock_move_judgements
+  -> 异动情报流
 ```
 
-如果市场休市或午间没有价格变化，涨速榜可能为空，这是正常现象。
+## 主要表
 
-现在的 `latest` 展示规则：
+| 表 | 用途 |
+| --- | --- |
+| `scan_runs` | 一次扫描批次 |
+| `scan_movers` | 当前扫描点命中的异动股票 |
+| `windows` | 时间窗口 |
+| `window_movers` | 窗口内累计强度 |
+| `stock_move_events` | 归一化事件 |
+| `stock_move_judgements` | 异动解释和延续性判断 |
 
-```text
-交易中：按本轮结果刷新 latest
-午休 / 收盘 / 非交易日：如果本轮没有有效涨速，则保留最后一组 speed > 0 的数据
-```
+## 异动条件
 
-运行状态可在 `tdx_mover_meta.json` 里查看：
+当前异动触发以涨速为核心：
 
-```text
-market_phase：trading / lunch_break / market_closed / non_trading_day
-preserve_last_mover：是否保留最后有效异动
-restored_speed_latest：是否从历史里恢复了涨速榜
-```
+- 去掉 `amount_delta_15s >= 30000000 AND speed > 0.5` 触发。
+- 涨速阈值改为 `speed >= 1.5`。
 
-## 异动判断
+成交额增量仍可作为排序和辅助解释指标，但不再作为低涨速触发入口。
 
-判断表：
+## 实时领涨
 
-```text
-../../data/stock/tdx_mover_judgement_latest.csv
-```
+实时领涨展示当前能看到的所有相关股票，并按开盘至当前的累计强度计算 Top。
 
-核心字段：
+设计要点：
 
-```text
-candidate_basis：speed 表示来自涨速榜；pct_fallback_no_speed 表示当前无涨速，用涨幅榜回退
-freshness：新上榜 / 重复出现 / 反复出现
-speed_signal：急拉 / 明显拉升 / 轻微异动 / 暂无快照涨速
-pct_position：初动观察 / 中段拉升 / 涨幅偏高 / 10cm涨停附近 / 20cm涨停附近
-amount_confirm：成交偏弱 / 成交一般 / 成交有效 / 成交强确认
-linkage_signal：个股孤立 / 有联动 / 板块扩散
-action_bucket：观察池 / 等待验证 / 回避池
-risk_flags：主要风险点
-key_points：简要判断要点
-```
+- 不是 5 分钟窗口。
+- 是从开盘到当前的累计强度。
+- 统计 Top5。
+- 和稳定异动榜在 UI 上明确区分。
+
+## 稳定异动
+
+稳定异动是全局 Top5，放在异动情报流最前面。
+
+展示内容：
+
+- 当前排名。
+- 出现次数。
+- 代表强度。
+- 最近更新时间。
+
+## 调度
+
+相关热任务只在交易日交易时间运行：
+
+- `event_engine`
+- `stock_move_judgements`
+- `anchor_realtime_roles`
+- `market_width_snapshot`
+
+集合竞价任务：
+
+- `auction_candidates`：09:15-09:25，只保留涨停且封单额最大的 Top3。
+
+## 性能原则
+
+- 盘中不重建研究池。
+- 盘中不跑模型总结。
+- 页面读取盘中表和根证据缓存。
+- 盘中只计算会随行情变化的字段。
+
+## 常见问题
+
+### 为什么看起来数据不全？
+
+优先检查：
+
+- 研究池当天是否完整。
+- `scan_runs` 是否覆盖目标时间段。
+- `scan_movers` 是否有目标股票。
+- `window_movers` 是否正常生成。
+- 交易时间判断是否把当前时段跳过。
+
+### 为什么页面卡？
+
+常见原因：
+
+- 详情页现场拼复杂 SQL。
+- 题材卡片切换时重复请求重数据。
+- 根证据缓存缺失，回退到实时计算。
+
+修复方向：
+
+- 交易日前夜刷新 `stock_root_evidence_cache`。
+- 盘中只更新热数据。
+- 详情页优先读缓存。

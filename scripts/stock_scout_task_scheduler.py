@@ -9,13 +9,22 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, time as clock_time
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from stock_move_scout.scheduler import DEPRECATED_TASK_IDS, SCHEDULED_TASKS, build_task_command, next_run_sql_for_task
+from stock_move_scout.scheduler import (
+    ARCHIVED_TASK_PREFIXES,
+    DEPRECATED_TASK_IDS,
+    PREOPEN_TIME_TASK_IDS,
+    SCHEDULED_TASKS,
+    TRADING_TIME_TASK_IDS,
+    build_task_command,
+    next_run_sql_for_task,
+)
+from stock_move_scout.research_pool import ResearchPoolProvider
 from stock_move_scout.sources import is_batched_source_task
 
 from stock_scout_mysql import (
@@ -38,6 +47,26 @@ def project_root() -> Path:
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_transient_mysql_error(exc: Exception) -> bool:
+    text = str(exc)
+    return "ERROR 1213" in text or "Deadlock found" in text or "ERROR 1205" in text or "Lock wait timeout" in text
+
+
+def mysql_retry(operation: Any, *, attempts: int = 3, base_sleep: float = 0.25) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except Exception as exc:
+            if not is_transient_mysql_error(exc) or attempt >= attempts - 1:
+                raise
+            last_exc = exc
+            time.sleep(base_sleep * (attempt + 1))
+    if last_exc:
+        raise last_exc
+    return None
 
 
 def parse_json(value: str) -> dict[str, Any]:
@@ -80,6 +109,49 @@ def task_type_list(value: str) -> list[str]:
     return items or ["maintenance"]
 
 
+def is_trade_weekday(value: datetime | None = None) -> bool:
+    return (value or datetime.now()).weekday() < 5
+
+
+def in_regular_trading_time(value: datetime | None = None) -> bool:
+    now = value or datetime.now()
+    if not is_trade_weekday(now):
+        return False
+    current = now.time()
+    return clock_time(9, 30) <= current < clock_time(11, 30) or clock_time(13, 0) <= current < clock_time(15, 0)
+
+
+def in_preopen_auction_time(value: datetime | None = None) -> bool:
+    now = value or datetime.now()
+    if not is_trade_weekday(now):
+        return False
+    current = now.time()
+    return clock_time(9, 15) <= current <= clock_time(9, 25, 59)
+
+
+def in_headline_theme_checkpoint(value: datetime | None = None) -> bool:
+    now = value or datetime.now()
+    if not is_trade_weekday(now):
+        return False
+    current = now.time()
+    return (
+        clock_time(9, 10) <= current < clock_time(9, 20)
+        or clock_time(11, 45) <= current < clock_time(11, 55)
+    )
+
+
+def should_enqueue_now(task: dict[str, str], value: datetime | None = None) -> tuple[bool, str]:
+    task_id = str(task.get("task_id") or "")
+    now = value or datetime.now()
+    if task_id in TRADING_TIME_TASK_IDS and not in_regular_trading_time(now):
+        return False, "outside_trading_time"
+    if task_id in PREOPEN_TIME_TASK_IDS and not in_preopen_auction_time(now):
+        return False, "outside_preopen_time"
+    if task_id == "ths_homepage_headline_themes" and not in_headline_theme_checkpoint(now):
+        return False, "outside_headline_theme_checkpoint"
+    return True, ""
+
+
 def render_dedupe_key(task: dict[str, str]) -> str:
     template = task.get("dedupe_key_template") or ""
     payload = parse_json(task.get("payload_template_json") or "")
@@ -87,6 +159,7 @@ def render_dedupe_key(task: dict[str, str]) -> str:
         return task["task_id"]
     payload.setdefault("run_key", datetime.now().strftime("%Y%m%d"))
     payload.setdefault("minute_key", datetime.now().strftime("%Y%m%d%H%M"))
+    payload.setdefault("hour_key", datetime.now().strftime("%Y%m%d%H"))
     values = {"task_id": task["task_id"], **payload}
     try:
         return template.format(**values)
@@ -104,6 +177,13 @@ def active_universe_count(config: MySqlConfig) -> int:
     rows = mysql_rows(run_mysql(config, sql, batch=True))
     try:
         return int(rows[0][0]) if rows and rows[0] else 0
+    except Exception:
+        return 0
+
+
+def research_pool_count(config: MySqlConfig, trade_date: str) -> int:
+    try:
+        return ResearchPoolProvider(config).latest_snapshot(trade_date).code_count
     except Exception:
         return 0
 
@@ -161,12 +241,29 @@ def task_by_id(config: MySqlConfig, task_id: str) -> dict[str, str] | None:
     return dict(zip(keys, rows[0])) if rows else None
 
 
+def next_run_update_sql(task_id: str) -> str:
+    expression = next_run_sql_for_task(task_id)
+    if expression and expression != "NULL":
+        return expression
+    return "DATE_ADD(NOW(3), INTERVAL update_interval_seconds SECOND)"
+
+
 def update_task_next_run(config: MySqlConfig, task_id: str) -> None:
     sql = f"""
     UPDATE scheduled_tasks
     SET last_enqueued_at = NOW(3),
-        next_run_after = DATE_ADD(NOW(3), INTERVAL update_interval_seconds SECOND),
+        next_run_after = {next_run_update_sql(task_id)},
         last_message = CONCAT('scheduler_checked ', DATE_FORMAT(NOW(3), '%Y-%m-%d %H:%i:%s'))
+    WHERE task_id = {sql_string(task_id)};
+    """
+    run_mysql(config, sql)
+
+
+def update_task_skipped_next_run(config: MySqlConfig, task_id: str, reason: str) -> None:
+    sql = f"""
+    UPDATE scheduled_tasks
+    SET next_run_after = {next_run_update_sql(task_id)},
+        last_message = CONCAT('scheduler_skipped:{sql_string(reason)[1:-1]} ', DATE_FORMAT(NOW(3), '%Y-%m-%d %H:%i:%s'))
     WHERE task_id = {sql_string(task_id)};
     """
     run_mysql(config, sql)
@@ -202,7 +299,9 @@ def enqueue_single_task(config: MySqlConfig, task: dict[str, str]) -> bool:
 def enqueue_batched_stock_task(config: MySqlConfig, task: dict[str, str]) -> bool:
     payload = parse_json(task.get("payload_template_json") or "")
     batch_size = max(1, int(payload.get("batch_size") or 100))
-    total = int(payload.get("total") or active_universe_count(config))
+    trade_date = str(payload.get("trade_date") or datetime.now().date().isoformat())
+    pool_only = bool(payload.get("research_pool_only"))
+    total = int(payload.get("total") or (research_pool_count(config, trade_date) if pool_only else active_universe_count(config)))
     if total <= 0:
         update_task_next_run(config, task["task_id"])
         return False
@@ -248,7 +347,7 @@ def enqueue_batched_stock_task(config: MySqlConfig, task: dict[str, str]) -> boo
         f"""
         UPDATE scheduled_tasks
         SET last_enqueued_at = NOW(3),
-            next_run_after = DATE_ADD(NOW(3), INTERVAL update_interval_seconds SECOND),
+            next_run_after = {next_run_update_sql(str(task["task_id"]))},
             last_message = CONCAT('enqueued_batches=', {len(offsets)}, ' total=', {total}, ' at ', DATE_FORMAT(NOW(3), '%Y-%m-%d %H:%i:%s'))
         WHERE task_id = {sql_string(task["task_id"])};
         """
@@ -298,14 +397,27 @@ def release_expired_locks(config: MySqlConfig) -> dict[str, int]:
 def scheduler_loop(args: argparse.Namespace, config: MySqlConfig) -> int:
     loops = 0
     while True:
-        release_expired_locks(config)
-        tasks = due_tasks(config, args.scheduler_limit)
-        enqueued = 0
-        for task in tasks:
-            if enqueue_task(config, task):
-                enqueued += 1
-        if tasks or args.verbose:
-            print(json.dumps({"at": now_text(), "due": len(tasks), "enqueued": enqueued}, ensure_ascii=False))
+        try:
+            mysql_retry(lambda: release_expired_locks(config))
+            tasks = mysql_retry(lambda: due_tasks(config, args.scheduler_limit))
+            enqueued = 0
+            skipped = 0
+            for task in tasks:
+                allowed, reason = should_enqueue_now(task)
+                if not allowed:
+                    skipped += 1
+                    mysql_retry(lambda task=task, reason=reason: update_task_skipped_next_run(config, task["task_id"], reason))
+                    if args.verbose:
+                        print(json.dumps({"at": now_text(), "task_id": task["task_id"], "skipped": reason}, ensure_ascii=False))
+                    continue
+                if mysql_retry(lambda task=task: enqueue_task(config, task)):
+                    enqueued += 1
+            if tasks or args.verbose:
+                print(json.dumps({"at": now_text(), "due": len(tasks), "enqueued": enqueued, "skipped": skipped}, ensure_ascii=False))
+        except Exception as exc:
+            if not is_transient_mysql_error(exc):
+                raise
+            print(json.dumps({"at": now_text(), "db_retry_skipped": f"{type(exc).__name__}: {str(exc)[:300]}"}, ensure_ascii=False))
         loops += 1
         if args.once or (args.max_loops and loops >= args.max_loops):
             return 0
@@ -459,18 +571,28 @@ def worker_loop(args: argparse.Namespace, config: MySqlConfig) -> int:
     worker_types = task_type_list(args.worker_types)
     worker_id = args.worker_id or f"{socket.gethostname()}:{os.getpid()}:{','.join(worker_types)}"
     loops = 0
-    heartbeat(config, worker_id, ",".join(worker_types), "idle")
+    mysql_retry(lambda: heartbeat(config, worker_id, ",".join(worker_types), "idle"))
     while True:
-        release_expired_locks(config)
-        task = claim_task(config, worker_id, worker_types)
-        if not task:
-            heartbeat(config, worker_id, ",".join(worker_types), "idle")
+        try:
+            mysql_retry(lambda: release_expired_locks(config))
+            task = mysql_retry(lambda: claim_task(config, worker_id, worker_types))
+        except Exception as exc:
+            if not is_transient_mysql_error(exc):
+                raise
+            print(json.dumps({"at": now_text(), "worker_db_retry_skipped": f"{type(exc).__name__}: {str(exc)[:300]}"}, ensure_ascii=False))
             loops += 1
             if args.once or (args.max_loops and loops >= args.max_loops):
                 return 0
             time.sleep(args.poll_seconds)
             continue
-        heartbeat(config, worker_id, ",".join(worker_types), "running", int(task["queue_id"]))
+        if not task:
+            mysql_retry(lambda: heartbeat(config, worker_id, ",".join(worker_types), "idle"))
+            loops += 1
+            if args.once or (args.max_loops and loops >= args.max_loops):
+                return 0
+            time.sleep(args.poll_seconds)
+            continue
+        mysql_retry(lambda: heartbeat(config, worker_id, ",".join(worker_types), "running", int(task["queue_id"])))
         started = time.monotonic()
         try:
             return_code, stdout, stderr = execute_task(task, args)
@@ -482,8 +604,8 @@ def worker_loop(args: argparse.Namespace, config: MySqlConfig) -> int:
             return_code = 1
             stdout = ""
             stderr = f"{type(exc).__name__}:{exc}"
-        finish_task(config, task, worker_id, started, return_code, stdout, stderr)
-        heartbeat(config, worker_id, ",".join(worker_types), "idle")
+        mysql_retry(lambda: finish_task(config, task, worker_id, started, return_code, stdout, stderr))
+        mysql_retry(lambda: heartbeat(config, worker_id, ",".join(worker_types), "idle"))
         print(
             json.dumps(
                 {
@@ -503,15 +625,27 @@ def worker_loop(args: argparse.Namespace, config: MySqlConfig) -> int:
 
 def seed_tasks(config: MySqlConfig) -> None:
     deprecated_ids = ", ".join(sql_string(task_id) for task_id in DEPRECATED_TASK_IDS)
+    archived_prefix_filter = " OR ".join(f"task_id LIKE {sql_string(prefix + '%')}" for prefix in ARCHIVED_TASK_PREFIXES)
     statements = [
         f"""
         UPDATE scheduled_tasks
         SET enabled = 0,
             last_message = 'deprecated by current scheduler task definitions'
         WHERE task_id IN ({deprecated_ids});
+        DELETE FROM scheduled_tasks
+        WHERE task_id IN ({deprecated_ids});
         """
     ]
+    if archived_prefix_filter:
+        statements.append(
+            f"""
+            DELETE FROM scheduled_tasks
+            WHERE {archived_prefix_filter};
+            """
+        )
     for task in SCHEDULED_TASKS:
+        if str(task.get("task_id") or "") in DEPRECATED_TASK_IDS:
+            continue
         next_run_sql = next_run_sql_for_task(str(task["task_id"]))
         statements.append(
             f"""
@@ -532,6 +666,7 @@ def seed_tasks(config: MySqlConfig) -> None:
               task_description=VALUES(task_description),
               task_kind=VALUES(task_kind),
               task_type=VALUES(task_type),
+              enabled=VALUES(enabled),
               schedule_type=VALUES(schedule_type),
               update_interval_seconds=VALUES(update_interval_seconds),
               priority=VALUES(priority),

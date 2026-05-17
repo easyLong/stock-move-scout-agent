@@ -20,30 +20,60 @@ from stock_move_scout.evidence.model_config import (
     resolve_api_key,
     resolve_model_runtime_config,
 )
+from stock_move_scout.sources.market_news import read_market_news_window
+from stock_move_scout.sources.market_themes import read_market_themes
 
 
 SYSTEM_PROMPT = (
-    "你是A股盘前早参作者。你的任务是基于输入的盘前消息和主题雷达，"
-    "写出一篇给短线交易者阅读的早参帖子。只允许基于输入材料归纳，"
-    "不要编造股票、消息、数据或政策细节，不给买卖建议。"
+    "你是一个每天盘前写雪球短帖的A股短线交易者。"
+    "你的任务是基于输入的盘前消息和主题雷达，写一篇像真人复盘笔记的早盘策略帖。"
+    "只允许基于输入材料归纳，不要编造股票、消息、数据或政策细节，不给买卖建议。"
+    "文字要有人味：有轻重、有迟疑、有自己的盘前观察，但不要油腻、不要煽动。"
 )
 
 
-USER_PROMPT = """请基于下面 JSON 生成一篇中文早参帖子。
+USER_PROMPT = """请基于下面 JSON 生成一篇适合发布到雪球的中文早盘策略帖。
 
 写作要求：
-1. 不要使用死板模板，但必须让读者一眼看到：最强主线、辅助线、盘中验证点。
-2. 时间范围必须体现为“上一个交易日收盘后至今”，可以写具体时间窗口。
-3. 先判断消息强弱，不要平均罗列；把高密度、高相关、可能影响今日风险偏好的方向放前面。
-4. 每条主线要说明：消息依据、可能映射方向、盘中如何验证。
-5. 不要臆造具体个股。只有输入里明确给出的主题、概念、消息才可以写。
-6. 语气像个人盘前复盘，清晰、有判断力、不过度煽动。
-7. 末尾必须包含“仅为个人盘前复盘，不构成投资建议。”
-8. 输出纯正文，不要 Markdown 代码块，不要 JSON。
+1. 面向雪球阅读，整体控制在 700-1100 个中文字符，最多不要超过 1200 字。
+2. 首行必须是帖子标题，格式类似：【5月13日盘前：先看AI能不能扛住分歧】。
+3. 第二段先说人话结论，可以用“今天我会先看……”“这里不急着下结论……”这类自然表达。
+4. 正文不要写成清单感很强的模板，优先用短段落，每段 1-2 句，段与段之间留空行。
+5. 排版建议是：先一句总判断，再分三段讲最强主线、次强主线、后手观察，最后单独收一个“今天盯什么”。
+6. “今天盯什么”必须单独一行，下面分 3-4 行写，每行只写一个观察点，不要挤在一个长段落里。
+7. 不要每段都写“依据/看点/映射方向/盘中验证点”，这些词会显得机器味很重。
+8. 每条主线只保留最关键的 1-2 个消息原因，再写你会怎么观察盘面。
+9. 不要平均罗列新闻，不要把每条消息都展开；只保留对今天交易情绪最有用的信息。
+10. 只写输入中明确存在的主题、概念、消息，不要臆造具体个股。
+11. 语气像个人盘前复盘，短句、清楚、有判断力，可以有一点“不确定性”，不要绝对化、不要喊口号。
+12. 避免 Markdown 表格、代码块、粗体符号、过多小标题；输出纯正文，不要 JSON。
+13. 末尾必须包含“仅为个人盘前复盘，不构成投资建议。”
+
+尽量避免这些机器感表达：
+- “映射方向包括”
+- “消息密度最高”
+- “风险偏好形成压制”
+- “持续性取决于”
+- “总体思路”
+- “核心不是单一利好”
+- “盘中验证点”
+- “第一条 / 第二条 / 第三条”
 
 输入 JSON：
 {payload_json}
 """
+
+
+MARKET_CONTEXT_PROMPT = """
+补充硬性要求：
+如果输入 JSON 里有 previous_market_context，开头 1-2 段必须先交代上一交易日 A 股市场温度。
+如果 previous_market_context 显示上一交易日下跌家数多、跌超3%家数多、跌停压力明显，
+今天必须先按“修复盘/分歧承接”来写，不能因为外盘 AI 或美股科技强，就直接写成纯进攻。
+所有强主题都要落回一句话：它能不能修复昨天弱盘，并吸引真实跟随。
+"""
+
+
+DISCLAIMER = "仅为个人盘前复盘，不构成投资建议。"
 
 
 def project_root() -> Path:
@@ -90,7 +120,14 @@ def call_morning_reference_model(
         "model": model,
         "input": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": USER_PROMPT.format(payload_json=json.dumps(payload, ensure_ascii=False, indent=2))},
+            {
+                "role": "user",
+                "content": (
+                    USER_PROMPT.format(payload_json=json.dumps(payload, ensure_ascii=False, indent=2))
+                    + "\n\n"
+                    + MARKET_CONTEXT_PROMPT
+                ),
+            },
         ],
     }
     request = urllib.request.Request(
@@ -163,69 +200,161 @@ def resolve_window(args: argparse.Namespace, config: Any | None) -> tuple[date, 
 
 
 def read_themes_mysql(config: Any, trade_day: date, limit: int) -> list[dict[str, Any]]:
-    sql = f"""
-    SELECT
-      theme_name,
-      importance_score,
-      source_count,
-      COALESCE(summary, ''),
-      COALESCE(CAST(source_titles AS CHAR), '[]'),
-      COALESCE(CAST(related_concepts AS CHAR), '[]')
-    FROM daily_market_themes
-    WHERE trade_date = {sql_string(trade_day.isoformat())}
-    ORDER BY importance_score DESC, source_count DESC, generated_at DESC
-    LIMIT {int(limit)};
-    """
-    rows: list[dict[str, Any]] = []
-    for row in mysql_rows(run_mysql(config, sql, batch=True)):
-        if len(row) < 6:
-            continue
-        rows.append(
-            {
-                "theme_name": row[0],
-                "importance_score": row[1],
-                "source_count": row[2],
-                "summary": row[3],
-                "source_titles": decode_json_list(row[4]),
-                "related_concepts": decode_json_list(row[5]),
-            }
-        )
-    return rows
+    return read_market_themes(config, trade_day, limit)
 
 
 def read_news_mysql(config: Any, start: datetime, end: datetime, min_importance: int, limit: int) -> list[dict[str, Any]]:
+    return read_market_news_window(config, start, end, min_importance=min_importance, limit=limit)
+
+
+def to_int(value: Any) -> int:
+    try:
+        return int(float(str(value or "0")))
+    except Exception:
+        return 0
+
+
+def read_previous_ths_after_close_summary(config: Any, trade_day: date) -> dict[str, Any]:
     sql = f"""
     SELECT
-      source,
-      item_kind,
-      DATE_FORMAT(published_at, '%Y-%m-%d %H:%i:%s'),
-      REPLACE(REPLACE(title, CHAR(9), ' '), CHAR(10), ' '),
-      REPLACE(REPLACE(COALESCE(content, ''), CHAR(9), ' '), CHAR(10), ' '),
+      DATE_FORMAT(trade_date, '%Y-%m-%d'),
+      title,
+      summary,
+      LEFT(COALESCE(content, ''), 3000),
       url,
-      importance
-    FROM market_news_items
-    WHERE published_at >= {sql_string(start.strftime("%Y-%m-%d %H:%M:%S"))}
-      AND published_at <= {sql_string(end.strftime("%Y-%m-%d %H:%M:%S"))}
-      AND importance >= {int(min_importance)}
-    ORDER BY importance DESC, published_at DESC
-    LIMIT {int(limit)};
+      DATE_FORMAT(published_at, '%Y-%m-%d %H:%i:%s'),
+      source_status,
+      DATE_FORMAT(collected_at, '%Y-%m-%d %H:%i:%s')
+    FROM ths_market_after_close_summaries
+    WHERE trade_date = (
+      SELECT MAX(trade_date)
+      FROM ths_market_after_close_summaries
+      WHERE trade_date < {sql_string(trade_day.isoformat())}
+        AND source_status = 'ok'
+    )
+      AND source_status = 'ok'
+    ORDER BY published_at DESC, collected_at DESC
+    LIMIT 1;
     """
-    rows: list[dict[str, Any]] = []
-    for row in mysql_rows(run_mysql(config, sql, batch=True)):
-        if len(row) < 7:
-            continue
-        rows.append(
-            {
-                "source": row[0],
-                "item_kind": row[1],
-                "published_at": row[2],
-                "title": row[3],
-                "content": row[4],
-                "url": row[5],
-                "importance": row[6],
-            }
-        )
-    return rows
+    try:
+        rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    except Exception:
+        return {}
+    if not rows or len(rows[0]) < 8:
+        return {}
+    row = rows[0]
+    return {
+        "source": "ths_market_after_close_summaries",
+        "trade_date": row[0],
+        "title": row[1],
+        "summary": row[2],
+        "content_excerpt": row[3],
+        "url": row[4],
+        "published_at": row[5],
+        "source_status": row[6],
+        "collected_at": row[7],
+    }
+
+
+def read_previous_market_context(config: Any, trade_day: date) -> dict[str, Any]:
+    sql = f"""
+    SELECT
+      DATE_FORMAT(trade_date, '%Y-%m-%d'),
+      DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s'),
+      total_count, up_count, down_count, flat_count, up3_count, down3_count,
+      limit_up_count, limit_down_count,
+      amount_top50_count, amount_top50_up_count, amount_top50_down_count,
+      research_pool_count,
+      research_pool_up_count,
+      research_pool_down_count
+    FROM market_width_snapshots
+    WHERE trade_date = (
+      SELECT MAX(trade_date)
+      FROM market_width_snapshots
+      WHERE trade_date < {sql_string(trade_day.isoformat())}
+    )
+      AND ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00')
+        OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00'))
+    ORDER BY captured_at DESC
+    LIMIT 1;
+
+    SELECT
+      DATE_FORMAT(trade_date, '%Y-%m-%d'),
+      COUNT(*),
+      ROUND(AVG(up_count), 0),
+      ROUND(AVG(down_count), 0),
+      MAX(down_count),
+      ROUND(AVG(down3_count), 0),
+      MAX(down3_count),
+      MAX(limit_down_count),
+      MAX(limit_up_count)
+    FROM market_width_snapshots
+    WHERE trade_date = (
+      SELECT MAX(trade_date)
+      FROM market_width_snapshots
+      WHERE trade_date < {sql_string(trade_day.isoformat())}
+    )
+      AND ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00')
+        OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00'))
+    GROUP BY trade_date;
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    latest = rows[0] if rows else []
+    stats = rows[1] if len(rows) > 1 else []
+    if len(latest) < 16:
+        ths_summary = read_previous_ths_after_close_summary(config, trade_day)
+        return {"source": "ths_market_after_close_summaries", "ths_after_close_summary": ths_summary} if ths_summary else {}
+    total = max(1, to_int(latest[2]))
+    down_count = to_int(latest[4])
+    down3_count = to_int(latest[7])
+    limit_down_count = to_int(latest[9])
+    down_ratio = down_count / total
+    down3_ratio = down3_count / total
+    if down_ratio >= 0.72 or down3_ratio >= 0.12 or limit_down_count >= 10:
+        temperature = "上一交易日市场明显偏弱/大跌，今天先按修复盘和分歧承接处理"
+    elif down_ratio >= 0.6 or down3_ratio >= 0.06:
+        temperature = "上一交易日市场偏弱，今天需要先看修复力度"
+    elif to_int(latest[3]) > down_count:
+        temperature = "上一交易日市场偏强，今天关注延续性"
+    else:
+        temperature = "上一交易日市场中性偏分歧"
+    context = {
+        "source": "market_width_snapshots",
+        "trade_date": latest[0],
+        "latest_snapshot_at": latest[1],
+        "temperature": temperature,
+        "latest": {
+            "total_count": total,
+            "up_count": to_int(latest[3]),
+            "down_count": down_count,
+            "flat_count": to_int(latest[5]),
+            "up3_count": to_int(latest[6]),
+            "down3_count": down3_count,
+            "limit_up_count": to_int(latest[8]),
+            "limit_down_count": limit_down_count,
+            "amount_top50_count": to_int(latest[10]),
+            "amount_top50_up_count": to_int(latest[11]),
+            "amount_top50_down_count": to_int(latest[12]),
+            "research_pool_count": to_int(latest[13]),
+            "research_pool_up_count": to_int(latest[14]),
+            "research_pool_down_count": to_int(latest[15]),
+        },
+        "session_stats": {
+            "snapshot_count": to_int(stats[1]) if len(stats) > 1 else 0,
+            "avg_up_count": to_int(stats[2]) if len(stats) > 2 else 0,
+            "avg_down_count": to_int(stats[3]) if len(stats) > 3 else 0,
+            "max_down_count": to_int(stats[4]) if len(stats) > 4 else 0,
+            "avg_down3_count": to_int(stats[5]) if len(stats) > 5 else 0,
+            "max_down3_count": to_int(stats[6]) if len(stats) > 6 else 0,
+            "max_limit_down_count": to_int(stats[7]) if len(stats) > 7 else 0,
+            "max_limit_up_count": to_int(stats[8]) if len(stats) > 8 else 0,
+        },
+    }
+    ths_summary = read_previous_ths_after_close_summary(config, trade_day)
+    if ths_summary:
+        context["source"] = "market_width_snapshots+ths_market_after_close_summaries"
+        context["ths_after_close_summary"] = ths_summary
+    return context
 
 
 def read_json_payload(path: Path) -> dict[str, Any]:
@@ -261,78 +390,154 @@ def theme_titles(theme: dict[str, Any], limit: int = 2) -> list[str]:
     return titles[:limit]
 
 
+def xueqiu_title(trade_day: date, themes: list[dict[str, Any]]) -> str:
+    first = theme_name(themes[0]) if themes else ""
+    if first:
+        return f"【{format_day(trade_day)}盘前：先看{first}能不能走出来】"
+    return f"【{format_day(trade_day)}盘前：先看开盘怎么选方向】"
+
+
+def split_watch_line(line: str) -> list[str]:
+    match = re.match(r"^(今天(?:主要)?盯什么[:：])\s*(.+)$", line)
+    if not match:
+        return [line]
+    head = match.group(1)
+    rest = match.group(2).strip()
+    parts = [part.strip(" ；;") for part in re.split(r"[；;]\s*(?=[一二三四五]看)", rest) if part.strip(" ；;")]
+    if len(parts) <= 1:
+        return [line]
+    return [head, *parts]
+
+
+def split_long_line(line: str, limit: int = 170) -> list[str]:
+    if len(line) <= limit or line.startswith("【"):
+        return [line]
+    sentences = [part.strip() for part in re.split(r"(?<=[。！？])", line) if part.strip()]
+    if len(sentences) <= 1:
+        return [line]
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) > limit:
+            chunks.append(current)
+            current = sentence
+        else:
+            current += sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def normalize_xueqiu_post(content: str, trade_day: date, themes: list[dict[str, Any]]) -> str:
+    text = (content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"```(?:\w+)?\n?", "", text)
+    text = text.replace("```", "")
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+
+    lines: list[str] = []
+    previous_blank = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        line = re.sub(r"^[\-*]\s+", "", line)
+        if not line:
+            if lines and not previous_blank:
+                lines.append("")
+            previous_blank = True
+            continue
+        lines.append(line)
+        previous_blank = False
+
+    while lines and not lines[-1]:
+        lines.pop()
+
+    if not lines or not lines[0].startswith("【"):
+        lines.insert(0, xueqiu_title(trade_day, themes))
+        lines.insert(1, "")
+
+    laid_out: list[str] = []
+    for line in lines:
+        if not line:
+            if laid_out and laid_out[-1]:
+                laid_out.append("")
+            continue
+        for watch_part in split_watch_line(line):
+            chunks = split_long_line(watch_part)
+            for idx, chunk in enumerate(chunks):
+                if idx > 0 and laid_out and laid_out[-1]:
+                    laid_out.append("")
+                laid_out.append(chunk)
+    lines = laid_out
+
+    body = "\n".join(lines).strip()
+    if DISCLAIMER not in body:
+        body = f"{body}\n\n{DISCLAIMER}"
+    return body.strip() + "\n"
+
+
 def build_post(trade_day: date, start: datetime, end: datetime, themes: list[dict[str, Any]], news: list[dict[str, Any]]) -> str:
-    top_names = [theme_name(item) for item in themes[:2] if theme_name(item)]
-    headline = "、".join(top_names) if top_names else "盘前消息"
+    primary = theme_name(themes[0]) if themes else "盘面"
+
     lines: list[str] = [
-        f"【{format_day(trade_day)}早参：{headline}为盘前主线】",
+        xueqiu_title(trade_day, themes),
         "",
-        f"消息窗口：{start.strftime('%Y-%m-%d %H:%M')} 至 {end.strftime('%Y-%m-%d %H:%M')}。",
+        f"今天我先看{primary}能不能扛住外盘分歧。",
+        f"窗口还是 {start.strftime('%m-%d %H:%M')} 到 {end.strftime('%m-%d %H:%M')}，盘前先别急着拍板，先看资金愿不愿意接。",
         "",
     ]
 
     if themes:
-        lines.append("一、盘前主线")
-        for idx, theme in enumerate(themes[:3], start=1):
+        for idx, theme in enumerate(themes[:3]):
             name = theme_name(theme)
-            score = compact(theme.get("importance_score"), 20)
-            source_count = compact(theme.get("source_count"), 20)
-            lines.append(f"{idx}、{name}")
-            meta = []
-            if score:
-                meta.append(f"强度 {score}")
-            if source_count:
-                meta.append(f"{source_count} 条消息")
-            if meta:
-                lines.append("信号：" + "，".join(meta))
             titles = theme_titles(theme)
-            if titles:
-                lines.append("依据：")
-                for title in titles:
-                    lines.append(f"- {title}")
             concepts = decode_json_list(theme.get("related_concepts"))[:4]
+            if idx == 0:
+                lines.append(f"{name}我放第一位。")
+            elif idx == 1:
+                lines.append(f"{name}可以当第二层去看。")
+            else:
+                lines.append(f"{name}先当后手观察。")
+            if titles:
+                lines.append("盘前能看到的理由：" + "；".join(titles[:2]) + "。")
             if concepts:
-                lines.append("观察：" + "、".join(concepts))
+                lines.append("我会顺着看 " + "、".join(concepts) + "，重点还是开盘后的承接和扩散。")
             lines.append("")
 
-        rest = [theme_name(item) for item in themes[3:7] if theme_name(item)]
+        rest = [theme_name(item) for item in themes[3:6] if theme_name(item)]
         if rest:
-            lines.append("二、辅助观察线")
-            for name in rest:
-                lines.append(f"- {name}")
+            lines.append("另外还能留意：" + "、".join(rest) + "。")
             lines.append("")
     elif news:
-        lines.append("一、盘前重要消息")
-        for item in news[:8]:
-            title = compact(item.get("title") or item.get("content"), 120)
+        lines.append("今天盘前重要消息不算少，但先不展开，等开盘确认方向。")
+        for item in news[:5]:
+            title = compact(item.get("title") or item.get("content"), 100)
             if title:
-                lines.append(f"- {title}")
+                lines.append(title)
         lines.append("")
     else:
-        lines.extend(["一、盘前消息", "暂未采集到有效盘前消息，先按昨日盘面和竞价反馈观察。", ""])
-
-    priority = [theme_name(item) for item in themes[:6] if theme_name(item)]
-    if priority:
-        lines.append("三、今日主题优先级")
-        lines.append(" > ".join(priority))
-        lines.append("")
+        lines.extend(["今天盘前有效信息不多，先按竞价和盘中反馈看。", ""])
 
     lines.extend(
         [
-            "四、盘中验证标准",
-            "- 高开后是否承接住；",
-            "- 是否有同题材扩散；",
-            "- 是否出现领涨票和中军票；",
-            "- 成交额是否放大；",
-            "- 是否出现回封、抗跌或持续换手结构。",
+            "我今天主要盯三件事。",
+            "先看竞价先把哪条线带出来。",
+            "再看开盘十几分钟有没有同方向扩散。",
+            "最后看冲高后有没有资金愿意接，只有脉冲没有承接，我会先降预期。",
             "",
-            "仅为个人盘前复盘，不构成投资建议。",
+            DISCLAIMER,
         ]
     )
-    return "\n".join(lines).strip() + "\n"
+    return normalize_xueqiu_post("\n".join(lines), trade_day, themes)
 
 
-def model_payload(trade_day: date, start: datetime, end: datetime, themes: list[dict[str, Any]], news: list[dict[str, Any]]) -> dict[str, Any]:
+def model_payload(
+    trade_day: date,
+    start: datetime,
+    end: datetime,
+    themes: list[dict[str, Any]],
+    news: list[dict[str, Any]],
+    market_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "task": "morning_reference_post",
         "trade_date": trade_day.isoformat(),
@@ -341,12 +546,16 @@ def model_payload(trade_day: date, start: datetime, end: datetime, themes: list[
             "since": start.strftime("%Y-%m-%d %H:%M:%S"),
             "until": end.strftime("%Y-%m-%d %H:%M:%S"),
         },
+        "previous_market_context": market_context or {},
         "themes": themes[:8],
         "news": news[:30],
         "output_constraints": {
+            "platform": "xueqiu",
             "audience": "A-share short-term trader morning reference",
-            "must_include": ["strongest themes", "secondary themes", "intraday validation points", "risk disclaimer"],
-            "must_not": ["invent stocks", "invent data", "give buy/sell advice"],
+            "length": "700-1100 Chinese characters, hard max 1200",
+            "tone": "human, experienced, conversational, not report-like",
+            "must_include": ["xueqiu-style title", "strongest themes", "secondary themes", "intraday validation points", "risk disclaimer"],
+            "must_not": ["invent stocks", "invent data", "give buy/sell advice", "markdown table", "code block", "rigid template language"],
         },
     }
 
@@ -385,9 +594,11 @@ def main() -> int:
     if config is not None:
         themes = read_themes_mysql(config, trade_day, args.theme_limit)
         news = read_news_mysql(config, start, end, args.min_importance, args.news_limit)
+        market_context = read_previous_market_context(config, trade_day)
     else:
         themes, news = read_fallback(root)
-    payload = model_payload(trade_day, start, end, themes, news)
+        market_context = {}
+    payload = model_payload(trade_day, start, end, themes, news, market_context)
     model_ok = False
     model_error = ""
     model_name = "fallback_without_model"
@@ -410,6 +621,7 @@ def main() -> int:
                 api_key=runtime.api_key,
                 timeout=runtime.timeout,
             )
+            content = normalize_xueqiu_post(content, trade_day, themes)
             model_name = runtime.model
         else:
             file_env = read_openai_env_file(args.api_key_file)
@@ -426,6 +638,7 @@ def main() -> int:
                 api_key=resolve_api_key(args.api_key_file),
                 timeout=args.model_timeout,
             )
+            content = normalize_xueqiu_post(content, trade_day, themes)
             model_name = model
         model_ok = True
     except Exception as exc:

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from stock_move_scout.analysis.activity import activity_context_from_index as build_activity_context, build_activity_index, clean_anchor
 from stock_move_scout.analysis.influence import influence_payload, influence_score, initiative_score, short_term_behavior_score
 from stock_move_scout.judgement import build_display_contract
+from stock_move_scout.research_pool import ResearchPoolProvider, research_pool_cte
 
 from stock_scout_mysql import (
     MySqlConfig,
@@ -25,17 +26,13 @@ from stock_scout_mysql import (
     sql_json,
     sql_string,
 )
-from stock_move_scout.evidence.storage import (
-    ensure_incremental_tables,
-    fetch_dirty_judgement_candidates,
-    mark_dirty_judgement,
-)
+from stock_move_scout.event_engine import ensure_event_engine_tables
 from stock_move_scout.web import resolve_trade_date
 
 
 def compact(value: Any, limit: int = 80) -> str:
     text = " ".join(str(value or "").split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
+    return text if len(text) <= limit else text[: limit - 1] + "..."
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
@@ -131,7 +128,7 @@ def sql_code_filter(alias: str, codes: list[str]) -> str:
     return f"AND {alias}.code IN ({','.join(sql_string(code) for code in clean_codes)})"
 
 
-def load_events(
+def load_raw_events(
     config: MySqlConfig,
     trade_date: str,
     scan_top: int,
@@ -139,14 +136,21 @@ def load_events(
     latest_only: bool,
     limit: int,
     codes: list[str] | None = None,
+    research_pool_only: bool = False,
 ) -> list[dict[str, Any]]:
     scan_scope = "ORDER BY scanned_at DESC LIMIT 1" if latest_only else "ORDER BY scanned_at DESC"
     window_scope = "ORDER BY ended_at DESC LIMIT 1" if latest_only else "ORDER BY ended_at DESC"
     codes = codes or []
     scan_code_filter = sql_code_filter("sm", codes)
     window_code_filter = sql_code_filter("wm", codes)
+    pool_cte = f"{research_pool_cte(trade_date)}," if research_pool_only else ""
+    scan_pool_join = "JOIN research_pool rp ON rp.code=sm.code" if research_pool_only else ""
+    window_pool_join = "JOIN research_pool rp ON rp.code=wm.code" if research_pool_only else ""
+    scan_rank_filter = f"AND sm.rank_speed <= {int(scan_top)}" if not research_pool_only else ""
+    window_rank_filter = f"AND wm.rank_no <= {int(window_top)}" if not research_pool_only else ""
     sql = f"""
     WITH
+    {pool_cte}
     scan_scope AS (
       SELECT id, run_id, scanned_at
       FROM scan_runs
@@ -203,12 +207,13 @@ def load_events(
         COALESCE(REPLACE(REPLACE(scp.company_highlights, CHAR(13), ' '), CHAR(10), ' '), '') AS company_highlights
       FROM scan_scope sr
       JOIN scan_movers sm ON sm.scan_run_id=sr.id
+      {scan_pool_join}
       LEFT JOIN scan_stock_roles ssr ON ssr.scan_run_id=sr.id AND ssr.code=sm.code
       LEFT JOIN async_evidence_summaries aes ON aes.trade_date={sql_string(trade_date)} AND aes.code=sm.code
       LEFT JOIN stock_company_profiles scp ON scp.code=sm.code
-      WHERE sm.rank_speed <= {int(scan_top)}
-        AND sm.name NOT LIKE '%ST%'
+      WHERE sm.name NOT LIKE '%ST%'
         AND sm.name NOT LIKE '%退市%'
+        {scan_rank_filter}
         {scan_code_filter}
 
       UNION ALL
@@ -252,6 +257,7 @@ def load_events(
         COALESCE(REPLACE(REPLACE(scp.company_highlights, CHAR(13), ' '), CHAR(10), ' '), '') AS company_highlights
       FROM window_scope rw
       JOIN window_movers wm ON wm.window_id=rw.id
+      {window_pool_join}
       LEFT JOIN window_stock_roles wsr ON wsr.window_id=rw.id AND wsr.code=wm.code
       LEFT JOIN window_sector_stats wss ON wss.window_id=rw.id AND wss.sector_key=wsr.sector_key
       LEFT JOIN scan_stock_roles ssr ON ssr.id = (
@@ -266,9 +272,9 @@ def load_events(
       )
       LEFT JOIN async_evidence_summaries aes ON aes.trade_date={sql_string(trade_date)} AND aes.code=wm.code
       LEFT JOIN stock_company_profiles scp ON scp.code=wm.code
-      WHERE wm.rank_no <= {int(window_top)}
-        AND wm.name NOT LIKE '%ST%'
+      WHERE wm.name NOT LIKE '%ST%'
         AND wm.name NOT LIKE '%退市%'
+        {window_rank_filter}
         {window_code_filter}
     ) x
     ORDER BY event_time DESC, event_type DESC, rank_no ASC
@@ -292,7 +298,9 @@ def load_events(
     # explicit so the judgement layer always covers the 5-minute windows.
     stable_scope = "ORDER BY ended_at DESC LIMIT 1" if latest_only else "ORDER BY ended_at DESC"
     stable_sql = f"""
-    WITH window_scope AS (
+    WITH
+    {pool_cte}
+    window_scope AS (
       SELECT id, window_id, started_at, ended_at
       FROM windows
       WHERE DATE(ended_at)={sql_string(trade_date)}
@@ -339,6 +347,7 @@ def load_events(
       COALESCE(REPLACE(REPLACE(scp.company_highlights, CHAR(13), ' '), CHAR(10), ' '), '') AS company_highlights
     FROM window_scope rw
     JOIN window_movers wm ON wm.window_id=rw.id
+    {window_pool_join}
     LEFT JOIN window_stock_roles wsr ON wsr.window_id=rw.id AND wsr.code=wm.code
     LEFT JOIN window_sector_stats wss ON wss.window_id=rw.id AND wss.sector_key=wsr.sector_key
     LEFT JOIN scan_stock_roles ssr ON ssr.id = (
@@ -353,9 +362,9 @@ def load_events(
     )
     LEFT JOIN async_evidence_summaries aes ON aes.trade_date={sql_string(trade_date)} AND aes.code=wm.code
     LEFT JOIN stock_company_profiles scp ON scp.code=wm.code
-    WHERE wm.rank_no <= {int(window_top)}
-      AND wm.name NOT LIKE '%ST%'
+    WHERE wm.name NOT LIKE '%ST%'
       AND wm.name NOT LIKE '%退市%'
+      {window_rank_filter}
       {window_code_filter}
     ORDER BY event_time DESC, rank_no ASC
     LIMIT {int(limit)};
@@ -365,12 +374,167 @@ def load_events(
     return (events + stable_events)[:limit]
 
 
+def load_events(
+    config: MySqlConfig,
+    trade_date: str,
+    scan_top: int,
+    window_top: int,
+    latest_only: bool,
+    limit: int,
+    codes: list[str] | None = None,
+    research_pool_only: bool = False,
+) -> list[dict[str, Any]]:
+    ensure_event_engine_tables(config)
+    codes = codes or []
+    event_code_filter = sql_code_filter("e", codes)
+    pool_cte = f"{research_pool_cte(trade_date)}," if research_pool_only else ""
+    pool_join = "JOIN research_pool rp ON rp.code=e.code" if research_pool_only else ""
+    latest_cte = ""
+    latest_join = ""
+    if latest_only:
+        latest_cte = f"""
+    latest_event_time AS (
+      SELECT event_type, MAX(event_time) AS event_time
+      FROM stock_move_events
+      WHERE trade_date={sql_string(trade_date)}
+      GROUP BY event_type
+    ),
+"""
+        latest_join = "JOIN latest_event_time let ON let.event_type=e.event_type AND let.event_time=e.event_time"
+    event_rank_filter = ""
+    if not research_pool_only:
+        event_rank_filter = f"""
+        AND (
+          (e.event_type='realtime_scan' AND e.sort_rank <= {int(scan_top)})
+          OR (e.event_type='stable_window' AND e.sort_rank <= {int(window_top)})
+        )
+        """
+    sql = f"""
+    WITH
+    {pool_cte}
+    {latest_cte}
+    event_rows AS (
+      SELECT
+        CASE WHEN e.event_type='stable_window' THEN 'stable' ELSE 'realtime' END AS event_type,
+        CASE
+          WHEN e.source_table IN ('scan_movers','window_movers') THEN SUBSTRING_INDEX(e.source_key, ':', 1)
+          ELSE e.event_id
+        END AS event_id,
+        e.event_id AS source_event_id,
+        e.source_table,
+        e.source_key,
+        e.event_time,
+        e.code,
+        e.stock_name,
+        e.sort_rank AS rank_no,
+        COALESCE(e.trigger_pct, 0) AS pct_change,
+        COALESCE(e.speed_pct, 0) AS speed,
+        COALESCE(e.amount, 0) AS amount,
+        COALESCE(
+          e.payload->>'$.amount_delta_15s',
+          e.payload->>'$.max_amount_delta_15s',
+          0
+        ) AS amount_delta_15s,
+        CASE
+          WHEN e.event_type='stable_window' THEN COALESCE(e.payload->>'$.appearance_count', 0)
+          ELSE 1
+        END AS appearance_count,
+        CASE
+          WHEN e.event_type='stable_window' THEN COALESCE(e.event_strength, 0)
+          ELSE 0
+        END AS window_score,
+        COALESCE(e.anchor_name, '') AS primary_anchor,
+        COALESCE(e.anchor_scope_type, '') AS anchor_type,
+        COALESCE(
+          e.payload->>'$.role_raw.anchor_member_count',
+          e.payload->>'$.role_raw.raw_json.anchor_member_count',
+          e.payload->>'$.role_raw.sector_stock_count',
+          e.payload->>'$.role_raw.raw_json.sector_stock_count',
+          0
+        ) AS anchor_member_count,
+        COALESCE(e.role_label, '') AS role_label,
+        COALESCE(ars.leader_code, '') AS leader_code,
+        COALESCE(ars.leader_name, '') AS leader_name,
+        COALESCE(ars.core_code, '') AS core_code,
+        COALESCE(ars.core_name, '') AS core_name,
+        COALESCE(e.payload->>'$.role_reason', '') AS role_reason,
+        COALESCE(
+          e.payload->>'$.role_raw.stock_reason',
+          e.payload->>'$.role_raw.raw_json.stock_reason',
+          ''
+        ) AS stock_reason,
+        COALESCE(
+          e.payload->>'$.role_raw.anchor_reason',
+          e.payload->>'$.role_raw.raw_json.anchor_reason',
+          ''
+        ) AS anchor_reason,
+        COALESCE(aes.evidence_hash, '') AS evidence_hash,
+        COALESCE(REPLACE(REPLACE(aes.final_view, CHAR(13), ' '), CHAR(10), ' '), '') AS final_view,
+        COALESCE(REPLACE(REPLACE(NULLIF(aes.move_reason, ''), CHAR(13), ' '), CHAR(10), ' '), REPLACE(REPLACE(aes.move_explanation, CHAR(13), ' '), CHAR(10), ' '), '') AS async_move_explanation,
+        COALESCE(aes.explanation_strength, 'none') AS async_explanation_strength,
+        COALESCE(aes.anchor_match, 'weak') AS anchor_match,
+        COALESCE(aes.quality_label, '') AS quality_label,
+        COALESCE(aes.evidence_strength, 'pending') AS evidence_strength,
+        COALESCE(aes.timeliness_label, 'unknown') AS timeliness_label,
+        COALESCE(REPLACE(REPLACE(aes.impact_summary_text, CHAR(13), ' '), CHAR(10), ' '), '') AS impact_summary_text,
+        COALESCE(aes.core_support, JSON_ARRAY()) AS core_support,
+        COALESCE(aes.counterpoints, JSON_ARRAY()) AS counterpoints,
+        COALESCE(aes.hard_catalysts, JSON_ARRAY()) AS hard_catalysts,
+        COALESCE(REPLACE(REPLACE(scp.company_highlights, CHAR(13), ' '), CHAR(10), ' '), '') AS company_highlights
+      FROM stock_move_events e
+      {latest_join}
+      {pool_join}
+      LEFT JOIN async_evidence_summaries aes ON aes.trade_date={sql_string(trade_date)} AND aes.code=e.code
+      LEFT JOIN stock_company_profiles scp ON scp.code=e.code
+      LEFT JOIN anchor_realtime_role_snapshots ars ON ars.id = (
+        SELECT ars2.id
+        FROM anchor_realtime_role_snapshots ars2
+        WHERE DATE(ars2.captured_at)={sql_string(trade_date)}
+          AND ars2.anchor_name=e.anchor_name
+          AND ars2.source='research_pool_theme_members'
+          AND ars2.captured_at <= e.event_time
+        ORDER BY ars2.captured_at DESC, ars2.created_at DESC
+        LIMIT 1
+      )
+      WHERE e.trade_date={sql_string(trade_date)}
+        AND e.event_type IN ('realtime_scan','stable_window')
+        AND e.stock_name NOT LIKE '%ST%'
+        AND e.stock_name NOT LIKE '%退市%'
+        {event_rank_filter}
+        {event_code_filter}
+    )
+    SELECT
+      event_type, event_id, event_time, code, stock_name, rank_no, pct_change, speed,
+      amount, amount_delta_15s, appearance_count, window_score, primary_anchor, anchor_type,
+      anchor_member_count, role_label, leader_code, leader_name, core_code, core_name,
+      role_reason, stock_reason, anchor_reason, evidence_hash, final_view, async_move_explanation,
+      async_explanation_strength, anchor_match, quality_label, evidence_strength, timeliness_label,
+      impact_summary_text, core_support, counterpoints, hard_catalysts, company_highlights
+    FROM event_rows
+    ORDER BY event_time DESC, event_type DESC, rank_no ASC
+    LIMIT {int(limit)};
+    """
+    keys = [
+        "event_type", "event_id", "event_time", "code", "stock_name", "rank_no", "pct_change", "speed",
+        "amount", "amount_delta_15s", "appearance_count", "window_score", "primary_anchor", "anchor_type",
+        "anchor_member_count", "role_label", "leader_code", "leader_name", "core_code", "core_name",
+        "role_reason", "stock_reason", "anchor_reason", "evidence_hash", "final_view", "async_move_explanation",
+        "async_explanation_strength", "anchor_match", "quality_label", "evidence_strength", "timeliness_label",
+        "impact_summary_text", "core_support", "counterpoints", "hard_catalysts", "company_highlights",
+    ]
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    events = [dict(zip(keys, row)) for row in rows if len(row) >= len(keys)]
+    if events:
+        return events
+    return load_raw_events(config, trade_date, scan_top, window_top, latest_only, limit, codes, research_pool_only)
+
+
 def fetch_anchor_context(config: MySqlConfig, trade_date: str, event_time: str, anchor: str, code: str) -> dict[str, Any]:
     anchor = clean_anchor(anchor)
     if not anchor:
         return {}
     anchor_terms = [anchor]
-    for term in re.split(r"[/、,，\s]+", anchor):
+    for term in re.split(r"[/、，\s]+", anchor):
         term = term.strip()
         if len(term) >= 2 and term not in anchor_terms:
             anchor_terms.append(term)
@@ -381,44 +545,47 @@ def fetch_anchor_context(config: MySqlConfig, trade_date: str, event_time: str, 
       SELECT code, MAX(stock_name) AS stock_name, MAX(confidence) AS confidence
       FROM (
         SELECT code, stock_name, confidence
-        FROM stock_theme_reason_bank
-        WHERE status='active'
-          AND (anchor_name IN ({term_sql}) OR theme_name IN ({term_sql}))
+        FROM (
+          SELECT
+            code,
+            stock_name,
+            GREATEST(55, 90 - LEAST(GREATEST(COALESCE(fit_rank, 1), 1), 20)) AS confidence,
+            concept_name AS anchor_name
+          FROM ths_stock_concept_explanations
+          WHERE COALESCE(concept_name, '') <> ''
+            AND COALESCE(reason_explain, '') <> ''
+        ) concept_members
+        WHERE anchor_name IN ({term_sql})
         UNION ALL
-        SELECT code, stock_name, confidence
-        FROM active_market_anchor_members
-        WHERE status <> 'expired'
-          AND anchor_name IN ({term_sql})
+        SELECT code, stock_name, GREATEST(55, match_score) AS confidence
+        FROM research_pool_theme_members
+        WHERE trade_date={sql_string(trade_date)}
+          AND theme_name IN ({term_sql})
       ) m
       GROUP BY code
     ),
-    iwencai_rank AS (
+    research_pool_day AS (
+      SELECT MAX(trade_date) AS trade_date
+      FROM research_pool_items
+      WHERE trade_date <= {sql_string(trade_date)}
+        AND rule='recent_limit_up_or_5d_gain_top'
+        AND limit_up_days=5
+        AND gain_period_days=5
+        AND gain_top=30
+    ),
+    research_pool_strength AS (
       SELECT
-        latest.code,
-        MAX(IF(latest.period_days=3, latest.period_pct, NULL)) AS iwencai_pct_3d,
-        MIN(IF(latest.period_days=3, latest.rank_no, NULL)) AS iwencai_rank_3d,
-        MAX(IF(latest.period_days=5, latest.period_pct, NULL)) AS iwencai_pct_5d,
-        MIN(IF(latest.period_days=5, latest.rank_no, NULL)) AS iwencai_rank_5d,
-        MAX(IF(latest.period_days=10, latest.period_pct, NULL)) AS iwencai_pct_10d,
-        MIN(IF(latest.period_days=10, latest.rank_no, NULL)) AS iwencai_rank_10d
-      FROM anchor_members am
-      JOIN (
-        SELECT ranked.*
-        FROM (
-          SELECT
-            r.*,
-            ROW_NUMBER() OVER (
-              PARTITION BY r.code, r.period_days
-              ORDER BY r.trade_date DESC, r.updated_at DESC
-            ) AS rn
-          FROM stock_period_rankings r
-          WHERE r.trade_date <= {sql_string(trade_date)}
-            AND r.trade_date >= DATE_SUB(CAST({sql_string(trade_date)} AS DATE), INTERVAL 7 DAY)
-            AND r.period_days IN (3,5,10)
-        ) ranked
-        WHERE ranked.rn=1
-      ) latest ON latest.code=am.code
-      GROUP BY latest.code
+        rp.code,
+        MAX(rp.pct_5d) AS pct_5d,
+        MIN(rp.rank_5d) AS rank_5d
+      FROM research_pool_items rp
+      JOIN research_pool_day d ON d.trade_date=rp.trade_date
+      JOIN anchor_members am ON am.code=rp.code
+      WHERE rp.rule='recent_limit_up_or_5d_gain_top'
+        AND rp.limit_up_days=5
+        AND rp.gain_period_days=5
+        AND rp.gain_top=30
+      GROUP BY rp.code
     ),
     day_scope AS (
       SELECT trade_day, ROW_NUMBER() OVER (ORDER BY trade_day DESC) AS rn
@@ -435,21 +602,22 @@ def fetch_anchor_context(config: MySqlConfig, trade_date: str, event_time: str, 
       SELECT
         am.code,
         am.stock_name,
-        COALESCE(MAX(iwr.iwencai_pct_3d), 0) AS pct_3d,
-        COALESCE(MAX(iwr.iwencai_pct_5d), 0) AS pct_5d,
-        COALESCE(MAX(iwr.iwencai_pct_10d), 0) AS pct_10d,
-        MAX(iwr.iwencai_rank_3d) AS market_rank_3d,
-        MAX(iwr.iwencai_rank_5d) AS market_rank_5d,
-        MAX(iwr.iwencai_rank_10d) AS market_rank_10d,
-        IF(MAX(iwr.iwencai_rank_3d) IS NOT NULL OR MAX(iwr.iwencai_rank_5d) IS NOT NULL OR MAX(iwr.iwencai_rank_10d) IS NOT NULL, 'iwencai_top50', 'not_in_iwencai_top50') AS period_rank_source
+        0 AS pct_3d,
+        COALESCE(MAX(rps.pct_5d), 0) AS pct_5d,
+        0 AS pct_10d,
+        NULL AS market_rank_3d,
+        MIN(rps.rank_5d) AS market_rank_5d,
+        NULL AS market_rank_10d,
+        IF(MIN(rps.rank_5d) IS NOT NULL, 'research_pool', 'not_in_research_pool') AS period_rank_source
       FROM anchor_members am
-      LEFT JOIN iwencai_rank iwr ON iwr.code=am.code
+      LEFT JOIN research_pool_strength rps ON rps.code=am.code
       GROUP BY am.code, am.stock_name
     ),
     latest_snapshot AS (
       SELECT snapshot_run_id
       FROM anchor_realtime_role_members
       WHERE anchor_name={sql_string(anchor)}
+        AND raw_json->>'$.source'='research_pool_theme_members'
         AND DATE(captured_at)={sql_string(trade_date)}
         AND captured_at <= {sql_string(event_time)}
       ORDER BY captured_at DESC
@@ -549,15 +717,25 @@ def fetch_anchor_context(config: MySqlConfig, trade_date: str, event_time: str, 
     return out
 
 
-def load_activity_index(config: MySqlConfig, trade_date: str) -> dict[str, dict[str, Any]]:
+def load_activity_index(
+    config: MySqlConfig,
+    trade_date: str,
+    codes: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    clean_codes = sorted({str(code or "").strip() for code in (codes or []) if str(code or "").strip()})
+    stock_code_filter = f"AND code IN ({','.join(sql_string(code) for code in clean_codes)})" if clean_codes else ""
+    scan_code_filter = f"AND sm.code IN ({','.join(sql_string(code) for code in clean_codes)})" if clean_codes else ""
+    scan_rank_filter = "" if clean_codes else "AND sm.rank_speed <= 20"
     strong_rows = mysql_rows(run_mysql(
         config,
         f"""
         SELECT DISTINCT code
-        FROM stock_period_rankings
+        FROM research_pool_items
         WHERE trade_date <= {sql_string(trade_date)}
           AND trade_date >= DATE_SUB(CAST({sql_string(trade_date)} AS DATE), INTERVAL 7 DAY)
-          AND period_days IN (3,5,10);
+          AND rule='recent_limit_up_or_5d_gain_top'
+          {stock_code_filter}
+        ;
         """,
         batch=True,
         raw=True,
@@ -579,24 +757,22 @@ def load_activity_index(config: MySqlConfig, trade_date: str) -> dict[str, dict[
           AND COALESCE(ssr.primary_anchor_name, '') <> ''
         UNION ALL
         SELECT
-          code,
-          anchor_name AS anchor,
-          confidence,
-          'active_market_anchor_member' AS source
-        FROM active_market_anchor_members
-        WHERE status <> 'expired'
-          AND COALESCE(anchor_name, '') <> ''
-          AND confidence >= 55
+          m.code AS code,
+          m.theme_name AS anchor,
+          GREATEST(55, m.match_score) AS confidence,
+          'research_pool_theme_member' AS source
+        FROM research_pool_theme_members m
+        WHERE m.trade_date={sql_string(trade_date)}
+          AND COALESCE(m.theme_name, '') <> ''
         UNION ALL
         SELECT
           code,
-          anchor_name AS anchor,
-          confidence,
-          'theme_reason_bank' AS source
-        FROM stock_theme_reason_bank
-        WHERE status='active'
-          AND COALESCE(anchor_name, '') <> ''
-          AND confidence >= 55
+          concept_name AS anchor,
+          GREATEST(55, 90 - LEAST(GREATEST(COALESCE(fit_rank, 1), 1), 20)) AS confidence,
+          'ths_stock_concept' AS source
+        FROM ths_stock_concept_explanations
+        WHERE COALESCE(concept_name, '') <> ''
+          AND COALESCE(reason_explain, '') <> ''
       ) raw
       WHERE COALESCE(anchor, '') <> ''
         AND anchor NOT IN ('未锚定', '异动')
@@ -625,11 +801,9 @@ def load_activity_index(config: MySqlConfig, trade_date: str) -> dict[str, dict[
         AND sr.accepted=1
         AND sm.name NOT LIKE '%ST%'
         AND sm.name NOT LIKE '%退市%'
-        AND sm.rank_speed <= 20
-        AND (
-          COALESCE(sm.speed, 0) >= 1
-          OR (COALESCE(sm.speed, 0) > 0.5 AND COALESCE(sm.amount_delta_15s, 0) >= 30000000)
-        )
+        {scan_rank_filter}
+        {scan_code_filter}
+        AND COALESCE(sm.speed, 0) >= 1.5
     )
     SELECT
       anchor,
@@ -662,24 +836,22 @@ def load_activity_index(config: MySqlConfig, trade_date: str) -> dict[str, dict[
           AND COALESCE(ssr.primary_anchor_name, '') <> ''
         UNION ALL
         SELECT
-          code,
-          anchor_name AS anchor,
-          confidence,
-          'active_market_anchor_member' AS source
-        FROM active_market_anchor_members
-        WHERE status <> 'expired'
-          AND COALESCE(anchor_name, '') <> ''
-          AND confidence >= 55
+          m.code AS code,
+          m.theme_name AS anchor,
+          GREATEST(55, m.match_score) AS confidence,
+          'research_pool_theme_member' AS source
+        FROM research_pool_theme_members m
+        WHERE m.trade_date={sql_string(trade_date)}
+          AND COALESCE(m.theme_name, '') <> ''
         UNION ALL
         SELECT
           code,
-          anchor_name AS anchor,
-          confidence,
-          'theme_reason_bank' AS source
-        FROM stock_theme_reason_bank
-        WHERE status='active'
-          AND COALESCE(anchor_name, '') <> ''
-          AND confidence >= 55
+          concept_name AS anchor,
+          GREATEST(55, 90 - LEAST(GREATEST(COALESCE(fit_rank, 1), 1), 20)) AS confidence,
+          'ths_stock_concept' AS source
+        FROM ths_stock_concept_explanations
+        WHERE COALESCE(concept_name, '') <> ''
+          AND COALESCE(reason_explain, '') <> ''
       ) raw
       WHERE COALESCE(anchor, '') <> ''
         AND anchor NOT IN ('未锚定', '异动')
@@ -703,15 +875,57 @@ def load_activity_index(config: MySqlConfig, trade_date: str) -> dict[str, dict[
       AND sr.accepted=1
       AND sm.name NOT LIKE '%ST%'
       AND sm.name NOT LIKE '%退市%'
-      AND sm.rank_speed <= 20
-      AND (
-        COALESCE(sm.speed, 0) >= 1
-        OR (COALESCE(sm.speed, 0) > 0.5 AND COALESCE(sm.amount_delta_15s, 0) >= 30000000)
-      )
+      {scan_rank_filter}
+      {scan_code_filter}
+      AND COALESCE(sm.speed, 0) >= 1.5
     ORDER BY anchor ASC, sr.scanned_at ASC, sm.rank_speed ASC;
     """
     all_rows = mysql_rows(run_mysql(config, all_sql, batch=True, raw=True))
     return build_activity_index(rows, all_rows, strong_codes)
+
+
+def load_headline_theme_index(
+    config: MySqlConfig,
+    trade_date: str,
+    codes: list[str] | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    clean_codes = sorted({str(code or "").strip() for code in (codes or []) if str(code or "").strip()})
+    code_filter = f"AND code IN ({','.join(sql_string(code) for code in clean_codes)})" if clean_codes else ""
+    rows = mysql_rows(run_mysql(
+        config,
+        f"""
+        SELECT
+          code,
+          theme_name,
+          MIN(theme_rank) AS theme_rank,
+          MAX(match_score) AS match_score,
+          SUBSTRING_INDEX(GROUP_CONCAT(NULLIF(concept_name, '') ORDER BY match_score DESC, fit_rank ASC SEPARATOR '\\n'), '\\n', 1) AS concept_name,
+          SUBSTRING_INDEX(GROUP_CONCAT(NULLIF(reason_explain, '') ORDER BY match_score DESC, fit_rank ASC SEPARATOR '\\n'), '\\n', 1) AS reason_explain
+        FROM research_pool_theme_members
+        WHERE trade_date={sql_string(trade_date)}
+          AND is_headline_theme=1
+          AND COALESCE(theme_name, '') <> ''
+          {code_filter}
+        GROUP BY code, theme_name
+        ORDER BY code ASC, theme_rank ASC, match_score DESC, theme_name ASC;
+        """,
+        batch=True,
+        raw=True,
+    ))
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        code = str(row[0] or "").strip()
+        theme = clean_anchor(row[1])
+        if not code or not theme:
+            continue
+        out.setdefault(code, {})[theme] = {
+            "theme_name": theme,
+            "theme_rank": as_int(row[2], 999),
+            "match_score": as_float(row[3]),
+            "concept_name": str(row[4] or "").strip(),
+            "reason_explain": str(row[5] or "").strip(),
+        }
+    return out
 
 
 def activity_candidate_anchors(
@@ -719,7 +933,7 @@ def activity_candidate_anchors(
     event_time: str,
     primary_anchor: str,
     code: str,
-    limit: int = 8,
+    limit: int = 20,
 ) -> list[dict[str, Any]]:
     primary = clean_anchor(primary_anchor)
     code_text = str(code or "").strip()
@@ -856,11 +1070,56 @@ def influence_anchor_selection_score(item: dict[str, Any]) -> float:
     return round(score, 2)
 
 
+def multi_theme_influence_items(
+    evaluated: list[dict[str, Any]],
+    headline_theme_meta: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not headline_theme_meta:
+        return []
+    by_anchor = {clean_anchor(item.get("anchor")): item for item in evaluated if clean_anchor(item.get("anchor"))}
+    items: list[dict[str, Any]] = []
+    for theme, meta in sorted(
+        headline_theme_meta.items(),
+        key=lambda pair: (as_int(pair[1].get("theme_rank"), 999), -as_float(pair[1].get("match_score")), pair[0]),
+    ):
+        item = by_anchor.get(clean_anchor(theme))
+        if not item:
+            continue
+        scored = item.get("_scored") if isinstance(item.get("_scored"), dict) else {}
+        detail = scored.get("score_detail") if isinstance(scored.get("score_detail"), dict) else {}
+        context = item.get("_activity_context") if isinstance(item.get("_activity_context"), dict) else {}
+        reasons = detail.get("influence_reasons") if isinstance(detail.get("influence_reasons"), list) else []
+        label = str(detail.get("influence_label") or item.get("influence_label") or "")
+        payload = detail.get("influence_payload") if isinstance(detail.get("influence_payload"), dict) else influence_payload(context, label, reasons)
+        items.append(
+            {
+                "theme_name": theme,
+                "theme_rank": as_int(meta.get("theme_rank"), 999),
+                "concept_name": meta.get("concept_name") or "",
+                "reason_explain": meta.get("reason_explain") or "",
+                "match_score": round(as_float(meta.get("match_score")), 2),
+                "influence": round(as_float(item.get("influence")), 2),
+                "influence_label": label,
+                "influence_selection_score": round(as_float(item.get("influence_selection_score")), 2),
+                "selected": bool(item.get("influence_selected") or item.get("selected")),
+                "day_trigger_order": as_int(item.get("day_trigger_order"), 0),
+                "wave_no": as_int(item.get("wave_no"), 1),
+                "wave_trigger_order": as_int(item.get("wave_trigger_order"), 0),
+                "new_after_3m": as_int(item.get("new_after_3m"), 0),
+                "new_after_5m": as_int(item.get("new_after_5m"), 0),
+                "new_after_10m": as_int(item.get("new_after_10m"), 0),
+                "payload": payload,
+            }
+        )
+    return items[:12]
+
+
 def score_best_activity_anchor(
     config: MySqlConfig,
     trade_date: str,
     row: dict[str, Any],
     activity_index: dict[str, dict[str, Any]],
+    headline_theme_index: dict[str, dict[str, dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     primary = clean_anchor(row.get("primary_anchor"))
     candidates = activity_candidate_anchors(activity_index, row.get("event_time", ""), primary, row.get("code", ""))
@@ -961,6 +1220,10 @@ def score_best_activity_anchor(
     detail["influence_anchor_source"] = influence_best.get("source") or ""
     detail["influence_anchor_selection_score"] = influence_best.get("influence_selection_score")
     detail["activity_anchor_candidates"] = public_candidates
+    detail["multi_theme_influence"] = multi_theme_influence_items(
+        evaluated,
+        (headline_theme_index or {}).get(str(row.get("code") or "").strip(), {}),
+    )
     detail["activity_anchor_selection_reason"] = (
         f"按「{best.get('anchor')}」口径计算：波段第{best.get('wave_trigger_order') or '-'}个触发，"
         f"{best.get('influence_label') or '带动未知'}，候选分{best.get('selection_score')}"
@@ -1042,28 +1305,24 @@ def anchor_leadership_score(row: dict[str, Any], anchor_context: dict[str, Any])
     rank_10d = as_int(anchor_context.get("rank_10d"), 9999)
     amount_rank = as_int(anchor_context.get("today_amount_rank"), 9999)
     speed_rank = as_int(anchor_context.get("today_speed_rank"), 9999)
-    market_rank_3d = as_int(anchor_context.get("market_rank_3d"), 9999)
-    market_rank_5d = as_int(anchor_context.get("market_rank_5d"), 9999)
-    market_rank_10d = as_int(anchor_context.get("market_rank_10d"), 9999)
     role = str(row.get("role_label") or anchor_context.get("today_role_label") or "")
     period_rank_source = str(anchor_context.get("period_rank_source") or "")
-    has_iwencai_strength = period_rank_source == "iwencai_top50"
-    if not has_iwencai_strength:
+    has_pool_strength = period_rank_source == "research_pool"
+    if not has_pool_strength:
         rank_3d = rank_5d = rank_10d = 9999
-        market_rank_3d = market_rank_5d = market_rank_10d = 9999
     if 0 < rank_3d <= 5:
         score += 12
-        reasons.append(f"近3日锚点内第{rank_3d}")
+        reasons.append(f"3日锚点内第{rank_3d}")
     elif 0 < rank_3d <= 10:
         score += 7
     if 0 < rank_5d <= 5:
         score += 8
-        reasons.append(f"近5日锚点内第{rank_5d}")
+        reasons.append(f"5日锚点内第{rank_5d}")
     elif 0 < rank_5d <= 10:
         score += 4
     if 0 < rank_10d <= 5:
         score += 5
-        reasons.append(f"近10日锚点内第{rank_10d}")
+        reasons.append(f"10日锚点内第{rank_10d}")
     elif 0 < rank_10d <= 10:
         score += 2
     if 0 < amount_rank <= 5:
@@ -1071,24 +1330,8 @@ def anchor_leadership_score(row: dict[str, Any], anchor_context: dict[str, Any])
         reasons.append(f"今日成交锚点内第{amount_rank}")
     if 0 < speed_rank <= 5:
         score += 2
-    if 0 < market_rank_3d <= 20:
-        score += 4
-        reasons.append(f"问财近3日全市场第{market_rank_3d}")
-    elif 0 < market_rank_3d <= 50:
-        score += 2
-    if 0 < market_rank_5d <= 20:
-        score += 3
-    elif 0 < market_rank_5d <= 50:
-        score += 1
-    if 0 < market_rank_10d <= 20:
-        score += 2
-    elif 0 < market_rank_10d <= 50:
-        score += 1
-    if not has_iwencai_strength:
-        if period_rank_source == "not_in_iwencai_top50":
-            reasons.append("未进问财Top50")
-        else:
-            reasons.append("未进锚点近期强势池")
+    if not has_pool_strength:
+        reasons.append("未进研究池近期强势结构")
     if "领涨" in role:
         score += 5
         reasons.append("具备领涨定位")
@@ -1275,13 +1518,13 @@ def build_texts(row: dict[str, Any], scored: dict[str, Any]) -> dict[str, Any]:
 
     evidence_phrase = stock_reason or impact or async_view
     if anchor and evidence_phrase:
-        explanation = compact(f"{anchor}有题材解释，盘口涨速和成交确认。", 80)
+        explanation = compact(f"{anchor}有题材解释，盘口涨速和成交确认", 80)
     elif anchor:
-        explanation = compact(f"{anchor}带动，主要由盘中涨速和成交增量触发。", 80)
+        explanation = compact(f"{anchor}带动，主要由盘中涨速和成交增量触发", 80)
     elif evidence_phrase:
-        explanation = compact("有个股材料，但题材锚点未确认，偏个股脉冲。", 80)
+        explanation = compact("有个股材料，但题材锚点未确认，偏个股脉冲", 80)
     else:
-        explanation = "缺少明确题材和硬证据，主要由盘口涨速触发。"
+        explanation = "缺少明确题材和硬证据，主要由盘口涨速触发"
 
     support_items: list[str] = []
     if anchor:
@@ -1298,7 +1541,7 @@ def build_texts(row: dict[str, Any], scored: dict[str, Any]) -> dict[str, Any]:
         support_items.append(compact(f"主动性口径：{initiative_anchor}；带动性口径：{influence_anchor}", 100))
     if evidence_phrase:
         support_items.append(compact(f"证据：{evidence_phrase}", 100))
-    leadership_reasons = detail.get("anchor_leadership_reasons") or []
+    leadership_reasons = []
     if leadership_reasons:
         support_items.append(compact(f"区间领头：{'；'.join(str(item) for item in leadership_reasons[:3])}", 110))
     initiative_reasons = detail.get("initiative_reasons") or []
@@ -1436,38 +1679,33 @@ def build_judgements(
     limit: int,
     code: str = "",
     dirty_only: bool = False,
+    research_pool_only: bool = False,
 ) -> dict[str, int]:
     ensure_table(config)
-    dirty_candidates: list[dict[str, str]] = []
-    codes = [code.strip()] if code.strip() else []
     if dirty_only:
-        ensure_incremental_tables(config)
-        dirty_candidates = fetch_dirty_judgement_candidates(config, trade_date, limit, code.strip())
-        codes = sorted({item["code"] for item in dirty_candidates if item.get("code")})
-        if not codes:
-            return {"dirty": 0, "events": 0, "written": 0, "ignored": 0}
-    events = load_events(config, trade_date, scan_top, window_top, latest_only, limit, codes)
-    activity_index = load_activity_index(config, trade_date)
+        return {"events": 0, "written": 0, "dirty_disabled": 1}
+    codes = [code.strip()] if code.strip() else []
+    research_codes = None
+    if research_pool_only and not code.strip():
+        research_codes = ResearchPoolProvider(config).latest_codes(trade_date)
+    if research_pool_only and not code.strip() and not research_codes:
+        return {"events": 0, "written": 0}
+    if research_pool_only and not code.strip() and research_codes:
+        codes = list(research_codes)
+    events = load_events(config, trade_date, scan_top, window_top, latest_only, limit, codes, research_pool_only)
+    index_codes = research_codes if research_pool_only and not code.strip() else None
+    activity_index = load_activity_index(config, trade_date, index_codes)
+    headline_theme_index = load_headline_theme_index(config, trade_date, index_codes)
     written = 0
     processed_codes: set[str] = set()
     for row in events:
-        selected_row, scored = score_best_activity_anchor(config, trade_date, row, activity_index)
+        selected_row, scored = score_best_activity_anchor(config, trade_date, row, activity_index, headline_theme_index)
         texts = build_texts(selected_row, scored)
         scored["score_detail"]["display_contract"] = build_display_contract(selected_row, scored, texts)
         write_judgement(config, trade_date, selected_row, scored, texts)
         processed_codes.add(str(row.get("code") or ""))
         written += 1
-    ignored = 0
-    if dirty_only:
-        for item in dirty_candidates:
-            if item.get("code") in processed_codes:
-                mark_dirty_judgement(config, item.get("dirty_id", ""), "done")
-            else:
-                mark_dirty_judgement(config, item.get("dirty_id", ""), "ignored", "no matching scan/window event")
-                ignored += 1
     result = {"events": len(events), "written": written}
-    if dirty_only:
-        result.update({"dirty": len(dirty_candidates), "ignored": ignored})
     return result
 
 
@@ -1479,7 +1717,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--code", default="")
     parser.add_argument("--latest-only", action="store_true")
-    parser.add_argument("--dirty-only", action="store_true")
+    parser.add_argument("--dirty-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--research-pool-only", dest="research_pool_only", action="store_true", help="Only process active research pool stocks.")
     add_mysql_args(parser)
     return parser.parse_args()
 
@@ -1501,6 +1740,7 @@ def main() -> int:
         args.limit,
         args.code,
         args.dirty_only,
+        args.research_pool_only,
     )
     print(json.dumps({"trade_date": args.trade_date, **result}, ensure_ascii=False))
     return 0

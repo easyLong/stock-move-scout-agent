@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Any
 
 
+def _research_pool_only(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("research_pool_only"))
+
+
 def build_source_command(
     *,
     kind: str,
@@ -15,6 +19,9 @@ def build_source_command(
     now: datetime | None = None,
 ) -> list[str] | None:
     current_time = now or datetime.now()
+
+    if kind in {"iwencai_period_rankings", "ths_limit_up_review", "stock_theme_reason_bank"}:
+        return None
 
     if kind == "build_cold_universe":
         return [python_executable, str(root / "scripts" / "build_stock_scout_universe.py")]
@@ -55,6 +62,47 @@ def build_source_command(
             command.extend(["--request-timeout", str(int(payload.get("request_timeout", 8)))])
         if payload.get("max_pages"):
             command.extend(["--max-pages", str(int(payload.get("max_pages", 4)))])
+        if payload.get("trade_date"):
+            command.extend(["--trade-date", str(payload.get("trade_date"))])
+        if _research_pool_only(payload):
+            command.append("--research-pool-only")
+        return command + mysql_args
+
+    if kind == "daily_root_evidence_pipeline":
+        command = [
+            python_executable,
+            str(root / "scripts" / "run_daily_root_evidence_pipeline.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--batch-size",
+            str(int(payload.get("batch_size", 500))),
+            "--workers",
+            str(int(payload.get("workers", 4))),
+            "--request-timeout",
+            str(int(payload.get("request_timeout", 12))),
+            "--timeout",
+            str(int(payload.get("timeout", 1200))),
+            "--per-kind-limit",
+            str(int(payload.get("per_kind_limit", 8))),
+            "--model-config",
+            str(payload.get("model_config", "default")),
+            "--model-timeout",
+            str(int(payload.get("model_timeout", 60))),
+        ]
+        if payload.get("fallback_only"):
+            command.append("--fallback-only")
+        if payload.get("skip_model_summary"):
+            command.append("--skip-model-summary")
+        if payload.get("skip_f10_refresh"):
+            command.append("--skip-f10-refresh")
+        if payload.get("preserve_trade_date"):
+            command.append("--preserve-trade-date")
+        if payload.get("service_date_mode"):
+            command.extend(["--service-date-mode", str(payload.get("service_date_mode"))])
+        if payload.get("fallback_without_model", True):
+            command.append("--fallback-without-model")
+        else:
+            command.append("--no-fallback-without-model")
         return command + mysql_args
 
     if kind == "morning_market_news":
@@ -137,6 +185,32 @@ def build_source_command(
             command.extend(["--until", str(payload.get("until"))])
         return command + mysql_args
 
+    if kind == "scheduled_task_health_check":
+        command = [
+            python_executable,
+            str(root / "scripts" / "check_scheduled_task_health.py"),
+            "--grace-minutes",
+            str(int(payload.get("grace_minutes", 15))),
+            "--lookback-days",
+            str(int(payload.get("lookback_days", 3))),
+        ]
+        if payload.get("as_of"):
+            command.extend(["--as-of", str(payload.get("as_of"))])
+        return command + mysql_args
+
+    if kind == "ths_market_after_close_summary":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_ths_market_after_close_summary.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--timeout",
+            str(int(payload.get("timeout", 12))),
+            "--output-json",
+            str(root / "runs" / "data_tasks" / "ths_market_after_close_summary.json"),
+        ]
+        return command + mysql_args
+
     if kind == "ths_hot_concepts":
         command = [
             python_executable,
@@ -156,26 +230,63 @@ def build_source_command(
             command.append("--skip-members")
         return command + mysql_args
 
-    if kind == "ths_limit_up_review":
+    if kind == "ths_homepage_headline_themes":
         command = [
             python_executable,
-            str(root / "scripts" / "collect_ths_limit_up_review.py"),
+            str(root / "scripts" / "collect_ths_homepage_headline_themes.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--timeout",
+            str(int(payload.get("timeout", 15))),
+            "--pause",
+            str(float(payload.get("pause", 0.03))),
+            "--max-pages",
+            str(int(payload.get("max_pages", 80))),
+        ]
+        if payload.get("fail_on_empty"):
+            command.append("--fail-on-empty")
+        if payload.get("hot_only"):
+            command.append("--hot-only")
+        command.append("--replace-date" if payload.get("replace_date", True) else "--no-replace-date")
+        return command + mysql_args
+
+    if kind == "eastmoney_limit_up_pool":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_eastmoney_limit_up_pool.py"),
             "--trade-date",
             str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
             "--days",
             str(int(payload.get("days", 1))),
-            "--timeout",
-            str(int(payload.get("timeout", 12))),
             "--pause",
-            str(float(payload.get("pause", 0.2))),
-            "--lookback-days",
-            str(int(payload.get("lookback_days", 14))),
+            str(float(payload.get("pause", 0.3))),
+            "--retries",
+            str(int(payload.get("retries", 3))),
         ]
-        if payload.get("input_json"):
-            command.extend(["--input-json", str(payload.get("input_json"))])
-        if payload.get("cookie_file"):
-            command.extend(["--cookie-file", str(payload.get("cookie_file"))])
+        if payload.get("dates"):
+            command.extend(["--dates", str(payload.get("dates"))])
+        if payload.get("fail_on_empty"):
+            command.append("--fail-on-empty")
         command.append("--replace-dates" if payload.get("replace_dates", True) else "--no-replace-dates")
+        return command + mysql_args
+
+    if kind == "post_close_leaderboard_snapshot":
+        command = [
+            python_executable,
+            str(root / "scripts" / "build_leaderboard_snapshot.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--limit-up-days",
+            str(int(payload.get("limit_up_days", 5))),
+            "--gain-period-days",
+            str(int(payload.get("gain_period_days", 5))),
+            "--gain-top",
+            str(int(payload.get("gain_top", 30))),
+        ]
+        if payload.get("force", True):
+            command.append("--force")
+        if payload.get("skip_research_pool"):
+            command.append("--skip-research-pool")
         return command + mysql_args
 
     if kind == "ths_stock_concepts":
@@ -195,69 +306,38 @@ def build_source_command(
         ]
         if payload.get("code"):
             command.extend(["--code", str(payload.get("code"))])
-        return command + mysql_args
-
-    if kind == "stock_theme_reason_bank":
-        command = [python_executable, str(root / "scripts" / "rebuild_stock_theme_reason_bank.py"), "--replace"]
-        if not payload.get("include_stock_concepts", True):
-            command.append("--no-include-stock-concepts")
-        if payload.get("include_concept_tags", False):
-            command.append("--include-concept-tags")
-        if payload.get("chunk_size"):
-            command.extend(["--chunk-size", str(int(payload.get("chunk_size", 500)))])
-        return command + mysql_args
-
-    if kind == "iwencai_period_rankings":
-        command = [
-            python_executable,
-            str(root / "scripts" / "collect_iwencai_period_rankings.py"),
-            "--periods",
-            str(payload.get("periods", "3,5,10")),
-            "--top",
-            str(int(payload.get("top", 300))),
-            "--universe",
-            str(payload.get("universe", "沪深A股")),
-        ]
         if payload.get("trade_date"):
             command.extend(["--trade-date", str(payload.get("trade_date"))])
+        if _research_pool_only(payload):
+            command.append("--research-pool-only")
         return command + mysql_args
 
-    if kind == "lhb_seat_evidence":
+    if kind == "research_pool_snapshot":
         command = [
             python_executable,
-            str(root / "scripts" / "collect_lhb_seat_evidence.py"),
+            str(root / "scripts" / "build_research_pool_snapshot.py"),
             "--trade-date",
             str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
-            "--limit",
-            str(int(payload.get("limit", 120))),
+            "--limit-up-days",
+            str(int(payload.get("limit_up_days", 5))),
+            "--gain-period-days",
+            str(int(payload.get("gain_period_days", 5))),
+            "--gain-top",
+            str(int(payload.get("gain_top", 30))),
         ]
-        if payload.get("judgement_codes", True):
-            command.append("--judgement-codes")
-        if payload.get("codes"):
-            command.extend(["--codes", str(payload.get("codes"))])
+        if payload.get("force", True):
+            command.append("--force")
         return command + mysql_args
 
-    if kind == "announcement_effects":
+    if kind == "research_pool_theme_members":
         command = [
             python_executable,
-            str(root / "scripts" / "build_announcement_effects.py"),
+            str(root / "scripts" / "build_research_pool_theme_members.py"),
             "--trade-date",
             str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
-            "--lookback-days",
-            str(int(payload.get("lookback_days", 240))),
-            "--stale-after-days",
-            str(int(payload.get("stale_after_days", 31))),
-            "--sleep-seconds",
-            str(float(payload.get("sleep_seconds", 0.15))),
         ]
-        if payload.get("code"):
-            command.extend(["--code", str(payload.get("code"))])
-        if payload.get("limit"):
-            command.extend(["--limit", str(int(payload.get("limit", 0)))])
-        if payload.get("refresh_bars", True) is False:
-            command.append("--no-refresh-bars")
-        if payload.get("allow_local_fallback", False):
-            command.append("--allow-local-fallback")
+        if payload.get("force", True):
+            command.append("--force")
         return command + mysql_args
 
     if kind == "effective_facts":
@@ -269,6 +349,8 @@ def build_source_command(
         ]
         if payload.get("code"):
             command.extend(["--code", str(payload.get("code"))])
+        if _research_pool_only(payload):
+            command.append("--research-pool-only")
         return command + mysql_args
 
     if kind == "auction_candidates":
@@ -276,11 +358,11 @@ def build_source_command(
             python_executable,
             str(root / "scripts" / "build_auction_candidates.py"),
             "--limit",
-            str(int(payload.get("limit", 50))),
+            str(int(payload.get("limit", 3))),
             "--min-auction-pct",
-            str(float(payload.get("min_auction_pct", 1.0))),
+            str(float(payload.get("min_auction_pct", 0.0))),
             "--min-auction-amount",
-            str(float(payload.get("min_auction_amount", 10_000_000))),
+            str(float(payload.get("min_auction_amount", 0.0))),
             "--theme-limit",
             str(int(payload.get("theme_limit", 20))),
             "--timeout",
@@ -301,7 +383,7 @@ def build_source_command(
         if payload.get("minute_top"):
             command.extend(["--minute-top", str(int(payload.get("minute_top", 10)))])
         if payload.get("seal_top"):
-            command.extend(["--seal-top", str(int(payload.get("seal_top", 10)))])
+            command.extend(["--seal-top", str(int(payload.get("seal_top", 3)))])
         if payload.get("include_st"):
             command.append("--include-st")
         if payload.get("trade_date"):
@@ -321,6 +403,48 @@ def build_source_command(
         ]
         if payload.get("trade_date"):
             command.extend(["--trade-date", str(payload.get("trade_date"))])
+        return command + mysql_args
+
+    if kind == "market_width_snapshot":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_market_width_snapshot.py"),
+            "--source",
+            str(payload.get("source", "tdx")),
+            "--output-json",
+            str(root / "runs" / "data_tasks" / "market_width_latest.json"),
+        ]
+        if payload.get("batch_size"):
+            command.extend(["--batch-size", str(int(payload.get("batch_size", 80)))])
+        if payload.get("tdx_timeout"):
+            command.extend(["--tdx-timeout", str(int(payload.get("tdx_timeout", 3)))])
+        if payload.get("include_bj", False):
+            command.append("--include-bj")
+        if payload.get("include_st", False):
+            command.append("--include-st")
+        return command + mysql_args
+
+    if kind == "market_width_daily_close":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_market_width_daily_close.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--min-rows",
+            str(int(payload.get("min_rows", 4000))),
+            "--workers",
+            str(int(payload.get("workers", 12))),
+            "--batch-size",
+            str(int(payload.get("batch_size", 900))),
+            "--wait-minutes",
+            str(int(payload.get("wait_minutes", 20))),
+            "--retry-seconds",
+            str(int(payload.get("retry_seconds", 120))),
+            "--output-json",
+            str(root / "runs" / "data_tasks" / "market_width_daily_close.json"),
+        ]
+        if payload.get("refresh_bars", True) is False:
+            command.append("--no-refresh-bars")
         return command + mysql_args
 
     return None

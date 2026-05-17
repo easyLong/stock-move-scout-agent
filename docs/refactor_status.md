@@ -1,279 +1,44 @@
 # 重构状态
 
-## 2026-05-10 本轮整理
+## 当前主链路
 
-已完成：
-
-```text
-1. DB/SQL 基础工具下沉到 src/stock_move_scout/db/
-   - mysql.py: MySqlConfig、run_mysql、mysql_rows、MySQL CLI 参数
-   - sql.py: sql_string/sql_json/sql_int/sql_number/sql_bool
-   - scripts/stock_scout_mysql.py 继续作为旧脚本兼容出口
-
-2. 调度命令门面下沉到 src/stock_move_scout/scheduler/commands.py
-   - stock_scout_task_scheduler.py 只保留薄 wrapper
-   - 业务命令仍由 sources/evidence/analysis/judgement 分层构造
-
-3. Web 运行时辅助下沉到 src/stock_move_scout/web/
-   - json_query / latest_data_date / resolve_trade_date
-   - stock_scout_web.py 继续保留 FastAPI 入口和前端 HTML
-```
-
-验证：
+本项目当前围绕“个股异动，快速定位异动原因，找真正有效证据”组织。
 
 ```text
-python -m compileall -q src scripts
-Web /api/trade_dates 200 OK
-Web、windowed agent、scheduler、hot worker、maintenance/cold/warm worker 均已按新代码重启
+盘后 15:25  涨停池更新
+盘后 16:05  日K和市场概览收盘快照
+盘后 16:20  收盘确认版领头羊快照
+夜间 22:30  生成下一个交易日的研究池、有效事实、模型总结、根证据缓存
+盘中        只对服务日研究池做实时扫描、窗口统计、市场概览和异动情报流展示
 ```
 
-## 1. 目标分层
+## 已完成
 
-当前目标架构：
+- 研究池落地到 `research_pool_snapshots` 和 `research_pool_items`。
+- 研究池规则统一为“近5日涨停 + 近5日无涨停且5日涨幅Top30”。
+- 市场概览使用 `research_pool_*` 字段，不再使用旧问财 Top50 命名。
+- 领头羊新增 `leaderboard_snapshots`，收盘后生成确认版快照。
+- Web API 增加 `service_trade_date`、`base_trade_date`、`leader_data_trade_date`。
+- 有效事实层简化为 F10 近期重要事件近10日过滤。
+- 龙虎榜只保留同花顺详情里的蓝色席位标签证据。
+- 证据详情和领头羊页优先展示有效事实总结。
 
-```text
-sources -> scheduler -> mysql -> analysis -> evidence -> judgement -> feed/web
-```
+## 已退出主链路
 
-核心原则：
+- `stock_active_facts`
+- `stock_announcement_effects`
+- `stock_theme_reason_bank`
+- `ths_limit_up_review_items`
+- `iwencai_period_rankings`
+- `stock_move_judgement_dirty_queue`
 
-```text
-MySQL 是唯一业务状态源。
-scripts 保留为兼容入口和编排入口。
-src/stock_move_scout 承接可复用业务模块。
-调度器不硬编码业务脚本参数。
-Web 不重新推理业务结论。
-```
+## 保留但非主链路
 
-## 2. 已完成拆分
+- `stock_root_evidence_cache_dirty_queue`：保留为增量缓存兜底，当前主要依赖批量 pipeline 刷新。
+- 旧问财 Top50 物理字段已从当前 schema 和线上表移除。
 
-### sources
+## 下一步建议
 
-```text
-src/stock_move_scout/sources/
-  definitions.py
-  commands.py
-```
-
-已承接：
-
-```text
-数据源定义
-hot / warm / cold 分层
-采集命令构造
-分批任务判断
-```
-
-### scheduler
-
-```text
-src/stock_move_scout/scheduler/
-  task_definitions.py
-```
-
-已承接：
-
-```text
-scheduled_tasks 定义
-next_run 规则
-任务参数归属判断
-```
-
-### analysis
-
-```text
-src/stock_move_scout/analysis/
-  commands.py
-  realtime_filter.py
-  activity.py
-  influence.py
-```
-
-已承接：
-
-```text
-实时异动筛选规则
-同锚活动索引
-同锚首发与波次
-3/5/10 分钟扩散统计
-时间序列 Top3 + 本股
-活跃序列 Top3 + 本股
-主动性评分
-带动性评分
-短线行为评分
-analysis 任务命令路由
-```
-
-### evidence
-
-```text
-src/stock_move_scout/evidence/
-  commands.py
-  model_config.py
-  model_client.py
-  schema.py
-  storage.py
-  summary.py
-  payload.py
-```
-
-已承接：
-
-```text
-证据层任务命令路由
-模型配置读取
-OpenAI-compatible 模型客户端
-证据摘要 schema
-evidence_hash
-证据指纹
-dirty queue
-异步证据 payload 构建
-fallback 事实卡
-summary 落库
-```
-
-### judgement
-
-```text
-src/stock_move_scout/judgement/
-  commands.py
-  display_contract.py
-```
-
-已承接：
-
-```text
-judgement 任务命令路由
-Web 展示契约 display_contract
-```
-
-### feed
-
-```text
-src/stock_move_scout/feed/
-  queries.py
-```
-
-已承接：
-
-```text
-Web feed SQL 查询
-交易日期查询
-实时领涨 / 稳定异动读取
-```
-
-### db
-
-```text
-src/stock_move_scout/db/
-  sql.py
-```
-
-已承接：
-
-```text
-部分 SQL 辅助函数
-```
-
-## 3. 当前仍较重的脚本
-
-```text
-scripts/windowed_stock_scout_agent.py
-  仍包含通达信扫描、窗口聚合、任务投递。
-
-scripts/build_stock_move_judgements.py
-  已调用 analysis / judgement 模块，但仍包含较多 SQL、评分、风险和写库逻辑。
-
-scripts/stock_scout_web.py
-  Web 服务、接口、前端 HTML/CSS/JS 仍集中在一个文件。
-
-scripts/stock_scout_mysql.py
-  MySQL 工具、表初始化、导入逻辑、部分领域函数仍集中。
-```
-
-## 4. 本阶段不继续拆的内容
-
-按当前决策，先暂停继续拆代码，优先补齐文档和稳定边界。
-
-暂不继续拆：
-
-```text
-analysis 锚点归因
-analysis 区间强度
-judgement 风险模型
-judgement 持续性标签
-web 展示组件
-stock_scout_mysql.py
-```
-
-## 5. 下一阶段建议顺序
-
-建议后续按这个顺序继续：
-
-```text
-1. 补单元测试或样例数据回放，锁住实时筛选、带动性输出。
-2. 拆 judgement 的评分输入、风险模型、持续性标签。
-3. 拆 analysis 的锚点归因和区间强度。
-4. 拆 feed/web 的展示数据整形。
-5. 拆 db 层，把 stock_scout_mysql.py 逐步瘦身。
-```
-
-## 6. 开发约束
-
-后续新增功能时遵守：
-
-```text
-新增数据源：先放 sources。
-新增调度任务：先放 scheduler/task_definitions.py。
-新增实时分析：放 analysis。
-新增证据摘要：放 evidence。
-新增最终判断：放 judgement。
-新增 Web 数据读取：放 feed。
-新增 UI 展示：尽量读取 display_contract。
-不要让文件重新成为流程状态源。
-```
-
-## 7. 证据详情解耦进展
-
-已新增：
-
-```text
-src/stock_move_scout/feed/evidence_view.py
-  负责把 feed 行数据整理成 evidence_view 展示视图。
-```
-
-当前边界：
-
-```text
-feed/queries.py
-  继续负责 SQL 查询和原始 evidence_items/detail 字段。
-
-feed/evidence_view.py
-  负责证据层归一化、裁剪、摘要卡片和分层展示模型。
-  展示层不完全信任 SQL 里的 layer 字段，会按来源和用途重新划分实时/异步。
-
-scripts/stock_scout_web.py
-  /api/feed 为每行附加 evidence_view。
-  前端优先读取 evidence_view，旧的 evidence_items/detail 解析逻辑保留兜底。
-```
-
-当前分层规则：
-
-```text
-实时层：
-  实时扫描、扫描触发、同锚扩散、问财区间排名。
-  判断引擎生成的持续性、核心支撑。
-  实时扫描带出的题材证据、个股证据。
-
-异步层：
-  事实卡、龙虎榜、模型总结、核心证据、影响要素。
-  最大瑕疵、证据缺口、持续依据等补充验证内容。
-```
-
-下一步建议：
-
-```text
-1. 给 evidence_view 增加样例回放测试，锁住关键事实、带动性、龙虎榜等展示排序。
-2. 将前端证据渲染函数从 stock_scout_web.py 拆成静态 JS 文件。
-3. 待 evidence_view 稳定后，再精简 SQL 中重复拼接的 detail/display_contract 展示字段。
-```
+- 把领头羊大 SQL 拆成维度分表，便于解释每个得分来源。
+- 把 `stock_scout_web.py` 的 API 继续拆成独立 router。
+- 给盘中热任务增加更细的耗时和失败原因统计。

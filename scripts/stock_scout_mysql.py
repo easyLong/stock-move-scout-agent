@@ -31,6 +31,16 @@ from stock_move_scout.feed.root_cache import (
     enqueue_root_evidence_cache_dirty_many,
     latest_root_evidence_trade_date,
 )
+from stock_move_scout.market_width import ensure_market_width_tables
+from stock_move_scout.sources.auction_storage import (
+    import_auction_candidate_rows as storage_import_auction_candidate_rows,
+    import_auction_minute_analysis_rows as storage_import_auction_minute_analysis_rows,
+    import_auction_trend_summary_rows as storage_import_auction_trend_summary_rows,
+)
+from stock_move_scout.sources.market_news_storage import (
+    import_market_news_json as storage_import_market_news_json,
+    import_market_news_rows as storage_import_market_news_rows,
+)
 
 
 UNANCHORED_TYPE = "unanchored"
@@ -188,8 +198,6 @@ def active_anchor_candidates(row: dict[str, Any], active_anchor_map: dict[str, l
 
 
 def theme_reason_anchor_type(info: dict[str, Any]) -> str:
-    if text_value(info, "source") == "ths_limit_up_review":
-        return "limit_up_theme"
     return "hot_concept"
 
 
@@ -339,10 +347,8 @@ def related_theme_reason_info_for(
 
 def theme_reason_rank(info: dict[str, Any]) -> tuple[float, float, int]:
     source_rank = {
-        "ths_limit_up_review": 5,
         "ths_hot_concept": 4,
         "ths_stock_concept": 3,
-        "ths_root_theme_point": 2,
         "concept_tag": 1,
     }
     return (
@@ -665,7 +671,7 @@ def build_scan_roles(
                 ),
                 "raw_json": {
                     "anchor_strength": text_value(stat, "strength_label"),
-                    "anchor_source": "active_market_anchor" if had_active_anchor else "theme_reason_bank" if reason_info else "no_theme_anchor",
+                    "anchor_source": "research_pool_theme_members" if had_active_anchor else "ths_stock_concept" if reason_info else "no_theme_anchor",
                     "anchor_status": text_value(active_info, "status"),
                     "anchor_match_level": text_value(active_info, "match_level"),
                     "anchor_matched_term": text_value(active_info, "matched_term"),
@@ -682,7 +688,7 @@ def build_scan_roles(
                     "pct_change": num_value(row.get("pct_change")),
                     "speed": num_value(row.get("speed")),
                     "amount_yi": round(amount_value(row) / 100_000_000, 2),
-                    "algorithm": "scan_topn_anchor_roles_v2_coherent_anchor",
+                    "algorithm": "scan_topn_anchor_roles_v5_research_pool_theme",
                     "dominant_industry": text_value(stat, "dominant_industry"),
                     "dominant_sub_industry": text_value(stat, "dominant_sub_industry"),
                 },
@@ -771,9 +777,13 @@ def normalized_reason_item(
 def ensure_schema(config: MySqlConfig, root: Path | None = None) -> None:
     base = root or project_root()
     schema = base / "database" / "mysql" / "stock_scout_schema.sql"
+    if mysql_table_exists(config, "stock_ths_root_items"):
+        ensure_ths_root_item_columns(config)
     sql = schema.read_text(encoding="utf-8")
     run_mysql(config, sql, database=False)
     ensure_realtime_delta_columns(config)
+    ensure_market_width_tables(config)
+    ensure_ths_root_item_columns(config)
 
 
 def mysql_scalar(config: MySqlConfig, sql: str) -> str:
@@ -791,6 +801,16 @@ def mysql_column_exists(config: MySqlConfig, table_name: str, column_name: str) 
     return mysql_scalar(config, sql) != "0"
 
 
+def mysql_table_exists(config: MySqlConfig, table_name: str) -> bool:
+    sql = f"""
+    SELECT COUNT(*)
+    FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_SCHEMA=DATABASE()
+      AND TABLE_NAME={sql_string(table_name)};
+    """
+    return mysql_scalar(config, sql) != "0"
+
+
 def mysql_index_exists(config: MySqlConfig, table_name: str, index_name: str) -> bool:
     sql = f"""
     SELECT COUNT(*)
@@ -800,6 +820,18 @@ def mysql_index_exists(config: MySqlConfig, table_name: str, index_name: str) ->
       AND INDEX_NAME={sql_string(index_name)};
     """
     return mysql_scalar(config, sql) != "0"
+
+
+def ensure_ths_root_item_columns(config: MySqlConfig) -> None:
+    if not mysql_column_exists(config, "stock_ths_root_items", "detail_content"):
+        run_mysql(
+            config,
+            """
+            ALTER TABLE stock_ths_root_items
+            ADD COLUMN detail_content MEDIUMTEXT NULL COMMENT '重要事件展开详情'
+            AFTER content;
+            """,
+        )
 
 
 def ensure_realtime_delta_columns(config: MySqlConfig) -> None:
@@ -823,6 +855,139 @@ def load_active_anchor_member_map(config: MySqlConfig, codes: list[str]) -> dict
     if not clean_codes:
         return {}
     code_sql = ",".join(sql_string(code) for code in clean_codes)
+    research_pool_theme_sql = f"""
+    WITH latest_pool_day AS (
+      SELECT MAX(trade_date) AS trade_date
+      FROM research_pool_theme_members
+    ),
+    ranked_members AS (
+      SELECT
+        m.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY m.theme_name, m.code
+          ORDER BY m.is_headline_theme DESC, m.match_score DESC, m.fit_rank ASC, m.updated_at DESC
+        ) AS rn
+      FROM research_pool_theme_members m
+      JOIN latest_pool_day d ON d.trade_date=m.trade_date
+      WHERE m.code IN ({code_sql})
+        AND COALESCE(m.theme_name, '') <> ''
+        AND (m.is_headline_theme=1 OR m.theme_name NOT IN ('融资融券','转融券标的','深股通','沪股通','富时罗素','MSCI中国','标普道琼斯A股','证金持股','养老金持股','社保重仓','注册制次新股','新股与次新股','科创次新股','ST板块','低价股','高价股'))
+    )
+    SELECT
+      code,
+      theme_name AS anchor_name,
+      IF(is_headline_theme=1, 'research_pool_headline_theme', 'research_pool_concept') AS anchor_type,
+      'research_pool_theme_members' AS source,
+      stock_name,
+      DATE_FORMAT(trade_date, '%Y-%m-%d') AS last_seen_date,
+      1 AS event_count_14d,
+      1 AS active_days_14d,
+      0 AS total_heat_14d,
+      0 AS limit_up_count_14d,
+      reason_explain AS evidence_text,
+      GREATEST(45, match_score - LEAST(COALESCE(pool_rank, 99), 99) * 0.08 - LEAST(COALESCE(fit_rank, 99), 99) * 0.12) AS confidence,
+      'active' AS status,
+      IF(is_headline_theme=1, 'strong', 'medium') AS match_level,
+      concept_name AS matched_term
+    FROM ranked_members
+    WHERE rn=1
+    ORDER BY code, is_headline_theme DESC, theme_rank ASC, pool_rank ASC;
+    """
+    try:
+        rows = mysql_rows(run_mysql(config, research_pool_theme_sql, batch=True, raw=True))
+    except Exception:
+        rows = []
+    if rows:
+        keys = [
+            "code",
+            "anchor_name",
+            "anchor_type",
+            "source",
+            "stock_name",
+            "last_seen_date",
+            "event_count_14d",
+            "active_days_14d",
+            "total_heat_14d",
+            "limit_up_count_14d",
+            "evidence_text",
+            "confidence",
+            "status",
+            "match_level",
+            "matched_term",
+        ]
+        result: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            item = dict(zip(keys, row))
+            result.setdefault(text_value(item, "code"), []).append(item)
+        return result
+    headline_sql = f"""
+    WITH latest_snapshot AS (
+      SELECT snapshot_id, trade_date
+      FROM ths_homepage_headline_themes
+      WHERE source='ths_homepage_headline'
+      ORDER BY trade_date DESC, collected_at DESC
+      LIMIT 1
+    ),
+    ranked_members AS (
+      SELECT
+        m.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY m.theme_name, m.stock_code
+          ORDER BY m.stock_rank ASC, m.updated_at DESC
+        ) AS rn
+      FROM ths_homepage_headline_theme_members m
+      JOIN latest_snapshot s ON s.snapshot_id=m.snapshot_id
+      WHERE m.source='ths_homepage_headline'
+        AND m.stock_code IN ({code_sql})
+        AND COALESCE(m.theme_name, '') <> ''
+    )
+    SELECT
+      stock_code AS code,
+      theme_name AS anchor_name,
+      'ths_headline_theme' AS anchor_type,
+      'ths_homepage_headline' AS source,
+      stock_name,
+      DATE_FORMAT(trade_date, '%Y-%m-%d') AS last_seen_date,
+      1 AS event_count_14d,
+      1 AS active_days_14d,
+      0 AS total_heat_14d,
+      0 AS limit_up_count_14d,
+      CONCAT('同花顺首页头条题材：', theme_name, IF(COALESCE(block_name, '') <> '', CONCAT(' / ', block_name), '')) AS evidence_text,
+      GREATEST(60, 100 - LEAST(COALESCE(theme_rank, 99), 50) - LEAST(COALESCE(stock_rank, 99), 80) * 0.2) AS confidence,
+      'active' AS status,
+      'strong' AS match_level,
+      theme_name AS matched_term
+    FROM ranked_members
+    WHERE rn=1
+    ORDER BY code, theme_rank ASC, stock_rank ASC;
+    """
+    try:
+        rows = mysql_rows(run_mysql(config, headline_sql, batch=True, raw=True))
+    except Exception:
+        rows = []
+    if rows:
+        keys = [
+            "code",
+            "anchor_name",
+            "anchor_type",
+            "source",
+            "stock_name",
+            "last_seen_date",
+            "event_count_14d",
+            "active_days_14d",
+            "total_heat_14d",
+            "limit_up_count_14d",
+            "evidence_text",
+            "confidence",
+            "status",
+            "match_level",
+            "matched_term",
+        ]
+        result: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            item = dict(zip(keys, row))
+            result.setdefault(text_value(item, "code"), []).append(item)
+        return result
     sql = f"""
     SELECT
       c.code, c.anchor_name, c.anchor_type, c.match_source, c.stock_name,
@@ -918,10 +1083,24 @@ def load_theme_reason_map(config: MySqlConfig, codes: list[str]) -> dict[str, di
                PARTITION BY r.code, r.anchor_name
                ORDER BY r.priority DESC, r.confidence DESC, r.source_date DESC, r.updated_at DESC
              ) AS rn
-      FROM stock_theme_reason_bank r
-      WHERE r.code IN ({code_sql})
-        AND r.status='active'
-        AND COALESCE(r.reason_text, '') <> ''
+      FROM (
+        SELECT
+          code,
+          stock_name,
+          concept_name AS anchor_name,
+          concept_name AS theme_name,
+          reason_explain AS reason_text,
+          'ths_stock_concept' AS source,
+          DATE(fetched_at) AS source_date,
+          GREATEST(55, 90 - LEAST(GREATEST(COALESCE(fit_rank, 1), 1), 20)) AS confidence,
+          GREATEST(0, 100 - COALESCE(fit_rank, 100)) AS priority,
+          CONCAT('ths_stock_concept_explanations:', id) AS source_key,
+          updated_at
+        FROM ths_stock_concept_explanations
+        WHERE code IN ({code_sql})
+          AND COALESCE(concept_name, '') <> ''
+          AND COALESCE(reason_explain, '') <> ''
+      ) r
     ) ranked
     LEFT JOIN active_market_anchors a
       ON a.source='ths_hot_concept'
@@ -1526,6 +1705,7 @@ def import_company_profiles_csv(config: MySqlConfig, path: Path) -> int:
 
 
 def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, int]:
+    ensure_ths_root_item_columns(config)
     payload = read_json(path)
     rows = payload.get("rows") if isinstance(payload, dict) else []
     if not isinstance(rows, list) or not rows:
@@ -1572,7 +1752,8 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
                 """
             )
             snapshot_count += 1
-        items = row.get("ths_root_items") if isinstance(row.get("ths_root_items"), list) else []
+        raw_items = row.get("ths_root_items") if isinstance(row.get("ths_root_items"), list) else []
+        items = [item for item in raw_items if isinstance(item, dict) and text_value(item, "item_kind") == "important_event"]
         if items and code not in affected_codes:
             affected_codes.add(code)
             affected_cache_rows.append(
@@ -1585,8 +1766,8 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
             if not isinstance(item, dict):
                 continue
             item_kind = text_value(item, "item_kind") or "other"
-            if item_kind not in {"important_event", "hot_news", "announcement", "theme_point", "other"}:
-                item_kind = "other"
+            if item_kind != "important_event":
+                continue
             item_key_value = text_value(item, "item_key") or safe_id(
                 "|".join(
                     [
@@ -1602,14 +1783,14 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
                 f"""
                 INSERT INTO stock_ths_root_items(
                   code, stock_name, item_kind, item_key, source_section, source_rank, item_date,
-                  title, content, url, tags, importance, source_status, raw_json, collected_at
+                  title, content, detail_content, url, tags, importance, source_status, raw_json, collected_at
                 )
                 VALUES(
                   {sql_string(code)}, {sql_string(text_value(item, "stock_name") or text_value(row, "stock_name") or text_value(row, "name"))},
                   {sql_string(item_kind)}, {sql_string(item_key_value)}, {sql_string(text_value(item, "source_section"))},
                   {sql_int(item.get("source_rank"))}, {sql_string(text_value(item, "item_date") or None)},
                   {sql_string(limit_text(text_value(item, "title"), 512))}, {sql_string(text_value(item, "content"))},
-                  {sql_string(text_value(item, "url"))}, {sql_json(item.get("tags") or [])},
+                  {sql_string(text_value(item, "detail_content"))}, {sql_string(text_value(item, "url"))}, {sql_json(item.get("tags") or [])},
                   {sql_int(item.get("importance"))}, {sql_string(text_value(item, "source_status"))},
                   {sql_json(item.get("raw_json") or {})}, {sql_string(text_value(row, "fetched_at") or now_text())}
                 )
@@ -1620,6 +1801,7 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
                   item_date=COALESCE(VALUES(item_date), item_date),
                   title=VALUES(title),
                   content=VALUES(content),
+                  detail_content=VALUES(detail_content),
                   url=VALUES(url),
                   tags=VALUES(tags),
                   importance=VALUES(importance),
@@ -1632,6 +1814,7 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
     if not statements:
         return {"snapshots": 0, "items": 0}
     run_mysql(config, "START TRANSACTION;\n" + "\n".join(statements) + "\nCOMMIT;")
+    cleanup_ths_root_item_detail_duplicates(config, sorted(affected_codes))
     dirty_cache = 0
     if affected_cache_rows:
         trade_date = latest_root_evidence_trade_date(config) or date.today().strftime("%Y-%m-%d")
@@ -1645,56 +1828,52 @@ def import_ths_root_evidence_json(config: MySqlConfig, path: Path) -> dict[str, 
     return {"snapshots": snapshot_count, "items": item_count, "dirty_cache": dirty_cache}
 
 
+def cleanup_ths_root_item_detail_duplicates(config: MySqlConfig, codes: list[str]) -> None:
+    clean_codes = sorted({str(code or "").strip() for code in codes if str(code or "").strip()})
+    if not clean_codes:
+        return
+    code_sql = ",".join(sql_string(code) for code in clean_codes)
+    run_mysql(
+        config,
+        f"""
+        DELETE old_item
+        FROM stock_ths_root_items old_item
+        JOIN stock_ths_root_items new_item
+          ON new_item.code=old_item.code
+         AND new_item.item_kind=old_item.item_kind
+         AND COALESCE(new_item.item_date, '1000-01-01')=COALESCE(old_item.item_date, '1000-01-01')
+         AND new_item.title=old_item.title
+         AND new_item.id<>old_item.id
+         AND COALESCE(new_item.detail_content, '') <> ''
+        WHERE old_item.code IN ({code_sql})
+          AND COALESCE(old_item.detail_content, '') = '';
+        """,
+    )
+    run_mysql(
+        config,
+        f"""
+        DELETE old_item
+        FROM stock_ths_root_items old_item
+        JOIN stock_ths_root_items new_item
+          ON new_item.code=old_item.code
+         AND new_item.item_kind=old_item.item_kind
+         AND COALESCE(new_item.item_date, '1000-01-01')=COALESCE(old_item.item_date, '1000-01-01')
+         AND new_item.title=old_item.title
+         AND new_item.source_rank=old_item.source_rank
+         AND COALESCE(new_item.url, '')=COALESCE(old_item.url, '')
+         AND COALESCE(new_item.content, '')=COALESCE(old_item.content, '')
+         AND new_item.id>old_item.id
+        WHERE old_item.code IN ({code_sql});
+        """,
+    )
+
+
 def import_market_news_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    statements: list[str] = []
-    for row in rows:
-        source = text_value(row, "source") or "other"
-        if source not in {"cls", "wallstreetcn", "other"}:
-            source = "other"
-        item_kind = text_value(row, "item_kind") or "other"
-        if item_kind not in {"headline", "important", "red", "live", "other"}:
-            item_kind = "other"
-        source_item_id = text_value(row, "source_item_id") or safe_id(
-            "|".join([source, text_value(row, "published_at"), text_value(row, "title"), text_value(row, "url")])
-        )[:128]
-        statements.append(
-            f"""
-            INSERT INTO market_news_items(
-              source, source_item_id, item_kind, published_at, title, content, url,
-              tags, importance, source_status, raw_json, collected_at
-            )
-            VALUES(
-              {sql_string(source)}, {sql_string(source_item_id)}, {sql_string(item_kind)},
-              {sql_string(text_value(row, "published_at") or None)},
-              {sql_string(limit_text(text_value(row, "title"), 512))},
-              {sql_string(text_value(row, "content"))}, {sql_string(text_value(row, "url"))},
-              {sql_json(row.get("tags") or [])}, {sql_int(row.get("importance"))},
-              {sql_string(text_value(row, "source_status"))}, {sql_json(row.get("raw_json") or row)},
-              {sql_string(text_value(row, "collected_at") or now_text())}
-            )
-            ON DUPLICATE KEY UPDATE
-              item_kind=VALUES(item_kind),
-              published_at=COALESCE(VALUES(published_at), published_at),
-              title=VALUES(title),
-              content=VALUES(content),
-              url=VALUES(url),
-              tags=VALUES(tags),
-              importance=VALUES(importance),
-              source_status=VALUES(source_status),
-              raw_json=VALUES(raw_json),
-              collected_at=VALUES(collected_at);
-            """
-        )
-    run_mysql(config, "START TRANSACTION;\n" + "\n".join(statements) + "\nCOMMIT;")
-    return len(statements)
+    return storage_import_market_news_rows(config, rows)
 
 
 def import_market_news_json(config: MySqlConfig, path: Path) -> int:
-    payload = read_json(path)
-    rows = payload.get("rows") if isinstance(payload, dict) else []
-    return import_market_news_rows(config, rows if isinstance(rows, list) else [])
+    return storage_import_market_news_json(config, path)
 
 
 def import_daily_market_theme_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> int:
@@ -1745,163 +1924,15 @@ def import_daily_market_themes_json(config: MySqlConfig, path: Path) -> int:
 
 
 def import_auction_candidate_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    statements: list[str] = []
-    trade_dates = sorted({text_value(row, "trade_date") for row in rows if text_value(row, "trade_date")})
-    for trade_date in trade_dates:
-        statements.append(f"DELETE FROM auction_candidates WHERE trade_date={sql_string(trade_date)};")
-    for row in rows:
-        trade_date = text_value(row, "trade_date")
-        code = text_value(row, "code")
-        if not trade_date or not code:
-            continue
-        statements.append(upsert_stock_sql(row))
-        statements.append(
-            f"""
-            INSERT INTO auction_candidates(
-              trade_date, captured_at, rank_no, code, stock_name, auction_price, preclose,
-              auction_pct, auction_amount, matched_volume, buy_pressure, industry, sub_industry,
-              concepts, theme_matches, theme_score, sector_hot_count, concept_hot_count,
-              resonance_score, score, risk_flags, raw_json
-            )
-            VALUES(
-              {sql_string(trade_date)}, {sql_string(text_value(row, "captured_at") or now_text())},
-              {sql_int(row.get("rank_no"))}, {sql_string(code)}, {sql_string(text_value(row, "stock_name") or text_value(row, "name"))},
-              {sql_number(row.get("auction_price"))}, {sql_number(row.get("preclose"))},
-              {sql_number(row.get("auction_pct"))}, {sql_number(row.get("auction_amount"))},
-              {sql_int(row.get("matched_volume"))}, {sql_number(row.get("buy_pressure"))},
-              {sql_string(text_value(row, "industry"))}, {sql_string(text_value(row, "sub_industry"))},
-              {sql_json(row.get("concepts") or [])}, {sql_json(row.get("theme_matches") or [])},
-              {sql_number(row.get("theme_score"))}, {sql_int(row.get("sector_hot_count"))},
-              {sql_int(row.get("concept_hot_count"))}, {sql_number(row.get("resonance_score"))},
-              {sql_number(row.get("score"))}, {sql_string(text_value(row, "risk_flags"))}, {sql_json(row)}
-            );
-            """
-        )
-    if not statements:
-        return 0
-    run_mysql(config, "START TRANSACTION;\n" + "\n".join(statements) + "\nCOMMIT;")
-    return len([row for row in rows if text_value(row, "trade_date") and text_value(row, "code")])
+    return storage_import_auction_candidate_rows(config, rows)
 
 
 def import_auction_minute_analysis_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    statements: list[str] = []
-    minute_keys = sorted(
-        {
-            (text_value(row, "trade_date"), text_value(row, "snapshot_minute"))
-            for row in rows
-            if text_value(row, "trade_date") and text_value(row, "snapshot_minute")
-        }
-    )
-    for trade_date, snapshot_minute in minute_keys:
-        statements.append(
-            f"""
-            DELETE FROM auction_minute_analysis
-            WHERE trade_date={sql_string(trade_date)}
-              AND snapshot_minute={sql_string(snapshot_minute)};
-            """
-        )
-    for row in rows:
-        trade_date = text_value(row, "trade_date")
-        snapshot_minute = text_value(row, "snapshot_minute")
-        code = text_value(row, "code")
-        analysis_kind = text_value(row, "analysis_kind")
-        if not trade_date or not snapshot_minute or not code or not analysis_kind:
-            continue
-        statements.append(upsert_stock_sql(row))
-        statements.append(
-            f"""
-            INSERT INTO auction_minute_analysis(
-              trade_date, snapshot_minute, captured_at, analysis_kind, rank_no, code, stock_name,
-              auction_price, preclose, auction_pct, auction_amount, matched_volume,
-              bid1, ask1, bid_vol1, ask_vol1, limit_side, limit_price, seal_volume, seal_amount,
-              buy_pressure, industry, sub_industry, concepts, theme_matches, theme_score,
-              sector_hot_count, concept_hot_count, resonance_score, score, risk_flags, raw_json
-            )
-            VALUES(
-              {sql_string(trade_date)}, {sql_string(snapshot_minute)}, {sql_string(text_value(row, "captured_at") or now_text())},
-              {sql_string(analysis_kind)}, {sql_int(row.get("rank_no"))}, {sql_string(code)},
-              {sql_string(text_value(row, "stock_name") or text_value(row, "name"))},
-              {sql_number(row.get("auction_price"))}, {sql_number(row.get("preclose"))},
-              {sql_number(row.get("auction_pct"))}, {sql_number(row.get("auction_amount"))},
-              {sql_int(row.get("matched_volume"))}, {sql_number(row.get("bid1"))}, {sql_number(row.get("ask1"))},
-              {sql_int(row.get("bid_vol1"))}, {sql_int(row.get("ask_vol1"))},
-              {sql_string(text_value(row, "limit_side") or "none")}, {sql_number(row.get("limit_price"))},
-              {sql_int(row.get("seal_volume"))}, {sql_number(row.get("seal_amount"))},
-              {sql_number(row.get("buy_pressure"))}, {sql_string(text_value(row, "industry"))},
-              {sql_string(text_value(row, "sub_industry"))}, {sql_json(row.get("concepts") or [])},
-              {sql_json(row.get("theme_matches") or [])}, {sql_number(row.get("theme_score"))},
-              {sql_int(row.get("sector_hot_count"))}, {sql_int(row.get("concept_hot_count"))},
-              {sql_number(row.get("resonance_score"))}, {sql_number(row.get("score"))},
-              {sql_string(text_value(row, "risk_flags"))}, {sql_json(row)}
-            );
-            """
-        )
-    if not statements:
-        return 0
-    run_mysql(config, "START TRANSACTION;\n" + "\n".join(statements) + "\nCOMMIT;")
-    return len(
-        [
-            row
-            for row in rows
-            if text_value(row, "trade_date")
-            and text_value(row, "snapshot_minute")
-            and text_value(row, "analysis_kind")
-            and text_value(row, "code")
-        ]
-    )
+    return storage_import_auction_minute_analysis_rows(config, rows)
 
 
 def import_auction_trend_summary_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> int:
-    if not rows:
-        return 0
-    statements: list[str] = []
-    trade_dates = sorted({text_value(row, "trade_date") for row in rows if text_value(row, "trade_date")})
-    for trade_date in trade_dates:
-        statements.append(f"DELETE FROM auction_trend_summary WHERE trade_date={sql_string(trade_date)};")
-    for row in rows:
-        trade_date = text_value(row, "trade_date")
-        code = text_value(row, "code")
-        if not trade_date or not code:
-            continue
-        statements.append(upsert_stock_sql(row))
-        statements.append(
-            f"""
-            INSERT INTO auction_trend_summary(
-              trade_date, code, stock_name, first_seen_minute, last_seen_minute,
-              minute_count, pct_top_count, limit_up_count, limit_down_count,
-              best_pct_rank, final_candidate_rank, first_auction_pct, last_auction_pct,
-              pct_delta, first_auction_amount, last_auction_amount, amount_delta,
-              amount_growth_ratio, max_seal_amount, last_seal_amount, theme_score,
-              theme_matches, sector_hot_count, concept_hot_count, final_score,
-              trend_score, trend_label, key_points, action_hint, raw_json, generated_at
-            )
-            VALUES(
-              {sql_string(trade_date)}, {sql_string(code)}, {sql_string(text_value(row, "stock_name") or text_value(row, "name"))},
-              {sql_string(text_value(row, "first_seen_minute") or None)}, {sql_string(text_value(row, "last_seen_minute") or None)},
-              {sql_int(row.get("minute_count"))}, {sql_int(row.get("pct_top_count"))},
-              {sql_int(row.get("limit_up_count"))}, {sql_int(row.get("limit_down_count"))},
-              {sql_int(row.get("best_pct_rank"))}, {sql_int(row.get("final_candidate_rank"))},
-              {sql_number(row.get("first_auction_pct"))}, {sql_number(row.get("last_auction_pct"))},
-              {sql_number(row.get("pct_delta"))}, {sql_number(row.get("first_auction_amount"))},
-              {sql_number(row.get("last_auction_amount"))}, {sql_number(row.get("amount_delta"))},
-              {sql_number(row.get("amount_growth_ratio"))}, {sql_number(row.get("max_seal_amount"))},
-              {sql_number(row.get("last_seal_amount"))}, {sql_number(row.get("theme_score"))},
-              {sql_json(row.get("theme_matches") or [])}, {sql_int(row.get("sector_hot_count"))},
-              {sql_int(row.get("concept_hot_count"))}, {sql_number(row.get("final_score"))},
-              {sql_number(row.get("trend_score"))}, {sql_string(text_value(row, "trend_label"))},
-              {sql_json(row.get("key_points") or [])}, {sql_string(text_value(row, "action_hint"))},
-              {sql_json(row)}, {sql_string(text_value(row, "generated_at") or now_text())}
-            );
-            """
-        )
-    if not statements:
-        return 0
-    run_mysql(config, "START TRANSACTION;\n" + "\n".join(statements) + "\nCOMMIT;")
-    return len([row for row in rows if text_value(row, "trade_date") and text_value(row, "code")])
+    return storage_import_auction_trend_summary_rows(config, rows)
 
 
 def import_auction_candidates_json(config: MySqlConfig, path: Path) -> int:

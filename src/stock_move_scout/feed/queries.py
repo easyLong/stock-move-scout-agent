@@ -1,44 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from datetime import date
 
 from stock_move_scout.db import sql_string
-
-
-def _score_detail_text(alias: str, path: str) -> str:
-    return f"NULLIF(JSON_UNQUOTE(JSON_EXTRACT({alias}.score_detail, '{path}')), 'null')"
-
-
-def _non_iwencai_leadership_reason(score_alias: str, index: int) -> str:
-    value = _score_detail_text(score_alias, f"$.anchor_leadership_reasons[{index}]")
-    return f"IF(COALESCE({value}, '') <> '' AND {value} NOT LIKE '问财%', {value}, NULL)"
-
-
-def _iwencai_rank_line(rank_alias: str, period_days: int) -> str:
-    column = f"rank_{period_days}d"
-    return (
-        f"IF(COALESCE({rank_alias}.{column}, 0) > 0, "
-        f"CONCAT('问财近{period_days}日全市场第', {rank_alias}.{column}), NULL)"
-    )
-
-
-def _dynamic_leadership_body(score_alias: str, rank_alias: str) -> str:
-    return "CONCAT_WS('\\n', {items})".format(
-        items=", ".join(
-            [
-                _non_iwencai_leadership_reason(score_alias, 0),
-                _non_iwencai_leadership_reason(score_alias, 1),
-                _non_iwencai_leadership_reason(score_alias, 2),
-                _iwencai_rank_line(rank_alias, 3),
-                _iwencai_rank_line(rank_alias, 5),
-                _iwencai_rank_line(rank_alias, 10),
-            ]
-        )
-    )
-
-
-def _dynamic_leadership_inline(score_alias: str, rank_alias: str) -> str:
-    return f"REPLACE({_dynamic_leadership_body(score_alias, rank_alias)}, '\\n', '；')"
+from stock_move_scout.research_pool import research_pool_snapshot_cte
 
 
 def _json_source_fields(
@@ -48,27 +13,90 @@ def _json_source_fields(
     updated_at_expr: str,
     source_generation: str,
 ) -> str:
+    if source_generation == "intraday":
+        availability = "intraday"
+        evidence_group = "current_effective"
+        evidence_role = "market_realtime"
+        display_level = "secondary"
+    elif source_generation == "after_close":
+        availability = "after_close_confirm"
+        evidence_group = "post_close_confirm"
+        evidence_role = "post_close_confirm"
+        display_level = "secondary"
+    elif source_generation == "model_summary":
+        availability = "async_supplement"
+        evidence_group = "model_summary"
+        evidence_role = "model_summary"
+        display_level = "primary"
+    else:
+        availability = "async_supplement"
+        evidence_group = "unknown"
+        evidence_role = "model_supplement"
+        display_level = "secondary"
     return f"""
               'source_table', '{source_table}',
               'source_key', {source_key_expr},
               'source_confidence', 'explicit',
               'data_date', {data_date_expr},
+              'evidence_date', {data_date_expr},
               'updated_at', {updated_at_expr},
-              'source_generation', '{source_generation}',"""
+              'source_generation', '{source_generation}',
+              'availability', '{availability}',
+              'evidence_group', '{evidence_group}',
+              'evidence_role', '{evidence_role}',
+              'display_level', '{display_level}',
+              'valid_status', 'watch',
+              'source_registry', JSON_OBJECT(
+                'source_table', '{source_table}',
+                'source_generation', '{source_generation}',
+                'availability', '{availability}',
+                'evidence_group', '{evidence_group}',
+                'update_cycle',
+                CASE '{source_generation}'
+                  WHEN 'intraday' THEN 'scan_loop'
+                  WHEN 'after_close' THEN 'after_close_daily'
+                  ELSE 'async_task'
+                END,
+                'data_date_policy',
+                CASE '{source_generation}'
+                  WHEN 'intraday' THEN 'event_day'
+                  WHEN 'after_close' THEN 'latest_confirmed_trade_day'
+                  ELSE 'model_snapshot_day'
+                END
+              ),"""
 
 
 def trade_dates_sql() -> str:
     return """
     SELECT JSON_OBJECT(
-      'latest', COALESCE(MAX(day_text), DATE_FORMAT(CURDATE(), '%Y-%m-%d')),
+      'latest', COALESCE(
+        MAX(CASE WHEN day_text <= DATE_FORMAT(CURDATE(), '%Y-%m-%d') THEN day_text END),
+        MAX(day_text),
+        DATE_FORMAT(CURDATE(), '%Y-%m-%d')
+      ),
       'dates', COALESCE(JSON_ARRAYAGG(day_text), JSON_ARRAY())
     )
     FROM (
       SELECT DISTINCT DATE_FORMAT(day_value, '%Y-%m-%d') AS day_text
       FROM (
+        SELECT trade_date AS day_value
+        FROM market_width_snapshots
+        WHERE source='stock_daily_bars_close'
+           OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
+            OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))
+        UNION ALL
+        SELECT trade_date AS day_value
+        FROM stock_daily_bars
+        GROUP BY trade_date
+        HAVING COUNT(*) >= 1000
+        UNION ALL
         SELECT DATE(scanned_at) AS day_value FROM scan_runs WHERE accepted=1
         UNION ALL
         SELECT DATE(ended_at) AS day_value FROM windows WHERE status='done' AND aggregate_count > 0
+        UNION ALL
+        SELECT trade_date AS day_value FROM research_pool_items
+        UNION ALL
+        SELECT trade_date AS day_value FROM stock_root_evidence_cache
       ) days
       WHERE day_value IS NOT NULL
         AND WEEKDAY(day_value) < 5
@@ -168,9 +196,693 @@ def auction_top10_sql() -> str:
       ) AS item
       FROM auction_trend_summary
       WHERE trade_date = CURDATE()
-      ORDER BY trend_score DESC, final_candidate_rank ASC
-      LIMIT 10
+        AND COALESCE(limit_up_count, 0) > 0
+        AND COALESCE(last_seal_amount, 0) > 0
+        AND COALESCE(last_auction_pct, 0) >= 9.5
+      ORDER BY last_seal_amount DESC, final_candidate_rank ASC
+      LIMIT 3
     ) ranked;
+    """
+
+
+def _leaderboard_sql_legacy(trade_date: str | None = "") -> str:
+    return leaderboard_sql(trade_date)
+
+
+def leaderboard_sql(trade_date: str | None = "") -> str:
+    day = sql_string(trade_date or date.today().strftime("%Y-%m-%d"))
+    main_a_regexp = "'^(000|001|002|003|300|301|600|601|603|605|688|689)'"
+    return f"""
+    WITH
+    market_universe AS (
+      SELECT
+        s.code,
+        COALESCE(
+          CASE WHEN COALESCE(s.name, '') <> '' AND s.name NOT REGEXP '^[?]+$' THEN s.name END,
+          (
+            SELECT cp.stock_name
+            FROM stock_company_profiles cp
+            WHERE cp.code=s.code
+              AND COALESCE(cp.stock_name, '') <> ''
+              AND cp.stock_name NOT REGEXP '^[?]+$'
+            LIMIT 1
+          ),
+          (
+            SELECT rs.stock_name
+            FROM ths_root_snapshots rs
+            WHERE rs.code=s.code
+              AND COALESCE(rs.stock_name, '') <> ''
+              AND rs.stock_name NOT REGEXP '^[?]+$'
+            ORDER BY rs.fetched_at DESC, rs.id DESC
+            LIMIT 1
+          ),
+          (
+            SELECT lu.stock_name
+            FROM limit_up_pool_items lu
+            WHERE lu.code=s.code
+              AND COALESCE(lu.stock_name, '') <> ''
+              AND lu.stock_name NOT REGEXP '^[?]+$'
+            ORDER BY lu.trade_date DESC, lu.updated_at DESC
+            LIMIT 1
+          ),
+          s.name
+        ) AS name
+      FROM stocks s
+      WHERE s.code REGEXP {main_a_regexp}
+        AND COALESCE(is_st, 0)=0
+        AND s.name NOT LIKE '%ST%'
+        AND s.name NOT LIKE '%退市%'
+    ),
+    research_pool_day AS (
+      SELECT MAX(trade_date) AS trade_date
+      FROM research_pool_items
+      WHERE trade_date <= {day}
+        AND rule='recent_limit_up_or_5d_gain_top'
+        AND limit_up_days=5
+        AND gain_period_days=5
+        AND gain_top=30
+    ),
+    leader_research_pool AS (
+      SELECT
+        rp.code,
+        COALESCE(CASE WHEN COALESCE(rp.stock_name, '') <> '' AND rp.stock_name NOT REGEXP '^[?]+$' THEN rp.stock_name END, u.name) AS name,
+        rp.pool_rank,
+        rp.source_kind,
+        rp.source_label,
+        rp.limit_up_day_count,
+        NULL AS rank_3d,
+        rp.rank_5d AS rank_5d,
+        NULL AS rank_10d,
+        NULL AS pct_3d,
+        rp.pct_5d AS pct_5d,
+        NULL AS pct_10d,
+        COALESCE(db.pct_change, rp.latest_pct, 0) AS today_pct
+      FROM research_pool_items rp
+      JOIN research_pool_day d ON d.trade_date=rp.trade_date
+      JOIN market_universe u ON u.code=rp.code
+      LEFT JOIN stock_daily_bars db
+        ON db.code=rp.code
+       AND db.trade_date=CAST({day} AS DATE)
+      WHERE rp.rule='recent_limit_up_or_5d_gain_top'
+        AND rp.limit_up_days=5
+        AND rp.gain_period_days=5
+        AND rp.gain_top=30
+    ),
+    headline_snapshot AS (
+      SELECT snapshot_id
+      FROM ths_homepage_headline_themes
+      WHERE trade_date <= {day}
+        AND source='ths_homepage_headline'
+      ORDER BY trade_date DESC, collected_at DESC
+      LIMIT 1
+    ),
+    headline_themes AS (
+      SELECT
+        h.snapshot_id,
+        h.rank_no AS theme_rank,
+        h.theme_id,
+        h.theme_name,
+        h.index_code,
+        REPLACE(REPLACE(REPLACE(h.theme_name, '概念', ''), '板块', ''), '产业', '') AS theme_core
+      FROM ths_homepage_headline_themes h
+      JOIN headline_snapshot s ON s.snapshot_id=h.snapshot_id
+      WHERE COALESCE(h.theme_name, '') <> ''
+    ),
+    headline_theme_member_candidates AS (
+      SELECT
+        h.theme_rank,
+        h.theme_name,
+        h.index_code,
+        u.code,
+        COALESCE(CASE WHEN COALESCE(m.stock_name, '') <> '' AND m.stock_name NOT REGEXP '^[?]+$' THEN m.stock_name END, u.name) AS name,
+        m.gain AS rise_percent,
+        m.stock_rank,
+        IF(p.code IS NULL, 0, 1) AS in_research_pool,
+        p.rank_3d,
+        p.rank_5d,
+        p.rank_10d,
+        p.pct_3d,
+        p.pct_5d,
+        p.pct_10d,
+        COALESCE(m.gain, p.today_pct, 0) AS today_pct,
+        p.source_kind,
+        p.source_label,
+        p.limit_up_day_count,
+        p.pool_rank
+      FROM headline_themes h
+      JOIN ths_homepage_headline_theme_members m
+        ON m.snapshot_id=h.snapshot_id
+       AND m.theme_id=h.theme_id
+      JOIN market_universe u ON u.code=m.stock_code
+      LEFT JOIN leader_research_pool p ON p.code=m.stock_code
+    ),
+    theme_top3 AS (
+      SELECT
+        theme_name,
+        MIN(theme_rank) AS theme_rank,
+        COUNT(DISTINCT code) AS member_count,
+        COUNT(DISTINCT IF(in_research_pool=1, code, NULL)) AS research_pool_member_count,
+        ROUND(AVG(COALESCE(rise_percent, 0)), 2) AS avg_rise,
+        ROUND(MAX(COALESCE(rise_percent, 0)), 2) AS max_rise
+      FROM headline_theme_member_candidates
+      GROUP BY theme_name
+      HAVING COUNT(DISTINCT IF(in_research_pool=1, code, NULL)) > 0
+    ),
+    scope_codes AS (
+      SELECT
+        'market' AS scope_key,
+        '研究池' AS scope_name,
+        1 AS scope_rank,
+        NULL AS theme_name,
+        NULL AS theme_avg_rise,
+        NULL AS theme_member_count,
+        NULL AS theme_research_pool_member_count,
+        p.code,
+        p.name,
+        p.rank_3d AS rank_3d,
+        p.rank_5d AS rank_5d,
+        p.rank_10d AS rank_10d,
+        p.pct_3d AS pct_3d,
+        p.pct_5d AS pct_5d,
+        p.pct_10d AS pct_10d,
+        p.today_pct AS today_pct,
+        p.source_kind,
+        p.source_label,
+        p.limit_up_day_count,
+        p.pool_rank
+      FROM leader_research_pool p
+      UNION ALL
+      SELECT
+        CONCAT('theme:', t.theme_name) AS scope_key,
+        t.theme_name AS scope_name,
+        10 + t.theme_rank AS scope_rank,
+        t.theme_name,
+        t.avg_rise AS theme_avg_rise,
+        t.member_count AS theme_member_count,
+        t.research_pool_member_count AS theme_research_pool_member_count,
+        p.code,
+        p.name,
+        MAX(p.rank_3d) AS rank_3d,
+        MAX(p.rank_5d) AS rank_5d,
+        MAX(p.rank_10d) AS rank_10d,
+        MAX(p.pct_3d) AS pct_3d,
+        MAX(p.pct_5d) AS pct_5d,
+        MAX(p.pct_10d) AS pct_10d,
+        MAX(p.today_pct) AS today_pct,
+        MAX(p.source_kind) AS source_kind,
+        MAX(p.source_label) AS source_label,
+        MAX(p.limit_up_day_count) AS limit_up_day_count,
+        MAX(p.pool_rank) AS pool_rank
+      FROM theme_top3 t
+      JOIN headline_theme_member_candidates p
+        ON p.theme_name=t.theme_name
+       AND p.in_research_pool=1
+      GROUP BY t.theme_rank, t.theme_name, t.avg_rise, t.member_count, t.research_pool_member_count, p.code, p.name
+    ),
+    scope_meta AS (
+      SELECT
+        'market' AS scope_key,
+        '研究池' AS scope_name,
+        1 AS scope_rank,
+        NULL AS theme_name,
+        NULL AS theme_avg_rise,
+        NULL AS theme_member_count,
+        NULL AS theme_research_pool_member_count,
+        COUNT(DISTINCT code) AS universe_count
+      FROM scope_codes
+      WHERE scope_key='market'
+      UNION ALL
+      SELECT
+        CONCAT('theme:', t.theme_name) AS scope_key,
+        t.theme_name AS scope_name,
+        10 + t.theme_rank AS scope_rank,
+        t.theme_name,
+        t.avg_rise AS theme_avg_rise,
+        t.member_count AS theme_member_count,
+        t.research_pool_member_count AS theme_research_pool_member_count,
+        COALESCE((
+          SELECT COUNT(DISTINCT sc.code)
+          FROM scope_codes sc
+          WHERE sc.scope_key=CONCAT('theme:', t.theme_name)
+      ), 0) AS universe_count
+      FROM theme_top3 t
+    ),
+    recent_trade_days AS (
+      SELECT CAST({day} AS DATE) AS trade_date
+      UNION
+      SELECT trade_date
+      FROM (
+        SELECT DISTINCT trade_date
+        FROM stock_daily_bars
+        WHERE trade_date < {day}
+        ORDER BY trade_date DESC
+        LIMIT 9
+      ) d
+    ),
+    limit_events_raw AS (
+      SELECT
+        i.trade_date,
+        i.code,
+        COALESCE(
+          STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time), '')), '%Y-%m-%d %H:%i:%s'),
+          STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time), '')), '%Y-%m-%d %H:%i')
+        ) AS first_limit_at,
+        COALESCE(i.turnover_amount, i.seal_amount, 0) AS limit_amount,
+        '东方财富涨停池' AS source_name,
+        1 AS source_priority
+      FROM limit_up_pool_items i
+      JOIN recent_trade_days td ON td.trade_date=i.trade_date
+      JOIN (SELECT DISTINCT code FROM scope_codes) p ON p.code=i.code
+      WHERE i.source='eastmoney_akshare_stock_zt_pool_em'
+        AND i.pool_type='limit_up'
+        AND COALESCE(i.status, '') IN ('limit_up', '涨停', '')
+        AND COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time, '') <> ''
+      UNION ALL
+      SELECT
+        DATE(sm.captured_at) AS trade_date,
+        sm.code,
+        MIN(sm.captured_at) AS first_limit_at,
+        MAX(COALESCE(sm.amount, 0)) AS limit_amount,
+        '实时扫描' AS source_name,
+        3 AS source_priority
+      FROM scan_movers sm
+      JOIN scan_runs sr ON sr.id=sm.scan_run_id AND sr.accepted=1
+      JOIN recent_trade_days td ON td.trade_date=DATE(sm.captured_at)
+      JOIN (SELECT DISTINCT code FROM scope_codes) p ON p.code=sm.code
+      WHERE COALESCE(sm.pct_change, 0) >= 9.8
+      GROUP BY DATE(sm.captured_at), sm.code
+    ),
+    limit_events_daily AS (
+      SELECT
+        trade_date,
+        code,
+        MIN(first_limit_at) AS first_limit_at,
+        MAX(limit_amount) AS limit_amount,
+        SUBSTRING_INDEX(GROUP_CONCAT(source_name ORDER BY source_priority ASC), ',', 1) AS source_name
+      FROM limit_events_raw
+      WHERE first_limit_at IS NOT NULL
+      GROUP BY trade_date, code
+    ),
+    today_limit_ranked AS (
+      SELECT *
+      FROM (
+        SELECT
+          sc.scope_key,
+          sc.scope_name,
+          sc.code,
+          sc.name,
+          CAST({day} AS DATE) AS trade_date,
+          e.first_limit_at,
+          e.limit_amount,
+          IF(e.code IS NOT NULL, 'limit_up', 'pct_rank') AS today_rank_kind,
+          COALESCE(e.source_name, '同花顺题材成分涨幅') AS source_name,
+          sc.today_pct,
+          ROW_NUMBER() OVER (
+            PARTITION BY sc.scope_key
+            ORDER BY
+              IF(e.code IS NOT NULL, 1, 0) DESC,
+              e.first_limit_at ASC,
+              e.limit_amount DESC,
+              COALESCE(sc.today_pct, -999) DESC,
+              sc.code ASC
+          ) AS rank_no
+        FROM scope_codes sc
+        LEFT JOIN limit_events_daily e
+          ON e.code=sc.code
+         AND e.trade_date=CAST({day} AS DATE)
+      ) ranked
+      WHERE rank_no <= 5
+    ),
+    today_limit_days_ranked AS (
+      SELECT *
+      FROM (
+        SELECT
+          sc.scope_key,
+          sc.scope_name,
+          sc.code,
+          sc.name,
+          i.trade_date,
+          GREATEST(
+            COALESCE(CAST(NULLIF(SUBSTRING_INDEX(i.limit_up_stat, '/', -1), '') AS UNSIGNED), 0),
+            COALESCE(i.limit_up_days, 0)
+          ) AS limit_up_days,
+          COALESCE(NULLIF(i.limit_up_stat, ''), CONCAT(COALESCE(i.limit_up_days, 0), '连板')) AS limit_up_stat,
+          COALESCE(i.turnover_amount, i.seal_amount, 0) AS limit_amount,
+          ROW_NUMBER() OVER (
+            PARTITION BY sc.scope_key
+            ORDER BY
+              GREATEST(
+                COALESCE(CAST(NULLIF(SUBSTRING_INDEX(i.limit_up_stat, '/', -1), '') AS UNSIGNED), 0),
+                COALESCE(i.limit_up_days, 0)
+              ) DESC,
+              COALESCE(
+                STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time), '')), '%Y-%m-%d %H:%i:%s'),
+                STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time), '')), '%Y-%m-%d %H:%i')
+              ) ASC,
+              COALESCE(i.turnover_amount, i.seal_amount, 0) DESC,
+              sc.code ASC
+          ) AS rank_no
+        FROM scope_codes sc
+        JOIN limit_up_pool_items i
+          ON i.code=sc.code
+         AND i.trade_date=CAST({day} AS DATE)
+         AND i.source='eastmoney_akshare_stock_zt_pool_em'
+         AND i.pool_type='limit_up'
+         AND COALESCE(i.status, '') IN ('limit_up', '涨停', '')
+        WHERE GREATEST(
+          COALESCE(CAST(NULLIF(SUBSTRING_INDEX(i.limit_up_stat, '/', -1), '') AS UNSIGNED), 0),
+          COALESCE(i.limit_up_days, 0)
+        ) > 0
+      ) ranked
+      WHERE rank_no <= 5
+    ),
+    first_10d_per_code AS (
+      SELECT *
+      FROM (
+        SELECT
+          sc.scope_key,
+          sc.scope_name,
+          sc.code,
+          sc.name,
+          e.trade_date,
+          e.first_limit_at,
+          e.limit_amount,
+          e.source_name,
+          ROW_NUMBER() OVER (
+            PARTITION BY sc.scope_key, sc.code
+            ORDER BY e.trade_date ASC, e.first_limit_at ASC, e.limit_amount DESC
+          ) AS code_rn
+        FROM scope_codes sc
+        JOIN limit_events_daily e ON e.code=sc.code
+      ) code_events
+      WHERE code_rn=1
+    ),
+    first_10d_ranked AS (
+      SELECT *
+      FROM (
+        SELECT
+          *,
+          ROW_NUMBER() OVER (
+            PARTITION BY scope_key
+            ORDER BY trade_date ASC, first_limit_at ASC, limit_amount DESC, code ASC
+          ) AS rank_no
+        FROM first_10d_per_code
+      ) ranked
+      WHERE rank_no <= 5
+    ),
+    dimension_scores AS (
+      SELECT
+        scope_key,
+        scope_name,
+        code,
+        name,
+        'today_limit' AS dimension,
+        '日内主动性' AS dimension_label,
+        rank_no,
+        6 - rank_no AS score,
+        IF(today_rank_kind='limit_up', ROUND(limit_amount / 100000000, 2), today_pct) AS value_num,
+        IF(
+          today_rank_kind='limit_up',
+          DATE_FORMAT(first_limit_at, '%H:%i:%s'),
+          CONCAT('今日', ROUND(today_pct, 2), '%')
+        ) AS value_text,
+        source_name,
+        DATE_FORMAT(trade_date, '%Y-%m-%d') AS data_date
+      FROM today_limit_ranked
+      UNION ALL
+      SELECT
+        scope_key,
+        scope_name,
+        code,
+        name,
+        'limit_up_days' AS dimension,
+        '连板辨识度' AS dimension_label,
+        rank_no,
+        6 - rank_no AS score,
+        limit_up_days AS value_num,
+        CONCAT(limit_up_days, '天 / ', limit_up_stat) AS value_text,
+        '东方财富涨停池' AS source_name,
+        DATE_FORMAT(trade_date, '%Y-%m-%d') AS data_date
+      FROM today_limit_days_ranked
+      UNION ALL
+      SELECT
+        scope_key,
+        scope_name,
+        code,
+        name,
+        'first_limit_10d' AS dimension,
+        '阶段先手性' AS dimension_label,
+        rank_no,
+        6 - rank_no AS score,
+        ROUND(limit_amount / 100000000, 2) AS value_num,
+        CONCAT(DATE_FORMAT(trade_date, '%m-%d'), ' ', DATE_FORMAT(first_limit_at, '%H:%i:%s')) AS value_text,
+        source_name,
+        DATE_FORMAT(trade_date, '%Y-%m-%d') AS data_date
+      FROM first_10d_ranked
+      UNION ALL
+      SELECT
+        scope_key,
+        scope_name,
+        code,
+        name,
+        'trend_strength' AS dimension,
+        '趋势强度' AS dimension_label,
+        COALESCE(rank_5d, pool_rank) AS rank_no,
+        GREATEST(1, 31 - COALESCE(rank_5d, 30)) AS score,
+        pct_5d AS value_num,
+        CONCAT('5日涨幅#', COALESCE(rank_5d, pool_rank), ' / ', ROUND(COALESCE(pct_5d, 0), 2), '%') AS value_text,
+        'research_pool_items' AS source_name,
+        DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d') AS data_date
+      FROM scope_codes
+      WHERE source_kind='five_day_gain_top'
+    ),
+    dimension_summary AS (
+      SELECT
+        scope_key,
+        code,
+        SUM(score) AS total_score,
+        MAX(IF(dimension='today_limit', score, 0)) AS today_limit_score,
+        MAX(IF(dimension='first_limit_10d', score, 0)) AS first_limit_10d_score,
+        MAX(IF(dimension='limit_up_days', score, 0)) AS limit_up_days_score,
+        MAX(IF(dimension='today_limit', rank_no, NULL)) AS today_limit_rank,
+        MAX(IF(dimension='first_limit_10d', rank_no, NULL)) AS first_limit_10d_rank,
+        MAX(IF(dimension='limit_up_days', rank_no, NULL)) AS limit_up_days_rank,
+        MAX(IF(dimension='today_limit', value_text, NULL)) AS today_limit_time,
+        MAX(IF(dimension='first_limit_10d', value_text, NULL)) AS first_limit_10d_time,
+        MAX(IF(dimension='limit_up_days', value_text, NULL)) AS limit_up_days_text,
+        MAX(IF(dimension='today_limit', value_num, NULL)) AS today_limit_amount_yi,
+        MAX(IF(dimension='first_limit_10d', value_num, NULL)) AS first_limit_10d_amount_yi,
+        MAX(IF(dimension='limit_up_days', value_num, NULL)) AS limit_up_days
+      FROM dimension_scores
+      GROUP BY scope_key, code
+    ),
+    scored AS (
+      SELECT
+        sc.scope_key,
+        MAX(sc.scope_name) AS scope_name,
+        sc.code,
+        MAX(sc.name) AS name,
+        COALESCE(MAX(ds.total_score), 0) AS total_score,
+        COALESCE(MAX(ds.today_limit_score), 0) AS today_limit_score,
+        COALESCE(MAX(ds.first_limit_10d_score), 0) AS first_limit_10d_score,
+        COALESCE(MAX(ds.limit_up_days_score), 0) AS limit_up_days_score,
+        MAX(ds.today_limit_rank) AS today_limit_rank,
+        MAX(ds.first_limit_10d_rank) AS first_limit_10d_rank,
+        MAX(ds.limit_up_days_rank) AS limit_up_days_rank,
+        COALESCE(MAX(ds.today_limit_time), '') AS today_limit_time,
+        COALESCE(MAX(ds.first_limit_10d_time), '') AS first_limit_10d_time,
+        COALESCE(MAX(ds.limit_up_days_text), '') AS limit_up_days_text,
+        MAX(ds.today_limit_amount_yi) AS today_limit_amount_yi,
+        MAX(ds.first_limit_10d_amount_yi) AS first_limit_10d_amount_yi,
+        MAX(ds.limit_up_days) AS limit_up_days,
+        MAX(sc.rank_3d) AS rank_3d,
+        MAX(sc.rank_5d) AS rank_5d,
+        MAX(sc.rank_10d) AS rank_10d,
+        MAX(sc.pct_3d) AS pct_3d,
+        MAX(sc.pct_5d) AS pct_5d,
+        MAX(sc.pct_10d) AS pct_10d,
+        MAX(sc.today_pct) AS today_pct,
+        MAX(sc.source_kind) AS source_kind,
+        MAX(sc.source_label) AS source_label,
+        MAX(sc.limit_up_day_count) AS limit_up_day_count,
+        MAX(sc.pool_rank) AS pool_rank
+      FROM scope_codes sc
+      LEFT JOIN dimension_summary ds
+        ON ds.scope_key=sc.scope_key
+       AND ds.code=sc.code
+      GROUP BY sc.scope_key, sc.code
+    ),
+    leaders AS (
+      SELECT *
+      FROM (
+        SELECT
+          scored.*,
+          IF(source_kind='five_day_gain_top', 'trend', 'emotion') AS pool_type,
+          IF(source_kind='five_day_gain_top', '趋势票', '情绪票') AS pool_type_label,
+          ROW_NUMBER() OVER (
+            PARTITION BY scope_key, IF(source_kind='five_day_gain_top', 'trend', 'emotion')
+            ORDER BY
+              IF(source_kind='five_day_gain_top', COALESCE(rank_5d, 999999), 0) ASC,
+              IF(source_kind='five_day_gain_top', COALESCE(pct_5d, -999), total_score) DESC,
+              IF(source_kind='five_day_gain_top', COALESCE(today_pct, -999), limit_up_days_score) DESC,
+              IF(source_kind='five_day_gain_top', 0, today_limit_score) DESC,
+              IF(source_kind='five_day_gain_top', 0, first_limit_10d_score) DESC,
+              IF(source_kind='five_day_gain_top', 999999, COALESCE(limit_up_days_rank, 999999)) ASC,
+              IF(source_kind='five_day_gain_top', 999999, COALESCE(today_limit_rank, 999999)) ASC,
+              IF(source_kind='five_day_gain_top', 999999, COALESCE(first_limit_10d_rank, 999999)) ASC,
+              today_pct DESC,
+              code ASC
+          ) AS leader_rank
+        FROM scored
+      ) ranked_leader
+      WHERE (pool_type='emotion' AND leader_rank <= 3)
+         OR (pool_type='trend' AND leader_rank <= 1)
+    )
+    SELECT JSON_OBJECT(
+      'trade_date', DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d'),
+      'rule', '研究池拆为情绪票和趋势票：情绪票=近5日涨停，展示Top3；趋势票=近5日无涨停且5日涨幅Top30，展示Top1。情绪票按连板辨识度、日内主动性、阶段先手性排序；趋势票按5日涨幅排名和涨幅强度排序。',
+      'theme_rule', '全市场榜=研究池全集；主题榜=同花顺首页头条题材成分 ∩ 研究池，主题内部单独重排',
+      'scopes', COALESCE((
+        SELECT JSON_ARRAYAGG(scope_item)
+        FROM (
+          SELECT JSON_OBJECT(
+            'scope_key', sm.scope_key,
+            'scope_name', sm.scope_name,
+            'scope_rank', sm.scope_rank,
+            'theme_name', COALESCE(sm.theme_name, ''),
+            'theme_avg_rise', sm.theme_avg_rise,
+            'theme_member_count', sm.theme_member_count,
+            'theme_research_pool_member_count', sm.theme_research_pool_member_count,
+            'universe_count', sm.universe_count,
+            'leaders', COALESCE((
+              SELECT JSON_ARRAYAGG(JSON_OBJECT(
+                'rank_no', l.leader_rank,
+                'code', l.code,
+                'name', l.name,
+                'pool_type', l.pool_type,
+                'pool_type_label', l.pool_type_label,
+                'source_kind', l.source_kind,
+                'source_label', l.source_label,
+                'pool_rank', l.pool_rank,
+                'company_highlights', COALESCE((
+                  SELECT cp.company_highlights
+                  FROM stock_company_profiles cp
+                  WHERE cp.code=l.code
+                  LIMIT 1
+                ), ''),
+                'active_fact_summary', COALESCE((
+                  SELECT COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, ''))
+                  FROM async_evidence_summaries aes
+                  WHERE aes.trade_date=CAST({day} AS DATE)
+                    AND aes.code=l.code
+                    AND EXISTS (
+                      SELECT 1
+                      FROM stock_effective_facts ef WHERE ef.trade_date=CAST({day} AS DATE) AND ef.code=l.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+                    )
+                  LIMIT 1
+                ), ''),
+                'active_facts', COALESCE((
+                  SELECT JSON_ARRAYAGG(JSON_OBJECT(
+                    'date', COALESCE(DATE_FORMAT(ef.fact_date, '%Y-%m-%d'), ''),
+                    'title', COALESCE(NULLIF(ef.fact_subtype, ''), NULLIF(ef.fact_title, ''), '有效事实'),
+                    'body', LEFT(COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(ef.payload, '$.display_body')), ''), NULLIF(ef.fact_body, ''), ef.fact_title, ''), 220),
+                    'lines', COALESCE(JSON_EXTRACT(ef.payload, '$.display_lines'), JSON_ARRAY())
+                  ))
+                  FROM stock_effective_facts ef
+                  WHERE ef.trade_date=CAST({day} AS DATE)
+                    AND ef.code=l.code
+                    AND ef.evidence_group='current_effective'
+                    AND ef.valid_status='active'
+                    AND ef.display_level <> 'hidden'
+                ), '[]'),
+                'active_fact_count', COALESCE((
+                  SELECT COUNT(*)
+                  FROM stock_effective_facts ef WHERE ef.trade_date=CAST({day} AS DATE) AND ef.code=l.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+                ), 0),
+                'main_business', COALESCE((
+                  SELECT cp.main_business
+                  FROM stock_company_profiles cp
+                  WHERE cp.code=l.code
+                  LIMIT 1
+                ), ''),
+                'sw_industry', COALESCE((
+                  SELECT cp.sw_industry
+                  FROM stock_company_profiles cp
+                  WHERE cp.code=l.code
+                  LIMIT 1
+                ), ''),
+                'concept_tags', COALESCE((
+                  SELECT cp.concept_tags
+                  FROM stock_company_profiles cp
+                  WHERE cp.code=l.code
+                  LIMIT 1
+                ), ''),
+                'headline_theme_tags', COALESCE((
+                  SELECT GROUP_CONCAT(DISTINCT htm.theme_name ORDER BY htm.theme_rank ASC SEPARATOR '、')
+                  FROM headline_theme_member_candidates htm
+                  WHERE htm.code=l.code
+                    AND htm.in_research_pool=1
+                    AND COALESCE(htm.theme_name, '') <> ''
+                ), ''),
+                'theme_concept_explain', IF(COALESCE(sm.theme_name, '')='', '', COALESCE((
+                  SELECT e.reason_explain
+                  FROM ths_stock_concept_explanations e
+                  WHERE e.code=l.code
+                    AND COALESCE(e.reason_explain, '') <> ''
+                    AND (
+                         e.concept_name=sm.theme_name
+                      OR e.concept_name LIKE CONCAT('%', REPLACE(REPLACE(REPLACE(sm.theme_name, '概念', ''), '板块', ''), '产业', ''), '%')
+                      OR sm.theme_name LIKE CONCAT('%', REPLACE(REPLACE(REPLACE(e.concept_name, '概念', ''), '板块', ''), '产业', ''), '%')
+                    )
+                  ORDER BY e.fit_rank ASC, e.updated_at DESC
+                  LIMIT 1
+                ), '')),
+                'total_score', l.total_score,
+                'today_limit_score', l.today_limit_score,
+                'first_limit_10d_score', l.first_limit_10d_score,
+                'limit_up_days_score', l.limit_up_days_score,
+                'today_limit_rank', l.today_limit_rank,
+                'first_limit_10d_rank', l.first_limit_10d_rank,
+                'limit_up_days_rank', l.limit_up_days_rank,
+                'today_limit_time', l.today_limit_time,
+                'first_limit_10d_time', l.first_limit_10d_time,
+                'limit_up_days_text', l.limit_up_days_text,
+                'today_limit_amount_yi', l.today_limit_amount_yi,
+                'first_limit_10d_amount_yi', l.first_limit_10d_amount_yi,
+                'limit_up_days', l.limit_up_days,
+                'today_pct', l.today_pct,
+                'rank_3d', l.rank_3d,
+                'rank_5d', l.rank_5d,
+                'rank_10d', l.rank_10d,
+                'pct_3d', l.pct_3d,
+                'pct_5d', l.pct_5d,
+                'pct_10d', l.pct_10d,
+                'dimensions', COALESCE((
+                  SELECT JSON_ARRAYAGG(JSON_OBJECT(
+                    'dimension', d.dimension,
+                    'label', d.dimension_label,
+                    'rank_no', d.rank_no,
+                    'score', d.score,
+                    'value_num', d.value_num,
+                    'value_text', d.value_text,
+                    'source_name', d.source_name,
+                    'data_date', COALESCE(d.data_date, '')
+                  ))
+                  FROM dimension_scores d
+                  WHERE d.scope_key=l.scope_key
+                    AND d.code=l.code
+                ), JSON_ARRAY())
+              ))
+              FROM leaders l
+              WHERE l.scope_key=sm.scope_key
+              ORDER BY l.leader_rank ASC
+            ), JSON_ARRAY())
+          ) AS scope_item
+          FROM scope_meta sm
+          ORDER BY sm.scope_rank ASC
+        ) ordered_scopes
+      ), JSON_ARRAY())
+    ) AS payload;
     """
 
 
@@ -252,6 +964,228 @@ def status_sql(trade_date: str | None = "") -> str:
     """
 
 
+def market_width_latest_sql(trade_date: str | None = "") -> str:
+    filters = [
+        "(source='stock_daily_bars_close' OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999') OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999')))"
+    ]
+    if trade_date:
+        filters.append(f"trade_date={sql_string(trade_date)}")
+    where_day = "WHERE " + " AND ".join(filters)
+    return f"""
+    SELECT COALESCE(JSON_OBJECT(
+      'snapshot_id', snapshot_id,
+      'trade_date', DATE_FORMAT(trade_date, '%Y-%m-%d'),
+      'captured_at', DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s'),
+      'source', source,
+      'market_scope', market_scope,
+      'total_count', total_count,
+      'up_count', up_count,
+      'down_count', down_count,
+      'flat_count', flat_count,
+      'up3_count', up3_count,
+      'down3_count', down3_count,
+      'up5_count', up5_count,
+      'down5_count', down5_count,
+      'has_5pct_data', IF(up5_count > 0 OR down5_count > 0 OR (up3_count = 0 AND down3_count = 0), TRUE, FALSE),
+      'limit_up_count', limit_up_count,
+      'limit_down_count', limit_down_count,
+      'amount_top50_count', amount_top50_count,
+      'amount_top50_up_count', amount_top50_up_count,
+      'amount_top50_down_count', amount_top50_down_count,
+      'amount_top50_flat_count', amount_top50_flat_count,
+      'amount_top50_up3_count', amount_top50_up3_count,
+      'amount_top50_down3_count', amount_top50_down3_count,
+      'amount_top50_up5_count', amount_top50_up5_count,
+      'amount_top50_down5_count', amount_top50_down5_count,
+      'research_pool_trade_date', COALESCE(DATE_FORMAT(research_pool_trade_date, '%Y-%m-%d'), ''),
+      'research_pool_rule', research_pool_rule,
+      'research_pool_count', research_pool_count,
+      'research_pool_up_count', research_pool_up_count,
+      'research_pool_down_count', research_pool_down_count,
+      'research_pool_flat_count', research_pool_flat_count,
+      'research_pool_up3_count', research_pool_up3_count,
+      'research_pool_down3_count', research_pool_down3_count,
+      'research_pool_up5_count', research_pool_up5_count,
+      'research_pool_down5_count', research_pool_down5_count,
+      'sh_index_price', sh_index_price,
+      'sh_index_pct_change', sh_index_pct_change,
+      'sh_index_amount_yi', ROUND(sh_index_amount / 100000000, 2),
+      'sh_index_volume', sh_index_volume,
+      'total_volume', total_volume,
+      'total_volume_yi', ROUND(total_volume / 100000000, 2),
+      'total_amount_yi', ROUND(total_amount / 100000000, 2),
+      'top50_amount_yi', ROUND(top50_amount / 100000000, 2)
+    ), JSON_OBJECT())
+    FROM market_width_snapshots
+    {where_day}
+    ORDER BY trade_date DESC, captured_at DESC
+    LIMIT 1;
+    """
+
+
+def market_width_series_sql(trade_date: str | None = "", limit: int = 240) -> str:
+    filters = []
+    if trade_date:
+        filters.append(f"trade_date={sql_string(trade_date)}")
+    filters.append("((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999') OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))")
+    where_clause = "WHERE " + " AND ".join(filters)
+    return f"""
+    SELECT COALESCE(JSON_ARRAYAGG(item), JSON_ARRAY())
+    FROM (
+      SELECT JSON_OBJECT(
+        'snapshot_id', snapshot_id,
+        'time', DATE_FORMAT(captured_at, '%H:%i'),
+        'captured_at', DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s'),
+        'up_count', up_count,
+        'down_count', down_count,
+        'flat_count', flat_count,
+        'up3_count', up3_count,
+        'down3_count', down3_count,
+        'up5_count', up5_count,
+        'down5_count', down5_count,
+        'has_5pct_data', IF(up5_count > 0 OR down5_count > 0 OR (up3_count = 0 AND down3_count = 0), TRUE, FALSE),
+        'limit_up_count', limit_up_count,
+        'limit_down_count', limit_down_count,
+        'total_count', total_count,
+        'amount_top50_count', amount_top50_count,
+        'amount_top50_up_count', amount_top50_up_count,
+        'amount_top50_down_count', amount_top50_down_count,
+        'amount_top50_flat_count', amount_top50_flat_count,
+        'amount_top50_up3_count', amount_top50_up3_count,
+        'amount_top50_down3_count', amount_top50_down3_count,
+        'amount_top50_up5_count', amount_top50_up5_count,
+        'amount_top50_down5_count', amount_top50_down5_count,
+        'research_pool_trade_date', COALESCE(DATE_FORMAT(research_pool_trade_date, '%Y-%m-%d'), ''),
+        'research_pool_rule', research_pool_rule,
+        'research_pool_count', research_pool_count,
+        'research_pool_up_count', research_pool_up_count,
+        'research_pool_down_count', research_pool_down_count,
+        'research_pool_flat_count', research_pool_flat_count,
+        'research_pool_up3_count', research_pool_up3_count,
+        'research_pool_down3_count', research_pool_down3_count,
+        'research_pool_up5_count', research_pool_up5_count,
+        'research_pool_down5_count', research_pool_down5_count,
+        'sh_index_price', sh_index_price,
+        'sh_index_pct_change', sh_index_pct_change,
+        'sh_index_amount_yi', ROUND(sh_index_amount / 100000000, 2),
+        'sh_index_volume', sh_index_volume,
+        'total_volume', total_volume,
+        'total_volume_yi', ROUND(total_volume / 100000000, 2),
+        'total_amount_yi', ROUND(total_amount / 100000000, 2),
+        'top50_amount_yi', ROUND(top50_amount / 100000000, 2)
+      ) AS item
+      FROM (
+        SELECT *
+        FROM market_width_snapshots
+        {where_clause}
+        ORDER BY captured_at DESC
+        LIMIT {max(1, int(limit))}
+      ) latest_rows
+      ORDER BY captured_at ASC
+    ) series_rows;
+    """
+
+
+def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5) -> str:
+    day_filter = f"AND trade_date <= {sql_string(trade_date)}" if trade_date else ""
+    return f"""
+    SELECT COALESCE(JSON_ARRAYAGG(item), JSON_ARRAY())
+    FROM (
+      SELECT trade_date, JSON_OBJECT(
+        'trade_date', DATE_FORMAT(trade_date, '%Y-%m-%d'),
+        'captured_at', DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s'),
+        'total_count', total_count,
+        'up_count', up_count,
+        'down_count', down_count,
+        'up5_count', up5_count,
+        'down5_count', down5_count,
+        'has_5pct_data', IF(up5_count > 0 OR down5_count > 0 OR (up3_count = 0 AND down3_count = 0), TRUE, FALSE),
+        'limit_up_count', limit_up_count,
+        'limit_down_count', limit_down_count,
+        'positive_power', up_count + up5_count * 4 + limit_up_count * 12,
+        'negative_power', down_count + down5_count * 4 + limit_down_count * 12,
+        'positive_hot_power', up5_count + limit_up_count * 3,
+        'negative_hot_power', down5_count + limit_down_count * 3,
+        'amount_top50_up_count', amount_top50_up_count,
+        'amount_top50_down_count', amount_top50_down_count,
+        'amount_top50_up5_count', amount_top50_up5_count,
+        'amount_top50_down5_count', amount_top50_down5_count,
+        'research_pool_trade_date', COALESCE(DATE_FORMAT(research_pool_trade_date, '%Y-%m-%d'), ''),
+        'research_pool_up_count', research_pool_up_count,
+        'research_pool_down_count', research_pool_down_count,
+        'research_pool_up5_count', research_pool_up5_count,
+        'research_pool_down5_count', research_pool_down5_count,
+        'sh_index_price', sh_index_price,
+        'sh_index_pct_change', sh_index_pct_change,
+        'sh_index_amount_yi', ROUND(sh_index_amount / 100000000, 2),
+        'sh_index_volume', sh_index_volume,
+        'total_volume', total_volume,
+        'total_volume_yi', ROUND(total_volume / 100000000, 2),
+        'total_amount_yi', ROUND(total_amount / 100000000, 2)
+      ) AS item
+      FROM (
+        SELECT s.*
+        FROM market_width_snapshots s
+        JOIN (
+          SELECT trade_date, MAX(captured_at) AS captured_at
+          FROM market_width_snapshots
+          WHERE ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
+            OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))
+            AND (source='stock_daily_bars_close' OR up5_count > 0 OR down5_count > 0)
+            {day_filter}
+          GROUP BY trade_date
+          ORDER BY trade_date DESC
+          LIMIT {max(2, int(limit))}
+        ) d ON d.trade_date=s.trade_date AND d.captured_at=s.captured_at
+        ORDER BY s.trade_date ASC
+      ) daily_rows
+    ) ordered_rows;
+    """
+
+
+def market_width_top50_sql(snapshot_id: str | None = "", trade_date: str | None = "") -> str:
+    if snapshot_id:
+        snapshot_filter = f"snapshot_id={sql_string(snapshot_id)}"
+    elif trade_date:
+        snapshot_filter = f"""snapshot_id=(
+          SELECT snapshot_id
+          FROM market_width_snapshots
+          WHERE trade_date={sql_string(trade_date)}
+            AND (source='stock_daily_bars_close'
+              OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
+                OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999')))
+          ORDER BY captured_at DESC
+          LIMIT 1
+        )"""
+    else:
+        snapshot_filter = """snapshot_id=(
+          SELECT snapshot_id
+          FROM market_width_snapshots
+          WHERE source='stock_daily_bars_close'
+             OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
+              OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))
+          ORDER BY trade_date DESC, captured_at DESC
+          LIMIT 1
+        )"""
+    return f"""
+    SELECT COALESCE(JSON_ARRAYAGG(item), JSON_ARRAY())
+    FROM (
+      SELECT JSON_OBJECT(
+        'rank_no', rank_no,
+        'code', code,
+        'name', name,
+        'latest_price', latest_price,
+        'pct_change', pct_change,
+        'amount_yi', ROUND(COALESCE(amount, 0) / 100000000, 2)
+      ) AS item
+      FROM market_width_amount_top50
+      WHERE {snapshot_filter}
+      ORDER BY rank_no ASC
+      LIMIT 50
+    ) ranked;
+    """
+
+
 def intel_feed_sql(
     trade_date: str | None = "",
     *,
@@ -265,32 +1199,46 @@ def intel_feed_sql(
     clean_code = (code or "").strip()
     scan_detail_filter = ""
     window_detail_filter = ""
+    auction_detail_filter = ""
     if clean_kind:
         if clean_kind != "scan":
             scan_detail_filter += " AND 1=0"
         if clean_kind != "window":
             window_detail_filter += " AND 1=0"
+        if clean_kind != "auction":
+            auction_detail_filter += " AND 1=0"
     if clean_code:
         scan_detail_filter += f" AND code={sql_string(clean_code)}"
         window_detail_filter += f" AND code={sql_string(clean_code)}"
+        auction_detail_filter += f" AND code={sql_string(clean_code)}"
     if clean_event_time:
         scan_detail_filter += f" AND DATE_FORMAT(event_time, '%Y-%m-%d %H:%i:%s')={sql_string(clean_event_time)}"
         window_detail_filter += f" AND DATE_FORMAT(event_time, '%Y-%m-%d %H:%i:%s')={sql_string(clean_event_time)}"
-    leadership_body = _dynamic_leadership_body("smj", "pr")
-    leadership_inline = _dynamic_leadership_inline("smj", "pr")
+        auction_detail_filter += f" AND DATE_FORMAT(event_time, '%Y-%m-%d %H:%i:%s')={sql_string(clean_event_time)}"
+    scan_run_time_filter = (
+        f"AND DATE_FORMAT(scanned_at, '%Y-%m-%d %H:%i:%s')={sql_string(clean_event_time)}"
+        if clean_event_time and (not clean_kind or clean_kind == "scan")
+        else ""
+    )
+    window_time_filter = (
+        f"AND DATE_FORMAT(ended_at, '%Y-%m-%d %H:%i:%s')={sql_string(clean_event_time)}"
+        if clean_event_time and (not clean_kind or clean_kind == "window")
+        else ""
+    )
+    rank_limit = 9999 if (clean_code or clean_event_time) else 50
     scan_async_source = _json_source_fields(
         "async_evidence_summaries",
         "CONCAT('async_evidence_summaries:', DATE_FORMAT(aes.trade_date, '%Y-%m-%d'), ':', sm.code)",
         "DATE_FORMAT(aes.trade_date, '%Y-%m-%d')",
         "DATE_FORMAT(aes.updated_at, '%Y-%m-%d %H:%i:%s')",
-        "async",
+        "model_summary",
     )
     window_async_source = _json_source_fields(
         "async_evidence_summaries",
         "CONCAT('async_evidence_summaries:', DATE_FORMAT(aes.trade_date, '%Y-%m-%d'), ':', wm.code)",
         "DATE_FORMAT(aes.trade_date, '%Y-%m-%d')",
         "DATE_FORMAT(aes.updated_at, '%Y-%m-%d %H:%i:%s')",
-        "async",
+        "model_summary",
     )
     scan_judgement_source = _json_source_fields(
         "stock_move_judgements",
@@ -306,34 +1254,8 @@ def intel_feed_sql(
         "DATE_FORMAT(smj.updated_at, '%Y-%m-%d %H:%i:%s')",
         "intraday",
     )
-    scan_period_source = _json_source_fields(
-        "stock_period_rankings",
-        "CONCAT('stock_period_rankings:', pr.data_date, ':', sm.code)",
-        "pr.data_date",
-        "DATE_FORMAT(pr.updated_at, '%Y-%m-%d %H:%i:%s')",
-        "after_close",
-    )
-    window_period_source = _json_source_fields(
-        "stock_period_rankings",
-        "CONCAT('stock_period_rankings:', pr.data_date, ':', wm.code)",
-        "pr.data_date",
-        "DATE_FORMAT(pr.updated_at, '%Y-%m-%d %H:%i:%s')",
-        "after_close",
-    )
-    scan_lhb_source = _json_source_fields(
-        "stock_lhb_seat_evidence",
-        "CONCAT('stock_lhb_seat_evidence:', DATE_FORMAT(lhb.trade_date, '%Y-%m-%d'), ':', sm.code)",
-        "DATE_FORMAT(lhb.trade_date, '%Y-%m-%d')",
-        "DATE_FORMAT(lhb.updated_at, '%Y-%m-%d %H:%i:%s')",
-        "after_close",
-    )
-    window_lhb_source = _json_source_fields(
-        "stock_lhb_seat_evidence",
-        "CONCAT('stock_lhb_seat_evidence:', DATE_FORMAT(lhb.trade_date, '%Y-%m-%d'), ':', wm.code)",
-        "DATE_FORMAT(lhb.trade_date, '%Y-%m-%d')",
-        "DATE_FORMAT(lhb.updated_at, '%Y-%m-%d %H:%i:%s')",
-        "after_close",
-    )
+    scan_lhb_source = ""
+    window_lhb_source = ""
     scan_role_source = _json_source_fields(
         "scan_stock_roles",
         "CONCAT('scan_stock_roles:', sr.run_id, ':', sm.code)",
@@ -355,16 +1277,25 @@ def intel_feed_sql(
         "DATE_FORMAT(el.updated_at, '%Y-%m-%d %H:%i:%s')",
         "async",
     )
+    auction_source = _json_source_fields(
+        "auction_trend_summary",
+        "CONCAT('auction_trend_summary:', DATE_FORMAT(ats.trade_date, '%Y-%m-%d'), ':', ats.code)",
+        "DATE_FORMAT(ats.trade_date, '%Y-%m-%d')",
+        "DATE_FORMAT(ats.generated_at, '%Y-%m-%d %H:%i:%s')",
+        "intraday",
+    )
     return f"""
     SET SESSION group_concat_max_len=16384;
     WITH
+    {research_pool_snapshot_cte(trade_date or date.today().strftime("%Y-%m-%d"))},
     recent_scan_runs AS (
       SELECT id, run_id, scanned_at
       FROM scan_runs
       WHERE DATE(scanned_at)={day}
         AND accepted=1
+        {scan_run_time_filter}
       ORDER BY scanned_at DESC
-      LIMIT 1
+      LIMIT {rank_limit}
     ),
     recent_windows AS (
       SELECT id, window_id, ended_at
@@ -372,6 +1303,7 @@ def intel_feed_sql(
       WHERE DATE(ended_at)={day}
         AND status='done'
         AND aggregate_count > 0
+        {window_time_filter}
       ORDER BY ended_at DESC
     ),
     latest_anchor_role_snapshot AS (
@@ -381,10 +1313,12 @@ def intel_feed_sql(
         SELECT anchor_name, MAX(captured_at) AS max_at
         FROM anchor_realtime_role_snapshots
         WHERE DATE(captured_at)={day}
+          AND source='research_pool_theme_members'
         GROUP BY anchor_name
       ) latest
         ON latest.anchor_name = s.anchor_name
        AND latest.max_at = s.captured_at
+      WHERE s.source='research_pool_theme_members'
     ),
     latest_anchor_role_member AS (
       SELECT m.*
@@ -393,51 +1327,133 @@ def intel_feed_sql(
         ON s.snapshot_run_id = m.snapshot_run_id
        AND s.anchor_name = m.anchor_name
     ),
-    period_ranks AS (
-      SELECT
-        code,
-        DATE_FORMAT(MAX(trade_date), '%Y-%m-%d') AS data_date,
-        MIN(IF(period_days=3, rank_no, NULL)) AS rank_3d,
-        MIN(IF(period_days=5, rank_no, NULL)) AS rank_5d,
-        MIN(IF(period_days=10, rank_no, NULL)) AS rank_10d,
-        MAX(updated_at) AS updated_at
+    stock_headline_themes AS (
+      SELECT code, JSON_ARRAYAGG(theme_name) AS tags
       FROM (
-        SELECT ranked.*
-        FROM (
-          SELECT
-            r.*,
-            ROW_NUMBER() OVER (
-              PARTITION BY r.code, r.period_days
-              ORDER BY r.trade_date DESC, r.updated_at DESC
-            ) AS rn
-          FROM stock_period_rankings r
-          WHERE r.trade_date <= {day}
-            AND r.trade_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 7 DAY)
-            AND r.period_days IN (3,5,10)
-        ) ranked
-        WHERE ranked.rn=1
-      ) latest
+        SELECT code, theme_name, MIN(theme_rank) AS theme_rank, MAX(match_score) AS match_score
+        FROM research_pool_theme_members
+        WHERE trade_date={day}
+          AND is_headline_theme=1
+          AND COALESCE(theme_name, '') <> ''
+        GROUP BY code, theme_name
+        ORDER BY theme_rank ASC, match_score DESC, theme_name ASC
+      ) themes
       GROUP BY code
     ),
+    stock_headline_theme_roles AS (
+      SELECT
+        code,
+        latest_source_updated_at AS latest_updated_at,
+        roles
+      FROM stock_headline_theme_role_evidence
+      WHERE trade_date={day}
+    ),
     latest_lhb AS (
-      SELECT latest.*
-      FROM (
-        SELECT
-          lhb.*,
-          ROW_NUMBER() OVER (
-            PARTITION BY lhb.code
-            ORDER BY lhb.trade_date DESC, lhb.updated_at DESC
-          ) AS rn
-        FROM stock_lhb_seat_evidence lhb
-        WHERE lhb.trade_date <= {day}
-          AND lhb.trade_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 7 DAY)
-      ) latest
-      WHERE latest.rn=1
+      SELECT
+        NULL AS code,
+        JSON_ARRAY() AS key_facts,
+        NULL AS trade_date,
+        '' AS seat_signal_label,
+        NULL AS updated_at
+      WHERE 1=0
     ),
     root_evidence AS (
-      SELECT code, updated_at AS latest_updated_at, items
-      FROM stock_root_evidence_cache
-      WHERE trade_date={day}
+      SELECT
+        rec.code,
+        rec.updated_at AS latest_updated_at,
+        COALESCE((
+          SELECT JSON_ARRAYAGG(t.item)
+          FROM (
+            SELECT jt.ord, jt.item
+            FROM JSON_TABLE(rec.items, '$[*]' COLUMNS (
+              ord FOR ORDINALITY,
+              item JSON PATH '$',
+              source_table VARCHAR(64) PATH '$.source_table' NULL ON EMPTY,
+              label VARCHAR(64) PATH '$.label' NULL ON EMPTY,
+              source VARCHAR(128) PATH '$.source' NULL ON EMPTY,
+              type VARCHAR(64) PATH '$.type' NULL ON EMPTY,
+              body VARCHAR(512) PATH '$.body' NULL ON EMPTY
+            )) jt
+            WHERE COALESCE(jt.source_table, '') <> 'stock_period_rankings'
+              AND COALESCE(jt.label, '') <> '区间领头'
+              AND COALESCE(jt.type, '') <> 'period'
+              AND COALESCE(jt.source, '') NOT LIKE '%问财%'
+              AND COALESCE(jt.body, '') NOT LIKE '%问财%'
+            ORDER BY jt.ord
+          ) t
+        ), JSON_ARRAY()) AS items
+      FROM stock_root_evidence_cache rec
+      WHERE rec.trade_date={day}
+    ),
+    auction_ranked AS (
+      SELECT
+        MAX(COALESCE(ats.last_seen_minute, ats.generated_at)) OVER () AS event_time,
+        'auction' AS kind,
+        '竞价封单' AS kind_label,
+        ats.code,
+        ats.stock_name AS name,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(ats.last_seal_amount, 0) DESC, ats.final_candidate_rank ASC) AS sort_rank,
+        CONCAT(ats.stock_name, ' ', ats.code) AS title,
+        CONCAT(
+          IF(COALESCE(scp.company_highlights, '') <> '', CONCAT('【亮点】', scp.company_highlights, '；'), ''),
+          '涨停封单 ', ROUND(COALESCE(ats.last_seal_amount, 0) / 100000000, 2), '亿；',
+          '竞价涨幅 ', ROUND(COALESCE(ats.last_auction_pct, 0), 2), '%；',
+          '竞价额 ', ROUND(COALESCE(ats.last_auction_amount, 0) / 100000000, 2), '亿'
+        ) AS summary,
+        CONCAT(
+          IF(COALESCE(scp.company_highlights, '') <> '', CONCAT('【亮点】', scp.company_highlights, '\n'), ''),
+          '【集合竞价】涨停封单 ', ROUND(COALESCE(ats.last_seal_amount, 0) / 100000000, 2), '亿；',
+          '竞价涨幅 ', ROUND(COALESCE(ats.last_auction_pct, 0), 2), '%；',
+          '竞价额 ', ROUND(COALESCE(ats.last_auction_amount, 0) / 100000000, 2), '亿'
+        ) AS detail,
+        JSON_MERGE_PRESERVE(
+          JSON_ARRAY(JSON_OBJECT(
+            'layer', 'realtime',
+            'label', '竞价封单',
+            'type', 'realtime',
+            'source', '集合竞价',
+            {auction_source}
+            'body', CONCAT(
+              '涨停封单 ', ROUND(COALESCE(ats.last_seal_amount, 0) / 100000000, 2), '亿；',
+              '竞价涨幅 ', ROUND(COALESCE(ats.last_auction_pct, 0), 2), '%；',
+              '竞价额 ', ROUND(COALESCE(ats.last_auction_amount, 0) / 100000000, 2), '亿'
+            ),
+            'priority', 0,
+            'payload', IF(JSON_VALID(ats.raw_json), JSON_EXTRACT(ats.raw_json, '$'), JSON_OBJECT())
+          )),
+          COALESCE(re.items, JSON_ARRAY())
+        ) AS evidence_items,
+        JSON_OBJECT() AS display_contract,
+        DATE_FORMAT(COALESCE(ats.last_seen_minute, ats.generated_at), '%Y-%m-%d %H:%i:%s') AS intraday_source_updated_at,
+        CAST('' AS CHAR) AS judgement_updated_at,
+        CAST('' AS CHAR) AS async_evidence_updated_at,
+        CAST('' AS CHAR) AS period_rank_updated_at,
+        CAST('' AS CHAR) AS lhb_updated_at,
+        CAST('' AS CHAR) AS evidence_layer_updated_at,
+        DATE_FORMAT(GREATEST(
+          COALESCE(ats.generated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
+          COALESCE(re.latest_updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
+        ), '%Y-%m-%d %H:%i:%s') AS latest_source_updated_at,
+        COALESCE(ats.last_seal_amount, 0) / 100000000 AS score,
+        COALESCE(ats.last_auction_pct, 0) AS change_pct,
+        0 AS speed_pct,
+        ROUND(COALESCE(ats.last_auction_amount, 0) / 100000000, 2) AS amount_yi,
+        JSON_MERGE_PRESERVE(
+          COALESCE(sht.tags, JSON_ARRAY()),
+          JSON_ARRAY(
+            CONCAT('封单:', ROUND(COALESCE(ats.last_seal_amount, 0) / 100000000, 2), '亿'),
+            CONCAT('竞价:', ROUND(COALESCE(ats.last_auction_pct, 0), 2), '%')
+          )
+        ) AS tags,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(ats.last_seal_amount, 0) DESC, ats.final_candidate_rank ASC) AS rn
+      FROM auction_trend_summary ats
+      LEFT JOIN stock_company_profiles scp ON scp.code = ats.code
+      LEFT JOIN stock_headline_themes sht ON sht.code = ats.code
+      LEFT JOIN root_evidence re ON re.code = ats.code
+      WHERE ats.trade_date={day}
+        AND COALESCE(ats.limit_up_count, 0) > 0
+        AND COALESCE(ats.last_seal_amount, 0) > 0
+        AND COALESCE(ats.last_auction_pct, 0) >= 9.5
     ),
     scan_ranked AS (
       SELECT
@@ -456,7 +1472,7 @@ def intel_feed_sql(
           IF(COALESCE(scp.company_highlights, '') <> '', CONCAT('【亮点】', scp.company_highlights, '\n'), ''),
           IF(COALESCE(smj.final_view, '') <> '', CONCAT('【判断层】', smj.final_view, '\n'), ''),
           IF(COALESCE(aes.summary_text, '') <> '' AND COALESCE(aes.impact_summary_text, '') = '', CONCAT('【异步证据】异步总结：', aes.summary_text, '\n'), ''),
-          IF(COALESCE(aes.impact_summary_text, '') <> '', CONCAT('【异步证据】影响要素：', aes.impact_summary_text, '\n'), ''),
+          IF(COALESCE(aes.impact_summary_text, '') <> '', CONCAT('【异步证据】有效事实总结：', aes.impact_summary_text, '\n'), ''),
           IF(JSON_LENGTH(COALESCE(re.items, JSON_ARRAY())) > 0, CONCAT('【异步证据】基础事实：', re.items->>'$[0].body', '\n'), ''),
           IF(
             COALESCE(ssr.raw_json->>'$.raw_json.anchor_reason', ssr.raw_json->>'$.anchor_reason', '') <> '',
@@ -473,11 +1489,11 @@ def intel_feed_sql(
         JSON_MERGE_PRESERVE(
           IF(JSON_VALID(aes.key_facts) AND JSON_LENGTH(aes.key_facts) > 0, JSON_ARRAY(JSON_OBJECT(
               'layer', 'async',
-              'label', '关键事实',
+              'label', '有效事实总结',
               'type', 'facts',
               'source', '事实卡',
               {scan_async_source}
-              'body', CONCAT_WS('\n', aes.key_facts->>'$[0]', aes.key_facts->>'$[1]', aes.key_facts->>'$[2]'),
+              'body', CONCAT_WS('\n', aes.key_facts->>'$[0]', aes.key_facts->>'$[1]', aes.key_facts->>'$[2]', aes.key_facts->>'$[3]', aes.key_facts->>'$[4]', aes.key_facts->>'$[5]', aes.key_facts->>'$[6]', aes.key_facts->>'$[7]', aes.key_facts->>'$[8]', aes.key_facts->>'$[9]', aes.key_facts->>'$[10]', aes.key_facts->>'$[11]'),
               'priority', 0,
               'payload', JSON_EXTRACT(aes.key_facts, '$')
             )), JSON_ARRAY()),
@@ -518,8 +1534,7 @@ def intel_feed_sql(
               {scan_judgement_source}
               'body', CONCAT(
                 smj.sustainability_label, ' / ', ROUND(smj.sustainability_score, 0), '分',
-                '；硬', ROUND(smj.hard_catalyst_score, 0),
-                ' 区间', ROUND(smj.anchor_leadership_score, 0),
+                '；区间', ROUND(smj.anchor_leadership_score, 0),
                 ' 盘口', ROUND(smj.tape_confirm_score, 0),
                 ' 行为', ROUND(COALESCE(JSON_EXTRACT(smj.score_detail, '$.short_term_behavior'), 0), 0),
                 ' 风险-', ROUND(smj.anchor_risk_deduction, 0),
@@ -535,49 +1550,28 @@ def intel_feed_sql(
               {scan_judgement_source}
               'body', CONCAT_WS('\n',
                 smj.support_items->>'$[0]',
-                IF(COALESCE({leadership_body}, '') <> '', CONCAT('区间领头：', {leadership_inline}), NULL),
                 IF(COALESCE(smj.support_items->>'$[1]', '') LIKE '区间领头：%', smj.support_items->>'$[2]', smj.support_items->>'$[1]')
               ),
               'priority', 3
             )), JSON_ARRAY()),
-          IF(COALESCE({leadership_body}, '') <> '', JSON_ARRAY(JSON_OBJECT(
-              'layer', 'async',
-              'label', '区间领头',
-              'type', 'period',
-              'source', '问财区间排名',
-              {scan_period_source}
-              'body', {leadership_body},
-              'evidence_date', pr.data_date,
-              'priority', 3
-            )), JSON_ARRAY()),
-          IF(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.initiative_reasons')) > 0, JSON_ARRAY(JSON_OBJECT(
-              'layer', 'async',
-              'label', '主动性',
-              'type', 'initiative',
-              'source', CONCAT('扫描触发 / ', COALESCE(JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.initiative_label')), '')),
-              {scan_judgement_source}
-              'body', CONCAT_WS('\n',
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.initiative_reasons[0]')),
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.initiative_reasons[1]')),
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.initiative_reasons[2]'))
-              ),
-              'priority', 3,
-              'payload', JSON_EXTRACT(smj.score_detail, '$.initiative_reasons')
-            )), JSON_ARRAY()),
-          IF(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.influence_reasons')) > 0, JSON_ARRAY(JSON_OBJECT(
+          IF(COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0 OR COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.influence_reasons')), 0) > 0, JSON_ARRAY(JSON_OBJECT(
               'layer', 'async',
               'label', '带动性',
               'type', 'influence',
-              'source', CONCAT('同锚扩散 / ', COALESCE(JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_label')), '')),
+              'source', IF(COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0, '多题材扩散', CONCAT('同锚扩散 / ', COALESCE(JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_label')), ''))),
               {scan_judgement_source}
-              'body', CONCAT_WS('\n',
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[0]')),
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[1]')),
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[2]'))
+              'body', IF(
+                COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0,
+                CONCAT('关联头条题材带动性 ', JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), ' 个'),
+                CONCAT_WS('\n',
+                  JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[0]')),
+                  JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[1]')),
+                  JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[2]'))
+                )
               ),
               'priority', 4,
-              'payload', JSON_EXTRACT(smj.score_detail, '$.influence_reasons'),
-              'structured_payload', JSON_EXTRACT(smj.score_detail, '$.influence_payload')
+              'payload', IF(COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0, JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence'), JSON_EXTRACT(smj.score_detail, '$.influence_reasons')),
+              'structured_payload', IF(COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0, JSON_OBJECT('mode', 'multi_theme'), JSON_EXTRACT(smj.score_detail, '$.influence_payload'))
             )), JSON_ARRAY()),
           IF(JSON_VALID(aes.sustainability_basis) AND JSON_LENGTH(aes.sustainability_basis) > 0, JSON_ARRAY(JSON_OBJECT(
               'layer', 'async',
@@ -691,10 +1685,10 @@ def intel_feed_sql(
               'priority', 9,
               'payload', JSON_EXTRACT(aes.core_evidence_items, '$')
             )), JSON_ARRAY()),
-          IF(COALESCE(aes.impact_summary_text, '') <> '', JSON_ARRAY(JSON_OBJECT(
+          IF(COALESCE(aes.impact_summary_text, '') <> '' AND NOT (JSON_VALID(aes.key_facts) AND JSON_LENGTH(aes.key_facts) > 0), JSON_ARRAY(JSON_OBJECT(
               'layer', 'async',
-              'label', '影响要素',
-              'type', 'impact',
+              'label', '有效事实总结',
+              'type', 'facts',
               'source', '模型判断',
               {scan_async_source}
               'body', COALESCE(aes.impact_summary_text, ''),
@@ -711,6 +1705,56 @@ def intel_feed_sql(
               'priority', 20
             )), JSON_ARRAY()),
           COALESCE(re.items, JSON_ARRAY()),
+          IF(JSON_LENGTH(COALESCE(shtr.roles, JSON_ARRAY())) > 0, JSON_ARRAY(JSON_OBJECT(
+              'layer', 'realtime',
+              'label', '头条题材角色',
+              'type', 'headline_theme_roles',
+              'source', '研究池题材角色',
+              'source_table', 'research_pool_theme_members',
+              'source_key', CONCAT('research_pool_theme_members:', {day}, ':', sm.code),
+              'source_confidence', 'explicit',
+              'data_date', {day},
+              'evidence_date', {day},
+              'updated_at', DATE_FORMAT(shtr.latest_updated_at, '%Y-%m-%d %H:%i:%s'),
+              'source_generation', 'intraday',
+              'availability', 'intraday',
+              'evidence_group', 'current_effective',
+              'evidence_role', 'market_realtime',
+              'display_level', 'primary',
+              'valid_status', 'watch',
+              'source_registry', JSON_OBJECT(
+                'source_table', 'research_pool_theme_members',
+                'source_generation', 'intraday',
+                'availability', 'intraday',
+                'evidence_group', 'current_effective',
+                'update_cycle', 'scan_loop',
+                'data_date_policy', 'event_day'
+              ),
+              'body', CONCAT('关联今日头条题材 ', JSON_LENGTH(shtr.roles), ' 个'),
+              'priority', 21,
+              'payload', JSON_EXTRACT(shtr.roles, '$')
+            )), JSON_ARRAY()),
+          IF(arm.id IS NOT NULL OR ars.id IS NOT NULL OR COALESCE(ssr.role_label, '') <> '', JSON_ARRAY(JSON_OBJECT(
+              'layer', 'realtime',
+              'label', '领涨中军',
+              'type', 'realtime',
+              'source', '研究池题材角色',
+              {scan_role_source}
+              'body', CONCAT_WS('\n',
+                CONCAT('题材：', COALESCE(ars.anchor_name, ssr.primary_anchor_name, '未锚定')),
+                CONCAT('定位：', CASE
+                  WHEN arm.role_label IN ('研究池领涨', '研究池领涨中军', '研究池中军') THEN arm.role_label
+                  WHEN arm.id IS NOT NULL THEN '题材成员'
+                  WHEN ssr.role_label IN ('领涨', '领涨中军', '中军') THEN CONCAT('局部', ssr.role_label)
+                  WHEN ars.id IS NOT NULL THEN '扫描异动'
+                  ELSE COALESCE(ssr.role_label, '')
+                END),
+                IF(COALESCE(ars.leader_name, ssr.leader_name, '') <> '', CONCAT('领涨：', COALESCE(ars.leader_name, ssr.leader_name), IF(COALESCE(ars.leader_code, ssr.leader_code, '') <> '', CONCAT(' ', COALESCE(ars.leader_code, ssr.leader_code)), '')), NULL),
+                IF(COALESCE(ars.core_name, ssr.core_name, '') <> '', CONCAT('中军：', COALESCE(ars.core_name, ssr.core_name), IF(COALESCE(ars.core_code, ssr.core_code, '') <> '', CONCAT(' ', COALESCE(ars.core_code, ssr.core_code)), '')), NULL),
+                CONCAT('题材内研究池成员：', COALESCE(ars.member_count, ssr.anchor_member_count, 0), '只')
+              ),
+              'priority', 22
+            )), JSON_ARRAY()),
           IF(COALESCE(ssr.raw_json->>'$.raw_json.anchor_reason', ssr.raw_json->>'$.anchor_reason', '') <> '', JSON_ARRAY(JSON_OBJECT(
               'layer', 'realtime',
               'label', '题材证据',
@@ -734,7 +1778,7 @@ def intel_feed_sql(
         DATE_FORMAT(sr.scanned_at, '%Y-%m-%d %H:%i:%s') AS intraday_source_updated_at,
         DATE_FORMAT(smj.updated_at, '%Y-%m-%d %H:%i:%s') AS judgement_updated_at,
         DATE_FORMAT(aes.updated_at, '%Y-%m-%d %H:%i:%s') AS async_evidence_updated_at,
-        DATE_FORMAT(pr.updated_at, '%Y-%m-%d %H:%i:%s') AS period_rank_updated_at,
+        CAST('' AS CHAR) AS period_rank_updated_at,
         DATE_FORMAT(lhb.updated_at, '%Y-%m-%d %H:%i:%s') AS lhb_updated_at,
         CAST('' AS CHAR) AS evidence_layer_updated_at,
         DATE_FORMAT(GREATEST(
@@ -742,37 +1786,22 @@ def intel_feed_sql(
           COALESCE(smj.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(aes.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(re.latest_updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
-          COALESCE(pr.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(lhb.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
-          COALESCE(ars.captured_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
+          COALESCE(ars.captured_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
+          COALESCE(shtr.latest_updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
         ), '%Y-%m-%d %H:%i:%s') AS latest_source_updated_at,
         100 - sm.rank_speed AS score,
         COALESCE(sm.pct_change, 0) AS change_pct,
         COALESCE(sm.speed, 0) AS speed_pct,
         ROUND(COALESCE(sm.amount, 0) / 100000000, 2) AS amount_yi,
-        JSON_ARRAY(
+        JSON_MERGE_PRESERVE(
+          COALESCE(sht.tags, JSON_ARRAY()),
+          JSON_ARRAY(
+          CONCAT('研究池:', COALESCE(rp.source_rank_label, CONCAT('#', rp.source_rank))),
           CONCAT('扫描Top', sm.rank_speed),
-          CONCAT('题材定位:', CASE
-            WHEN arm.role_label IN ('全池领涨', '全池领涨中军', '全池中军') THEN arm.role_label
-            WHEN arm.id IS NOT NULL THEN '题材成员'
-            WHEN ssr.role_label IN ('领涨', '领涨中军', '中军') THEN CONCAT('局部', ssr.role_label)
-            WHEN ars.id IS NOT NULL THEN '扫描异动'
-            ELSE ssr.role_label
-          END),
-          CONCAT('锚点:', COALESCE(ars.anchor_name, ssr.primary_anchor_name)),
-          IF(COALESCE(ssr.raw_json->>'$.raw_json.anchor_source', ssr.raw_json->>'$.anchor_source', '') IN ('active_market_anchor', 'theme_reason_bank'), '题材锚点', ''),
           CONCAT('同锚:', COALESCE(ars.member_count, ssr.anchor_member_count), '只'),
-          IF(COALESCE(smj.sustainability_label, '') <> '', CONCAT('持续:', smj.sustainability_label, ROUND(smj.sustainability_score, 0), '分'), ''),
-          CASE
-            WHEN ars.id IS NOT NULL AND COALESCE(ars.leader_name, '') <> '' AND ars.leader_name <> sm.name THEN CONCAT('全池领涨:', ars.leader_name, IF(COALESCE(ars.leader_code, '') <> '', CONCAT('|', ars.leader_code), ''))
-            WHEN ars.id IS NULL AND COALESCE(ssr.leader_name, '') <> '' AND ssr.leader_name <> sm.name THEN CONCAT('局部领涨:', ssr.leader_name, IF(COALESCE(ssr.leader_code, '') <> '', CONCAT('|', ssr.leader_code), ''))
-            ELSE ''
-          END,
-          CASE
-            WHEN ars.id IS NOT NULL AND COALESCE(ars.core_name, '') <> '' AND ars.core_name <> sm.name THEN CONCAT('全池中军:', ars.core_name, IF(COALESCE(ars.core_code, '') <> '', CONCAT('|', ars.core_code), ''))
-            WHEN ars.id IS NULL AND COALESCE(ssr.core_name, '') <> '' AND ssr.core_name <> sm.name THEN CONCAT('局部中军:', ssr.core_name, IF(COALESCE(ssr.core_code, '') <> '', CONCAT('|', ssr.core_code), ''))
-            ELSE ''
-          END
+          IF(COALESCE(smj.sustainability_label, '') <> '', CONCAT('持续:', smj.sustainability_label, ROUND(smj.sustainability_score, 0), '分'), '')
+          )
         ) AS tags,
         ROW_NUMBER() OVER (
           PARTITION BY sr.id
@@ -780,6 +1809,7 @@ def intel_feed_sql(
         ) AS rn
       FROM recent_scan_runs sr
       JOIN scan_movers sm ON sm.scan_run_id = sr.id
+      JOIN research_pool rp ON rp.code = sm.code
       JOIN scan_stock_roles ssr ON ssr.scan_run_id = sr.id AND ssr.code = sm.code
       LEFT JOIN stock_company_profiles scp ON scp.code = sm.code
       LEFT JOIN stock_move_judgements smj ON smj.id = COALESCE(
@@ -801,10 +1831,14 @@ def intel_feed_sql(
           LIMIT 1
         )
       )
-      LEFT JOIN period_ranks pr ON pr.code = sm.code
       LEFT JOIN async_evidence_summaries aes ON aes.trade_date={day} AND aes.code = sm.code
+        AND EXISTS (
+          SELECT 1 FROM stock_effective_facts ef WHERE ef.trade_date={day} AND ef.code=sm.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+        )
       LEFT JOIN latest_lhb lhb ON lhb.code = sm.code
       LEFT JOIN root_evidence re ON re.code = sm.code
+      LEFT JOIN stock_headline_themes sht ON sht.code = sm.code
+      LEFT JOIN stock_headline_theme_roles shtr ON shtr.code = sm.code
       LEFT JOIN latest_anchor_role_snapshot ars ON ars.anchor_name = ssr.primary_anchor_name
       LEFT JOIN latest_anchor_role_member arm
         ON arm.snapshot_run_id = ars.snapshot_run_id
@@ -812,6 +1846,7 @@ def intel_feed_sql(
        AND arm.code = sm.code
       WHERE sm.name NOT LIKE '%ST%'
         AND sm.name NOT LIKE '%退市%'
+        AND COALESCE(sm.speed, 0) >= 1.5
     ),
     window_ranked AS (
       SELECT
@@ -837,7 +1872,7 @@ def intel_feed_sql(
             ''
           ),
           IF(COALESCE(aes.summary_text, '') <> '' AND COALESCE(aes.impact_summary_text, '') = '', CONCAT('【异步证据】异步总结：', aes.summary_text, '\n'), ''),
-          IF(COALESCE(aes.impact_summary_text, '') <> '', CONCAT('【异步证据】影响要素：', aes.impact_summary_text, '\n'), ''),
+          IF(COALESCE(aes.impact_summary_text, '') <> '', CONCAT('【异步证据】有效事实总结：', aes.impact_summary_text, '\n'), ''),
           IF(JSON_LENGTH(COALESCE(re.items, JSON_ARRAY())) > 0, CONCAT('【异步证据】基础事实：', re.items->>'$[0].body', '\n'), ''),
           IF(COALESCE(el.hard_evidence_summary, '') <> '', CONCAT('【异步证据】个股证据：', LEFT(el.hard_evidence_summary, 220), '\n'), ''),
           IF(COALESCE(el.market_evidence, '') <> '', CONCAT('【异步证据】题材证据：', LEFT(el.market_evidence, 220), '\n'), '')
@@ -845,11 +1880,11 @@ def intel_feed_sql(
         JSON_MERGE_PRESERVE(
           IF(JSON_VALID(aes.key_facts) AND JSON_LENGTH(aes.key_facts) > 0, JSON_ARRAY(JSON_OBJECT(
               'layer', 'async',
-              'label', '关键事实',
+              'label', '有效事实总结',
               'type', 'facts',
               'source', '事实卡',
               {window_async_source}
-              'body', CONCAT_WS('\n', aes.key_facts->>'$[0]', aes.key_facts->>'$[1]', aes.key_facts->>'$[2]'),
+              'body', CONCAT_WS('\n', aes.key_facts->>'$[0]', aes.key_facts->>'$[1]', aes.key_facts->>'$[2]', aes.key_facts->>'$[3]', aes.key_facts->>'$[4]', aes.key_facts->>'$[5]', aes.key_facts->>'$[6]', aes.key_facts->>'$[7]', aes.key_facts->>'$[8]', aes.key_facts->>'$[9]', aes.key_facts->>'$[10]', aes.key_facts->>'$[11]'),
               'priority', 0,
               'payload', JSON_EXTRACT(aes.key_facts, '$')
             )), JSON_ARRAY()),
@@ -890,8 +1925,7 @@ def intel_feed_sql(
               {window_judgement_source}
               'body', CONCAT(
                 smj.sustainability_label, ' / ', ROUND(smj.sustainability_score, 0), '分',
-                '；硬', ROUND(smj.hard_catalyst_score, 0),
-                ' 区间', ROUND(smj.anchor_leadership_score, 0),
+                '；区间', ROUND(smj.anchor_leadership_score, 0),
                 ' 盘口', ROUND(smj.tape_confirm_score, 0),
                 ' 行为', ROUND(COALESCE(JSON_EXTRACT(smj.score_detail, '$.short_term_behavior'), 0), 0),
                 ' 风险-', ROUND(smj.anchor_risk_deduction, 0),
@@ -907,49 +1941,28 @@ def intel_feed_sql(
               {window_judgement_source}
               'body', CONCAT_WS('\n',
                 smj.support_items->>'$[0]',
-                IF(COALESCE({leadership_body}, '') <> '', CONCAT('区间领头：', {leadership_inline}), NULL),
                 IF(COALESCE(smj.support_items->>'$[1]', '') LIKE '区间领头：%', smj.support_items->>'$[2]', smj.support_items->>'$[1]')
               ),
               'priority', 3
             )), JSON_ARRAY()),
-          IF(COALESCE({leadership_body}, '') <> '', JSON_ARRAY(JSON_OBJECT(
-              'layer', 'async',
-              'label', '区间领头',
-              'type', 'period',
-              'source', '问财区间排名',
-              {window_period_source}
-              'body', {leadership_body},
-              'evidence_date', pr.data_date,
-              'priority', 3
-            )), JSON_ARRAY()),
-          IF(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.initiative_reasons')) > 0, JSON_ARRAY(JSON_OBJECT(
-              'layer', 'async',
-              'label', '主动性',
-              'type', 'initiative',
-              'source', CONCAT('扫描触发 / ', COALESCE(JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.initiative_label')), '')),
-              {window_judgement_source}
-              'body', CONCAT_WS('\n',
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.initiative_reasons[0]')),
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.initiative_reasons[1]')),
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.initiative_reasons[2]'))
-              ),
-              'priority', 3,
-              'payload', JSON_EXTRACT(smj.score_detail, '$.initiative_reasons')
-            )), JSON_ARRAY()),
-          IF(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.influence_reasons')) > 0, JSON_ARRAY(JSON_OBJECT(
+          IF(COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0 OR COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.influence_reasons')), 0) > 0, JSON_ARRAY(JSON_OBJECT(
               'layer', 'async',
               'label', '带动性',
               'type', 'influence',
-              'source', CONCAT('同锚扩散 / ', COALESCE(JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_label')), '')),
+              'source', IF(COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0, '多题材扩散', CONCAT('同锚扩散 / ', COALESCE(JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_label')), ''))),
               {window_judgement_source}
-              'body', CONCAT_WS('\n',
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[0]')),
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[1]')),
-                JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[2]'))
+              'body', IF(
+                COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0,
+                CONCAT('关联头条题材带动性 ', JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), ' 个'),
+                CONCAT_WS('\n',
+                  JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[0]')),
+                  JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[1]')),
+                  JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.influence_reasons[2]'))
+                )
               ),
               'priority', 4,
-              'payload', JSON_EXTRACT(smj.score_detail, '$.influence_reasons'),
-              'structured_payload', JSON_EXTRACT(smj.score_detail, '$.influence_payload')
+              'payload', IF(COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0, JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence'), JSON_EXTRACT(smj.score_detail, '$.influence_reasons')),
+              'structured_payload', IF(COALESCE(JSON_LENGTH(JSON_EXTRACT(smj.score_detail, '$.multi_theme_influence')), 0) > 0, JSON_OBJECT('mode', 'multi_theme'), JSON_EXTRACT(smj.score_detail, '$.influence_payload'))
             )), JSON_ARRAY()),
           IF(JSON_VALID(aes.sustainability_basis) AND JSON_LENGTH(aes.sustainability_basis) > 0, JSON_ARRAY(JSON_OBJECT(
               'layer', 'async',
@@ -1063,10 +2076,10 @@ def intel_feed_sql(
               'priority', 9,
               'payload', JSON_EXTRACT(aes.core_evidence_items, '$')
             )), JSON_ARRAY()),
-          IF(COALESCE(aes.impact_summary_text, '') <> '', JSON_ARRAY(JSON_OBJECT(
+          IF(COALESCE(aes.impact_summary_text, '') <> '' AND NOT (JSON_VALID(aes.key_facts) AND JSON_LENGTH(aes.key_facts) > 0), JSON_ARRAY(JSON_OBJECT(
               'layer', 'async',
-              'label', '影响要素',
-              'type', 'impact',
+              'label', '有效事实总结',
+              'type', 'facts',
               'source', '模型判断',
               {window_async_source}
               'body', COALESCE(aes.impact_summary_text, ''),
@@ -1083,6 +2096,50 @@ def intel_feed_sql(
               'priority', 20
             )), JSON_ARRAY()),
           COALESCE(re.items, JSON_ARRAY()),
+          IF(JSON_LENGTH(COALESCE(shtr.roles, JSON_ARRAY())) > 0, JSON_ARRAY(JSON_OBJECT(
+              'layer', 'realtime',
+              'label', '头条题材角色',
+              'type', 'headline_theme_roles',
+              'source', '研究池题材角色',
+              'source_table', 'research_pool_theme_members',
+              'source_key', CONCAT('research_pool_theme_members:', {day}, ':', wm.code),
+              'source_confidence', 'explicit',
+              'data_date', {day},
+              'evidence_date', {day},
+              'updated_at', DATE_FORMAT(shtr.latest_updated_at, '%Y-%m-%d %H:%i:%s'),
+              'source_generation', 'intraday',
+              'availability', 'intraday',
+              'evidence_group', 'current_effective',
+              'evidence_role', 'market_realtime',
+              'display_level', 'primary',
+              'valid_status', 'watch',
+              'source_registry', JSON_OBJECT(
+                'source_table', 'research_pool_theme_members',
+                'source_generation', 'intraday',
+                'availability', 'intraday',
+                'evidence_group', 'current_effective',
+                'update_cycle', 'scan_loop',
+                'data_date_policy', 'event_day'
+              ),
+              'body', CONCAT('关联今日头条题材 ', JSON_LENGTH(shtr.roles), ' 个'),
+              'priority', 21,
+              'payload', JSON_EXTRACT(shtr.roles, '$')
+            )), JSON_ARRAY()),
+          IF(warm.id IS NOT NULL OR wars.id IS NOT NULL OR COALESCE(wsr.role_label, ssr.role_label, '') <> '', JSON_ARRAY(JSON_OBJECT(
+              'layer', 'realtime',
+              'label', '领涨中军',
+              'type', 'realtime',
+              'source', '研究池题材角色',
+              {window_role_source}
+              'body', CONCAT_WS('\n',
+                CONCAT('题材：', COALESCE(wars.anchor_name, wsr.sector_key, ssr.primary_anchor_name, '未锚定')),
+                CONCAT('定位：', CASE WHEN warm.id IS NOT NULL THEN warm.role_label ELSE COALESCE(wsr.role_label, ssr.role_label, '') END),
+                IF(COALESCE(wars.leader_name, wss.leader_name, ssr.leader_name, '') <> '', CONCAT('领涨：', COALESCE(wars.leader_name, wss.leader_name, ssr.leader_name), IF(COALESCE(wars.leader_code, wss.leader_code, ssr.leader_code, '') <> '', CONCAT(' ', COALESCE(wars.leader_code, wss.leader_code, ssr.leader_code)), '')), NULL),
+                IF(COALESCE(wars.core_name, wss.core_name, ssr.core_name, '') <> '', CONCAT('中军：', COALESCE(wars.core_name, wss.core_name, ssr.core_name), IF(COALESCE(wars.core_code, wss.core_code, ssr.core_code, '') <> '', CONCAT(' ', COALESCE(wars.core_code, wss.core_code, ssr.core_code)), '')), NULL),
+                CONCAT('题材内研究池成员：', COALESCE(wars.member_count, wsr.sector_stock_count, ssr.anchor_member_count, 0), '只')
+              ),
+              'priority', 22
+            )), JSON_ARRAY()),
           IF(COALESCE(wsr.role_reason, '') <> '', JSON_ARRAY(JSON_OBJECT(
               'layer', 'realtime',
               'label', '实时判断',
@@ -1129,7 +2186,7 @@ def intel_feed_sql(
         DATE_FORMAT(rw.ended_at, '%Y-%m-%d %H:%i:%s') AS intraday_source_updated_at,
         DATE_FORMAT(smj.updated_at, '%Y-%m-%d %H:%i:%s') AS judgement_updated_at,
         DATE_FORMAT(aes.updated_at, '%Y-%m-%d %H:%i:%s') AS async_evidence_updated_at,
-        DATE_FORMAT(pr.updated_at, '%Y-%m-%d %H:%i:%s') AS period_rank_updated_at,
+        CAST('' AS CHAR) AS period_rank_updated_at,
         DATE_FORMAT(lhb.updated_at, '%Y-%m-%d %H:%i:%s') AS lhb_updated_at,
         DATE_FORMAT(el.updated_at, '%Y-%m-%d %H:%i:%s') AS evidence_layer_updated_at,
         DATE_FORMAT(GREATEST(
@@ -1137,42 +2194,25 @@ def intel_feed_sql(
           COALESCE(smj.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(aes.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(re.latest_updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
-          COALESCE(pr.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(lhb.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(el.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
-          COALESCE(wars.captured_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
+          COALESCE(wars.captured_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
+          COALESCE(shtr.latest_updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
         ), '%Y-%m-%d %H:%i:%s') AS latest_source_updated_at,
         ROUND(wm.window_score, 1) AS score,
         COALESCE(wm.max_pct_change, wm.latest_pct_change, 0) AS change_pct,
         COALESCE(wm.max_speed, 0) AS speed_pct,
         ROUND(COALESCE(wm.amount, 0) / 100000000, 2) AS amount_yi,
-        JSON_ARRAY(
+        JSON_MERGE_PRESERVE(
+          COALESCE(sht.tags, JSON_ARRAY()),
+          JSON_ARRAY(
+          CONCAT('研究池:', COALESCE(rp.source_rank_label, CONCAT('#', rp.source_rank))),
           CONCAT('Top', wm.rank_no),
-          CASE WHEN warm.id IS NOT NULL THEN warm.role_label ELSE COALESCE(wsr.role_label, ssr.role_label, '') END,
-          COALESCE(CONCAT('锚点:', COALESCE(wars.anchor_name, wsr.sector_key, ssr.primary_anchor_name)), ''),
-           IF(COALESCE(wsr.raw_json->>'$.raw_json.anchor_source', wsr.raw_json->>'$.anchor_source', ssr.raw_json->>'$.raw_json.anchor_source', ssr.raw_json->>'$.anchor_source', '') IN ('active_market_anchor', 'theme_reason_bank'), '题材锚点', ''),
           COALESCE(CONCAT('同锚:', COALESCE(wars.member_count, wsr.sector_stock_count, ssr.anchor_member_count), '只'), ''),
           IF(COALESCE(smj.sustainability_label, '') <> '', CONCAT('持续:', smj.sustainability_label, ROUND(smj.sustainability_score, 0), '分'), ''),
-          COALESCE(IF(
-            COALESCE(wars.leader_name, wss.leader_name, ssr.leader_name, '') <> ''
-            AND COALESCE(wars.leader_name, wss.leader_name, ssr.leader_name, '') <> wm.name,
-            CONCAT(
-              '领涨:', COALESCE(wars.leader_name, wss.leader_name, ssr.leader_name),
-              IF(COALESCE(wars.leader_code, wss.leader_code, ssr.leader_code, '') <> '', CONCAT('|', COALESCE(wars.leader_code, wss.leader_code, ssr.leader_code)), '')
-            ),
-            ''
-          ), ''),
-          COALESCE(IF(
-            COALESCE(wars.core_name, wss.core_name, ssr.core_name, '') <> ''
-            AND COALESCE(wars.core_name, wss.core_name, ssr.core_name, '') <> wm.name,
-            CONCAT(
-              '中军:', COALESCE(wars.core_name, wss.core_name, ssr.core_name),
-              IF(COALESCE(wars.core_code, wss.core_code, ssr.core_code, '') <> '', CONCAT('|', COALESCE(wars.core_code, wss.core_code, ssr.core_code)), '')
-            ),
-            ''
-          ), ''),
           CONCAT('证据:', COALESCE(el.evidence_strength, 'pending')),
           CONCAT('出现:', wm.appearance_count, '次')
+          )
         ) AS tags,
         ROW_NUMBER() OVER (
           PARTITION BY rw.id
@@ -1180,7 +2220,10 @@ def intel_feed_sql(
         ) AS rn
       FROM recent_windows rw
       JOIN window_movers wm ON wm.window_id = rw.id
+      JOIN research_pool rp ON rp.code = wm.code
       LEFT JOIN stock_company_profiles scp ON scp.code = wm.code
+      LEFT JOIN stock_headline_themes sht ON sht.code = wm.code
+      LEFT JOIN stock_headline_theme_roles shtr ON shtr.code = wm.code
       LEFT JOIN window_stock_roles wsr ON wsr.window_id = rw.id AND wsr.code = wm.code
       LEFT JOIN window_sector_stats wss ON wss.window_id = rw.id AND wss.sector_key = wsr.sector_key
       LEFT JOIN scan_stock_roles ssr ON ssr.id = (
@@ -1218,12 +2261,15 @@ def intel_feed_sql(
           LIMIT 1
         )
       )
-      LEFT JOIN period_ranks pr ON pr.code = wm.code
       LEFT JOIN async_evidence_summaries aes ON aes.trade_date={day} AND aes.code = wm.code
+        AND EXISTS (
+          SELECT 1 FROM stock_effective_facts ef WHERE ef.trade_date={day} AND ef.code=wm.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+        )
       LEFT JOIN latest_lhb lhb ON lhb.code = wm.code
       LEFT JOIN root_evidence re ON re.code = wm.code
       WHERE wm.name NOT LIKE '%ST%'
         AND wm.name NOT LIKE '%退市%'
+        AND COALESCE(wm.max_speed, 0) >= 1.5
         AND wm.rank_no <= 5
     )
     SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
@@ -1232,6 +2278,7 @@ def intel_feed_sql(
       'kind_label', kind_label,
       'code', code,
       'name', name,
+      'sort_rank', sort_rank,
       'title', title,
       'summary', summary,
       'detail', detail,
@@ -1255,8 +2302,17 @@ def intel_feed_sql(
       SELECT event_time, kind, kind_label, code, name, sort_rank, title, summary, detail, evidence_items, display_contract,
         intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
         evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
+      FROM auction_ranked
+      WHERE rn <= 3
+        {auction_detail_filter}
+
+      UNION ALL
+
+      SELECT event_time, kind, kind_label, code, name, sort_rank, title, summary, detail, evidence_items, display_contract,
+        intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
+        evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
       FROM scan_ranked
-      WHERE rn <= 5
+      WHERE rn <= {rank_limit}
         {scan_detail_filter}
 
       UNION ALL
@@ -1265,11 +2321,12 @@ def intel_feed_sql(
         intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
         evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
       FROM window_ranked
-      WHERE rn <= 5
+      WHERE rn <= {rank_limit}
         {window_detail_filter}
 
       ORDER BY event_time DESC,
-        CASE kind WHEN 'scan' THEN 2 WHEN 'window' THEN 1 ELSE 0 END DESC,
+        CASE kind WHEN 'scan' THEN 3 WHEN 'auction' THEN 2 WHEN 'window' THEN 1 ELSE 0 END DESC,
+        CASE kind WHEN 'auction' THEN sort_rank ELSE 0 END ASC,
         score DESC
     ) feed;
     """
@@ -1277,9 +2334,30 @@ def intel_feed_sql(
 
 def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) -> str:
     day = sql_string(trade_date or date.today().strftime("%Y-%m-%d"))
-    window_count = max(1, int(window_count))
+    auction_async_source = _json_source_fields(
+        "async_evidence_summaries",
+        "CONCAT('async_evidence_summaries:', DATE_FORMAT(aes.trade_date, '%Y-%m-%d'), ':', ats.code)",
+        "DATE_FORMAT(aes.trade_date, '%Y-%m-%d')",
+        "DATE_FORMAT(aes.updated_at, '%Y-%m-%d %H:%i:%s')",
+        "model_summary",
+    )
+    scan_async_source = _json_source_fields(
+        "async_evidence_summaries",
+        "CONCAT('async_evidence_summaries:', DATE_FORMAT(aes.trade_date, '%Y-%m-%d'), ':', sm.code)",
+        "DATE_FORMAT(aes.trade_date, '%Y-%m-%d')",
+        "DATE_FORMAT(aes.updated_at, '%Y-%m-%d %H:%i:%s')",
+        "model_summary",
+    )
+    window_async_source = _json_source_fields(
+        "async_evidence_summaries",
+        "CONCAT('async_evidence_summaries:', DATE_FORMAT(aes.trade_date, '%Y-%m-%d'), ':', wm.code)",
+        "DATE_FORMAT(aes.trade_date, '%Y-%m-%d')",
+        "DATE_FORMAT(aes.updated_at, '%Y-%m-%d %H:%i:%s')",
+        "model_summary",
+    )
     return f"""
     WITH
+    {research_pool_snapshot_cte(trade_date or date.today().strftime("%Y-%m-%d"))},
     recent_scan_runs AS (
       SELECT id, run_id, scanned_at
       FROM scan_runs
@@ -1287,7 +2365,6 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
         AND scanned_at < DATE_ADD(CAST({day} AS DATE), INTERVAL 1 DAY)
         AND accepted=1
       ORDER BY scanned_at DESC
-      LIMIT 1
     ),
     recent_windows AS (
       SELECT id, window_id, ended_at
@@ -1297,7 +2374,108 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
         AND status='done'
         AND aggregate_count > 0
       ORDER BY ended_at DESC
-      LIMIT {window_count}
+      LIMIT 1
+    ),
+    stock_headline_themes AS (
+      SELECT code, JSON_ARRAYAGG(theme_name) AS tags
+      FROM (
+        SELECT code, theme_name, MIN(theme_rank) AS theme_rank, MAX(match_score) AS match_score
+        FROM research_pool_theme_members
+        WHERE trade_date={day}
+          AND is_headline_theme=1
+          AND COALESCE(theme_name, '') <> ''
+        GROUP BY code, theme_name
+        ORDER BY theme_rank ASC, match_score DESC, theme_name ASC
+      ) themes
+      GROUP BY code
+    ),
+    root_evidence AS (
+      SELECT
+        rec.code,
+        rec.updated_at AS latest_updated_at,
+        COALESCE((
+          SELECT JSON_ARRAYAGG(t.item)
+          FROM (
+            SELECT jt.ord, jt.item
+            FROM JSON_TABLE(rec.items, '$[*]' COLUMNS (
+              ord FOR ORDINALITY,
+              item JSON PATH '$',
+              source_table VARCHAR(64) PATH '$.source_table' NULL ON EMPTY,
+              label VARCHAR(64) PATH '$.label' NULL ON EMPTY,
+              source VARCHAR(128) PATH '$.source' NULL ON EMPTY,
+              type VARCHAR(64) PATH '$.type' NULL ON EMPTY,
+              body VARCHAR(512) PATH '$.body' NULL ON EMPTY
+            )) jt
+            WHERE COALESCE(jt.source_table, '') <> 'stock_period_rankings'
+              AND COALESCE(jt.label, '') <> '区间领头'
+              AND COALESCE(jt.type, '') <> 'period'
+              AND COALESCE(jt.source, '') NOT LIKE '%问财%'
+              AND COALESCE(jt.body, '') NOT LIKE '%问财%'
+            ORDER BY jt.ord
+          ) t
+        ), JSON_ARRAY()) AS items
+      FROM stock_root_evidence_cache rec
+      WHERE rec.trade_date={day}
+    ),
+    auction_ranked AS (
+      SELECT
+        MAX(COALESCE(ats.last_seen_minute, ats.generated_at)) OVER () AS event_time,
+        'auction' AS kind,
+        '竞价封单' AS kind_label,
+        ats.code,
+        ats.stock_name AS name,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(ats.last_seal_amount, 0) DESC, ats.final_candidate_rank ASC) AS sort_rank,
+        CONCAT(ats.stock_name, ' ', ats.code) AS title,
+        CONCAT(
+          IF(COALESCE(scp.company_highlights, '') <> '', CONCAT('【亮点】', scp.company_highlights, '；'), ''),
+          '涨停封单 ', ROUND(COALESCE(ats.last_seal_amount, 0) / 100000000, 2), '亿；',
+          '竞价涨幅 ', ROUND(COALESCE(ats.last_auction_pct, 0), 2), '%'
+        ) AS summary,
+        '' AS detail,
+        JSON_MERGE_PRESERVE(
+          IF(COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, '')) IS NOT NULL, JSON_ARRAY(JSON_OBJECT(
+              'layer', 'async',
+              'label', '有效事实总结',
+              'type', 'facts',
+              'source', '模型总结',
+              {auction_async_source}
+              'body', COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, '')),
+              'priority', 0
+            )), JSON_ARRAY()),
+          COALESCE(re.items, JSON_ARRAY())
+        ) AS evidence_items,
+        JSON_OBJECT() AS display_contract,
+        DATE_FORMAT(COALESCE(ats.last_seen_minute, ats.generated_at), '%Y-%m-%d %H:%i:%s') AS intraday_source_updated_at,
+        CAST('' AS CHAR) AS judgement_updated_at,
+        DATE_FORMAT(aes.updated_at, '%Y-%m-%d %H:%i:%s') AS async_evidence_updated_at,
+        CAST('' AS CHAR) AS period_rank_updated_at,
+        CAST('' AS CHAR) AS lhb_updated_at,
+        CAST('' AS CHAR) AS evidence_layer_updated_at,
+        DATE_FORMAT(COALESCE(ats.generated_at, ats.last_seen_minute), '%Y-%m-%d %H:%i:%s') AS latest_source_updated_at,
+        COALESCE(ats.last_seal_amount, 0) / 100000000 AS score,
+        COALESCE(ats.last_auction_pct, 0) AS change_pct,
+        0 AS speed_pct,
+        ROUND(COALESCE(ats.last_auction_amount, 0) / 100000000, 2) AS amount_yi,
+        JSON_MERGE_PRESERVE(
+          COALESCE(sht.tags, JSON_ARRAY()),
+          JSON_ARRAY(
+            CONCAT('封单:', ROUND(COALESCE(ats.last_seal_amount, 0) / 100000000, 2), '亿'),
+            CONCAT('竞价:', ROUND(COALESCE(ats.last_auction_pct, 0), 2), '%')
+          )
+        ) AS tags,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(ats.last_seal_amount, 0) DESC, ats.final_candidate_rank ASC) AS rn
+      FROM auction_trend_summary ats
+      LEFT JOIN stock_company_profiles scp ON scp.code = ats.code
+      LEFT JOIN stock_headline_themes sht ON sht.code = ats.code
+      LEFT JOIN async_evidence_summaries aes ON aes.trade_date={day} AND aes.code = ats.code
+        AND EXISTS (
+          SELECT 1 FROM stock_effective_facts ef WHERE ef.trade_date={day} AND ef.code=ats.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+        )
+      LEFT JOIN root_evidence re ON re.code = ats.code
+      WHERE ats.trade_date={day}
+        AND COALESCE(ats.limit_up_count, 0) > 0
+        AND COALESCE(ats.last_seal_amount, 0) > 0
+        AND COALESCE(ats.last_auction_pct, 0) >= 9.5
     ),
     scan_ranked AS (
       SELECT
@@ -1313,7 +2491,18 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
           COALESCE(NULLIF(smj.move_explanation, ''), NULLIF(aes.move_reason, ''), NULLIF(aes.final_view, ''), '')
         ) AS summary,
         '' AS detail,
-        JSON_ARRAY() AS evidence_items,
+        JSON_MERGE_PRESERVE(
+          IF(COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, '')) IS NOT NULL, JSON_ARRAY(JSON_OBJECT(
+              'layer', 'async',
+              'label', '有效事实总结',
+              'type', 'facts',
+              'source', '模型总结',
+              {scan_async_source}
+              'body', COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, '')),
+              'priority', 0
+            )), JSON_ARRAY()),
+          COALESCE(re.items, JSON_ARRAY())
+        ) AS evidence_items,
         JSON_OBJECT() AS display_contract,
         DATE_FORMAT(sr.scanned_at, '%Y-%m-%d %H:%i:%s') AS intraday_source_updated_at,
         DATE_FORMAT(smj.updated_at, '%Y-%m-%d %H:%i:%s') AS judgement_updated_at,
@@ -1325,22 +2514,25 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
           COALESCE(sr.scanned_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(smj.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(aes.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
-          COALESCE(rec.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
+          COALESCE(re.latest_updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
         ), '%Y-%m-%d %H:%i:%s') AS latest_source_updated_at,
         100 - sm.rank_speed AS score,
         COALESCE(sm.pct_change, 0) AS change_pct,
         COALESCE(sm.speed, 0) AS speed_pct,
         ROUND(COALESCE(sm.amount, 0) / 100000000, 2) AS amount_yi,
-        JSON_ARRAY(
+        JSON_MERGE_PRESERVE(
+          COALESCE(sht.tags, JSON_ARRAY()),
+          JSON_ARRAY(
+          CONCAT('研究池:', COALESCE(rp.source_rank_label, CONCAT('#', rp.source_rank))),
           CONCAT('扫描Top', sm.rank_speed),
-          CONCAT('锚点:', COALESCE(NULLIF(ssr.primary_anchor_name, ''), JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.original_primary_anchor')), '未锚定')),
-          IF(COALESCE(ssr.role_label, '') <> '', ssr.role_label, ''),
           CONCAT('同锚:', COALESCE(ssr.anchor_member_count, 0), '只'),
           IF(COALESCE(smj.sustainability_label, '') <> '', CONCAT('持续:', smj.sustainability_label, ROUND(smj.sustainability_score, 0), '分'), '')
+          )
         ) AS tags,
         ROW_NUMBER() OVER (PARTITION BY sr.id ORDER BY sm.rank_speed ASC) AS rn
       FROM recent_scan_runs sr
       JOIN scan_movers sm ON sm.scan_run_id = sr.id
+      JOIN research_pool rp ON rp.code = sm.code
       JOIN scan_stock_roles ssr ON ssr.scan_run_id = sr.id AND ssr.code = sm.code
       LEFT JOIN stock_company_profiles scp ON scp.code = sm.code
       LEFT JOIN stock_move_judgements smj ON smj.id = COALESCE(
@@ -1363,9 +2555,14 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
         )
       )
       LEFT JOIN async_evidence_summaries aes ON aes.trade_date={day} AND aes.code = sm.code
-      LEFT JOIN stock_root_evidence_cache rec ON rec.trade_date={day} AND rec.code = sm.code
+        AND EXISTS (
+          SELECT 1 FROM stock_effective_facts ef WHERE ef.trade_date={day} AND ef.code=sm.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+        )
+      LEFT JOIN root_evidence re ON re.code = sm.code
+      LEFT JOIN stock_headline_themes sht ON sht.code = sm.code
       WHERE sm.name NOT LIKE '%ST%'
         AND sm.name NOT LIKE '%退市%'
+        AND COALESCE(sm.speed, 0) >= 1.5
     ),
     window_ranked AS (
       SELECT
@@ -1381,7 +2578,18 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
           COALESCE(NULLIF(smj.move_explanation, ''), NULLIF(aes.move_reason, ''), NULLIF(el.community_main_claim, ''), NULLIF(el.hard_evidence_summary, ''), '')
         ) AS summary,
         '' AS detail,
-        JSON_ARRAY() AS evidence_items,
+        JSON_MERGE_PRESERVE(
+          IF(COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, '')) IS NOT NULL, JSON_ARRAY(JSON_OBJECT(
+              'layer', 'async',
+              'label', '有效事实总结',
+              'type', 'facts',
+              'source', '模型总结',
+              {window_async_source}
+              'body', COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, '')),
+              'priority', 0
+            )), JSON_ARRAY()),
+          COALESCE(re.items, JSON_ARRAY())
+        ) AS evidence_items,
         JSON_OBJECT() AS display_contract,
         DATE_FORMAT(rw.ended_at, '%Y-%m-%d %H:%i:%s') AS intraday_source_updated_at,
         DATE_FORMAT(smj.updated_at, '%Y-%m-%d %H:%i:%s') AS judgement_updated_at,
@@ -1394,22 +2602,25 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
           COALESCE(smj.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(aes.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
           COALESCE(el.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3))),
-          COALESCE(rec.updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
+          COALESCE(re.latest_updated_at, CAST('1000-01-01 00:00:00' AS DATETIME(3)))
         ), '%Y-%m-%d %H:%i:%s') AS latest_source_updated_at,
         wm.window_score AS score,
         COALESCE(wm.max_pct_change, wm.latest_pct_change, 0) AS change_pct,
         COALESCE(wm.max_speed, 0) AS speed_pct,
         ROUND(COALESCE(wm.amount, 0) / 100000000, 2) AS amount_yi,
-        JSON_ARRAY(
+        JSON_MERGE_PRESERVE(
+          COALESCE(sht.tags, JSON_ARRAY()),
+          JSON_ARRAY(
+          CONCAT('研究池:', COALESCE(rp.source_rank_label, CONCAT('#', rp.source_rank))),
           CONCAT('窗口Top', wm.rank_no),
-          CONCAT('锚点:', COALESCE(NULLIF(wsr.sector_key, ''), JSON_UNQUOTE(JSON_EXTRACT(smj.score_detail, '$.original_primary_anchor')), '未锚定')),
-          IF(COALESCE(wsr.role_label, '') <> '', wsr.role_label, ''),
           IF(COALESCE(smj.sustainability_label, '') <> '', CONCAT('持续:', smj.sustainability_label, ROUND(smj.sustainability_score, 0), '分'), ''),
           CONCAT('出现:', wm.appearance_count, '次')
+          )
         ) AS tags,
         ROW_NUMBER() OVER (PARTITION BY rw.id ORDER BY wm.rank_no ASC) AS rn
       FROM recent_windows rw
       JOIN window_movers wm ON wm.window_id = rw.id
+      JOIN research_pool rp ON rp.code = wm.code
       LEFT JOIN stock_company_profiles scp ON scp.code = wm.code
       LEFT JOIN window_stock_roles wsr ON wsr.window_id = rw.id AND wsr.code = wm.code
       LEFT JOIN evidence_layers el ON el.window_id = rw.id AND el.code = wm.code
@@ -1433,9 +2644,14 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
         )
       )
       LEFT JOIN async_evidence_summaries aes ON aes.trade_date={day} AND aes.code = wm.code
-      LEFT JOIN stock_root_evidence_cache rec ON rec.trade_date={day} AND rec.code = wm.code
+        AND EXISTS (
+          SELECT 1 FROM stock_effective_facts ef WHERE ef.trade_date={day} AND ef.code=wm.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+        )
+      LEFT JOIN root_evidence re ON re.code = wm.code
+      LEFT JOIN stock_headline_themes sht ON sht.code = wm.code
       WHERE wm.name NOT LIKE '%ST%'
         AND wm.name NOT LIKE '%退市%'
+        AND COALESCE(wm.max_speed, 0) >= 1.5
         AND wm.rank_no <= 5
     )
     SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
@@ -1444,6 +2660,7 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
       'kind_label', kind_label,
       'code', code,
       'name', name,
+      'sort_rank', sort_rank,
       'title', title,
       'summary', summary,
       'detail', detail,
@@ -1468,8 +2685,16 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
       SELECT event_time, kind, kind_label, code, name, sort_rank, title, summary, detail, evidence_items, display_contract,
         intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
         evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
+      FROM auction_ranked
+      WHERE rn <= 3
+
+      UNION ALL
+
+      SELECT event_time, kind, kind_label, code, name, sort_rank, title, summary, detail, evidence_items, display_contract,
+        intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
+        evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
       FROM scan_ranked
-      WHERE rn <= 5
+      WHERE rn <= 9999
 
       UNION ALL
 
@@ -1477,11 +2702,12 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
         intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
         evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
       FROM window_ranked
-      WHERE rn <= 5
+      WHERE rn <= 9999
 
-      ORDER BY event_time DESC,
-        CASE kind WHEN 'scan' THEN 2 WHEN 'window' THEN 1 ELSE 0 END DESC,
+      ORDER BY CASE kind WHEN 'window' THEN 3 WHEN 'auction' THEN 2 WHEN 'scan' THEN 1 ELSE 0 END DESC,
+        CASE kind WHEN 'window' THEN sort_rank ELSE 0 END ASC,
+        CASE kind WHEN 'auction' THEN sort_rank ELSE 0 END ASC,
+        event_time DESC,
         score DESC
     ) feed;
     """
-

@@ -55,12 +55,29 @@
       "tier": "cold",
       "enabled": true,
       "scope": "all_sh_sz_a_exclude_st_delisted",
-      "refresh_mode": "nightly_full_batch",
+      "refresh_mode": "daily_research_pool_incremental_pipeline",
       "refresh_interval_seconds": 86400,
-      "preferred_start_time": "22:00:00",
+      "preferred_start_time": "18:00:00",
       "batch_size": 100,
-      "sources": ["ths_root_important_event", "ths_root_announcement", "ths_theme_key_points"],
+      "sources": ["ths_root_important_event"],
       "cache_json": "data/stock/cache/official_site_evidence_cache.json"
+    },
+    "daily_root_evidence_pipeline": {
+      "tier": "warm",
+      "enabled": true,
+      "scope": "research_pool",
+      "refresh_mode": "daily_after_close_once",
+      "preferred_start_time": "18:00:00",
+      "refresh_interval_seconds": 86400,
+      "steps": [
+        "research_pool_snapshot",
+        "ths_root_important_event_incremental",
+        "research_pool_theme_members",
+        "headline_theme_role_evidence",
+        "effective_facts",
+        "async_evidence_summary_once",
+        "root_evidence_cache"
+      ]
     },
     "morning_market_news": {
       "tier": "warm",

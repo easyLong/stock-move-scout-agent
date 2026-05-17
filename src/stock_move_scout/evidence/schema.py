@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 
-SUMMARY_VERSION = 4
+SUMMARY_VERSION = 5
 
 
 SUMMARY_SCHEMA: dict[str, Any] = {
@@ -106,8 +106,14 @@ SUMMARY_SCHEMA: dict[str, Any] = {
 
 
 def evidence_hash(payload: dict[str, Any]) -> str:
+    hash_payload = payload
+    if isinstance(payload.get("current_facts"), list):
+        hash_payload = {
+            "code": payload.get("code"),
+            "current_facts": payload.get("current_facts"),
+        }
     raw = json.dumps(
-        {"summary_version": SUMMARY_VERSION, "payload": payload},
+        {"summary_version": SUMMARY_VERSION, "payload": hash_payload},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

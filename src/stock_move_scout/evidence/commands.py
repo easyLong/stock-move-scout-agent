@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Any
 
 
+def _research_pool_only(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("research_pool_only"))
+
+
 def build_evidence_command(
     *,
     kind: str,
@@ -45,6 +49,8 @@ def build_evidence_command(
             command.append("--sync-dirty")
         if payload.get("dirty_only"):
             command.append("--dirty-only")
+        if _research_pool_only(payload):
+            command.append("--research-pool-only")
         return command + mysql_args
 
     if kind == "root_evidence_cache_dirty":
@@ -59,6 +65,8 @@ def build_evidence_command(
         ]
         if payload.get("code"):
             command.extend(["--code", str(payload.get("code"))])
+        if _research_pool_only(payload):
+            command.append("--research-pool-only")
         return command + mysql_args
 
     if kind in {"stock_move_events", "derived_signals", "stock_move_evidence", "event_engine"}:

@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Any
 
 
+def _research_pool_only(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("research_pool_only"))
+
+
 def build_judgement_command(
     *,
     kind: str,
@@ -35,6 +39,8 @@ def build_judgement_command(
             command.append("--latest-only")
         if payload.get("dirty_only"):
             command.append("--dirty-only")
+        if _research_pool_only(payload):
+            command.append("--research-pool-only")
         return command + mysql_args
 
     return None

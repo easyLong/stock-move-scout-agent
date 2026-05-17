@@ -7,31 +7,31 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 
-EVIDENCE_VIEW_VERSION = 5
+EVIDENCE_VIEW_VERSION = 8
 
-CURRENT_GROUPS = {"current_effective", "post_close_confirm"}
-BACKGROUND_SOURCE_TABLES = {"stock_theme_reason_bank", "stock_company_profiles"}
-AFTER_CLOSE_SOURCE_TABLES = {"stock_period_rankings", "stock_lhb_seat_evidence", "ths_limit_up_review_items"}
+CURRENT_GROUPS = {"current_effective"}
+VISIBLE_GROUPS = ("model_summary", "current_effective", "post_close_confirm", "background_fact", "historical_tag", "unknown")
+BACKGROUND_SOURCE_TABLES = {"ths_stock_concept_explanations", "stock_company_profiles"}
+AFTER_CLOSE_SOURCE_TABLES: set[str] = set()
 INTRADAY_SOURCE_TABLES = {"scan_runs", "scan_movers", "scan_stock_roles", "windows", "window_movers", "window_stock_roles"}
-DECISION_TYPES = {
-    "facts", "move", "quality", "period", "initiative", "influence", "lhb", "anchor",
-    "support", "counter", "final", "timeliness", "flaw", "gap", "core", "impact",
-    "summary", "realtime", "announcement", "event",
+MODEL_SOURCE_TABLES = {"async_evidence_summaries"}
+HIDDEN_STATUSES = {"invalid"}
+STALE_STATUSES = {"expired", "historical"}
+
+LAYER_META: dict[str, tuple[str, str, str]] = {
+    "model_summary": ("有效事实总结", "只基于至今仍有效的事实生成；没有有效事实不会生成本层", "model-summary"),
+    "current_effective": ("今日有效", "盘中已经能直接解释今日异动的触发、硬催化和判断结果", "current-effective"),
+    "post_close_confirm": ("盘后确认", "龙虎榜、涨停池、盘后市场背景等盘后或上一交易日确认材料", "after-close"),
+    "background_fact": ("辅助背景", "题材归因、公司画像和长期事实，只辅助理解，不直接解释今日异动", "background-fact"),
+    "historical_tag": ("历史/失效", "已验证但时效走弱、价格影响消退或仅作历史标签保留", "historical-tag"),
+    "unknown": ("待核来源", "模型旧摘要或缺少明确有效性标记的材料，默认折叠", "async"),
 }
 
-LAYER_META = {
-    "current_effective": ("当前有效证据", "盘中已经能直接用于判断的触发、硬催化和模型结论", "current-effective"),
-    "post_close_confirm": ("盘后确认", "问财排名、龙虎榜、涨停复盘等盘后或上一交易日确认材料", "after-close"),
-    "background_fact": ("背景事实", "题材归因、公司画像和可读背景，只做辅助理解", "background-fact"),
-    "historical_tag": ("历史标签", "已验证但时效走弱、过期或仅作为历史标签保留", "historical-tag"),
-    "unknown": ("待核来源", "缺少明确来源或分层标记", "async"),
-}
-
-TYPE_META = {
-    "facts": ("关键事实", "stock", "事实卡", 0, 120, 3),
+TYPE_META: dict[str, tuple[str, str, str, int, int, int]] = {
+    "facts": ("有效事实总结", "stock", "事实卡", 0, 120, 3),
     "move": ("异动解释", "summary", "模型解释", 1, 100, 1),
     "quality": ("异动质量", "event", "模型判断", 2, 100, 1),
-    "period": ("区间领头", "theme", "问财区间排名", 3, 120, 3),
+    "period": ("区间领头", "theme", "研究池区间结构", 3, 120, 3),
     "initiative": ("主动性", "theme", "扫描触发", 3, 120, 3),
     "influence": ("带动性", "event", "同锚扩散", 4, 140, 8),
     "lhb": ("龙虎榜席位", "event", "东方财富龙虎榜", 3, 130, 4),
@@ -54,6 +54,7 @@ TYPE_META = {
 
 LABEL_TYPE = {
     "关键事实": "facts",
+    "有效事实总结": "facts",
     "异动解释": "move",
     "异动质量": "quality",
     "区间领头": "period",
@@ -76,11 +77,16 @@ LABEL_TYPE = {
     "题材背景": "theme",
     "题材": "theme",
     "个股证据": "stock",
-    "公告": "announcement",
     "当前硬催化": "announcement",
+    "公告": "announcement",
     "历史标签": "event",
     "事件": "event",
 }
+
+HARD_TYPES = {"announcement", "impact", "core"}
+STRUCTURE_TYPES = {"period", "lhb", "initiative", "influence", "support", "stock", "theme"}
+DECISION_TYPES = HARD_TYPES | STRUCTURE_TYPES | {"facts", "move", "quality", "anchor", "final", "timeliness", "flaw", "gap", "summary"}
+HARD_KEYWORDS = re.compile(r"净利|营收|同比|订单|合同|中标|客户|供货|公告|互动易|财报|季报|年报|龙虎榜|机构|股通|游资|锚点内")
 
 
 def clean(value: Any) -> str:
@@ -106,14 +112,13 @@ def parse_json_array(value: Any) -> list[Any]:
 
 def parse_date(value: Any) -> date | None:
     text = clean(value)
-    for pattern in (r"(\d{4})-(\d{1,2})-(\d{1,2})", r"(\d{4})年(\d{1,2})月(\d{1,2})日"):
-        match = re.search(pattern, text)
-        if match:
-            try:
-                return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-            except ValueError:
-                return None
-    return None
+    match = re.search(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})", text)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
 
 
 def parse_datetime(value: Any) -> datetime | None:
@@ -145,28 +150,50 @@ def meta_for(label: str, evidence_type: str) -> tuple[str, str, str, int, int, i
     return TYPE_META.get(type_for(label, evidence_type), TYPE_META["event"])
 
 
+def payload_dict(item: dict[str, Any]) -> dict[str, Any]:
+    payload = item.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
 def normalize_item(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         text = clean(raw)
         return {"label": "事件", "type": "event", "source": "文本", "body": text, "priority": 100} if text else {}
+
     item = dict(raw)
+    payload = payload_dict(item)
     label = clean(item.get("label"))
     evidence_type = type_for(label, clean(item.get("type")))
     meta = meta_for(label, evidence_type)
+
     item["type"] = evidence_type
     item["label"] = label or meta[0]
     item["source"] = clean(item.get("source")) or meta[2]
     item["body"] = clean(item.get("body") or item.get("text") or item.get("summary") or item.get("reason"))
-    item["source_table"] = clean(item.get("source_table"))
-    item["source_key"] = clean(item.get("source_key"))
-    item["evidence_group"] = clean(item.get("evidence_group"))
-    item["display_level"] = clean(item.get("display_level"))
-    item["valid_status"] = clean(item.get("valid_status"))
-    item["availability"] = clean(item.get("availability"))
-    item["freshness"] = clean(item.get("freshness"))
-    item["data_date"] = clean(item.get("data_date") or item.get("evidence_date") or item.get("source_date"))
-    item["evidence_date"] = clean(item.get("evidence_date") or item.get("data_date") or item.get("source_date"))
+
+    for key in (
+        "source_table",
+        "source_key",
+        "source_confidence",
+        "evidence_group",
+        "evidence_role",
+        "display_level",
+        "valid_status",
+        "availability",
+        "freshness",
+        "source_generation",
+        "valid_reason",
+    ):
+        item[key] = clean(item.get(key) or payload.get(key))
+
+    item["data_date"] = clean(item.get("data_date") or item.get("evidence_date") or item.get("source_date") or payload.get("fact_date"))
+    item["evidence_date"] = clean(item.get("evidence_date") or item.get("data_date") or item.get("source_date") or payload.get("fact_date"))
     item["updated_at"] = clean(item.get("updated_at") or item.get("collected_at") or item.get("summarized_at"))
+    item["source_registry"] = item.get("source_registry") if isinstance(item.get("source_registry"), dict) else {}
+    try:
+        item["valid_score"] = float(item.get("valid_score") or payload.get("valid_score") or 0)
+    except Exception:
+        item["valid_score"] = 0.0
     try:
         item["priority"] = int(float(item.get("priority", meta[3])))
     except Exception:
@@ -176,22 +203,28 @@ def normalize_item(raw: Any) -> dict[str, Any]:
 
 def infer_group(item: dict[str, Any]) -> str:
     explicit = clean(item.get("evidence_group"))
-    if explicit in LAYER_META:
+    if explicit in VISIBLE_GROUPS or explicit == "hidden":
         return explicit
+
     source_table = clean(item.get("source_table"))
     valid_status = clean(item.get("valid_status"))
     display_level = clean(item.get("display_level"))
     freshness = clean(item.get("freshness"))
     availability = clean(item.get("availability"))
     evidence_type = clean(item.get("type"))
-    if valid_status in {"expired", "historical", "invalid"} or freshness == "historical":
+
+    if valid_status in HIDDEN_STATUSES or display_level == "hidden":
+        return "hidden"
+    if valid_status in STALE_STATUSES or freshness == "historical":
         return "historical_tag"
     if source_table in BACKGROUND_SOURCE_TABLES or display_level == "background":
         return "background_fact"
     if source_table in AFTER_CLOSE_SOURCE_TABLES or availability == "after_close_confirm":
         return "post_close_confirm"
-    if source_table in INTRADAY_SOURCE_TABLES or availability in {"intraday", "cached_readable", "async_supplement"}:
+    if source_table in INTRADAY_SOURCE_TABLES or availability == "intraday":
         return "current_effective"
+    if source_table in MODEL_SOURCE_TABLES or availability == "async_supplement":
+        return "model_summary"
     if evidence_type in {"theme", "stock"}:
         return "background_fact"
     return "unknown"
@@ -202,12 +235,15 @@ def enrich_item(item: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
     group = infer_group(enriched)
     enriched["evidence_group"] = group
     if not enriched.get("availability"):
-        if group == "post_close_confirm":
+        if group == "current_effective":
+            enriched["availability"] = "intraday"
+        elif group == "post_close_confirm":
             enriched["availability"] = "after_close_confirm"
         elif group in {"background_fact", "historical_tag"}:
             enriched["availability"] = "cached_readable"
         else:
-            enriched["availability"] = "intraday" if clean(enriched.get("source_table")) in INTRADAY_SOURCE_TABLES else "cached_readable"
+            enriched["availability"] = "async_supplement"
+
     row_date = event_date(row)
     data_date = parse_date(enriched.get("data_date") or enriched.get("evidence_date"))
     if group == "background_fact":
@@ -231,7 +267,14 @@ def dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for item in items:
-        key = "|".join([clean(item.get("source_table")), clean(item.get("source_key")), clean(item.get("label")), clean(item.get("body"))[:80]])
+        key = "|".join(
+            [
+                clean(item.get("source_table")),
+                clean(item.get("source_key")),
+                clean(item.get("label")),
+                clean(item.get("body"))[:80],
+            ]
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -239,21 +282,39 @@ def dedupe_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def is_deprecated_rank_item(item: dict[str, Any]) -> bool:
+    label = clean(item.get("label"))
+    evidence_type = clean(item.get("type"))
+    source = clean(item.get("source"))
+    source_table = clean(item.get("source_table"))
+    body = clean(item.get("body"))
+    return (
+        source_table == "stock_period_rankings"
+        or evidence_type == "period"
+        or label == "区间领头"
+        or "问财" in source
+        or "问财" in body
+    )
+
+
 def evidence_items(row: dict[str, Any]) -> list[dict[str, Any]]:
     items = [normalize_item(raw) for raw in parse_json_array(row.get("evidence_items"))]
-    return [enrich_item(item, row) for item in dedupe_items([item for item in items if item])]
+    enriched = [enrich_item(item, row) for item in dedupe_items([item for item in items if item])]
+    return [item for item in enriched if item.get("evidence_group") != "hidden" and not is_deprecated_rank_item(item)]
 
 
 def decision_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out = []
+    out: list[dict[str, Any]] = []
     for item in items:
         if infer_group(item) not in CURRENT_GROUPS:
             continue
-        if clean(item.get("source_table")) in BACKGROUND_SOURCE_TABLES:
+        if clean(item.get("source_table")) in BACKGROUND_SOURCE_TABLES | MODEL_SOURCE_TABLES:
             continue
-        if clean(item.get("display_level")) == "background":
+        if clean(item.get("display_level")) in {"background", "hidden"}:
             continue
-        if clean(item.get("valid_status")) in {"expired", "historical", "invalid"}:
+        if clean(item.get("valid_status")) in STALE_STATUSES | HIDDEN_STATUSES:
+            continue
+        if clean(item.get("label")) == "实时判断":
             continue
         if clean(item.get("type")) not in DECISION_TYPES:
             continue
@@ -267,7 +328,7 @@ def item_priority(item: dict[str, Any]) -> int:
 
 def concise_body(item: dict[str, Any]) -> str:
     meta = meta_for(clean(item.get("label")), clean(item.get("type")))
-    lines = []
+    lines: list[str] = []
     for line in str(item.get("body") or "").splitlines():
         text = clean(line)
         if text and text not in lines:
@@ -278,7 +339,9 @@ def concise_body(item: dict[str, Any]) -> str:
 
 
 def prepare_sections(items: list[dict[str, Any]], group_id: str) -> list[dict[str, Any]]:
-    limits = {"current_effective": 7, "post_close_confirm": 6, "background_fact": 3, "historical_tag": 3, "unknown": 3}
+    limits = {"model_summary": 4, "current_effective": 8, "post_close_confirm": 6, "background_fact": 4, "historical_tag": 3, "unknown": 3}
+    if group_id == "current_effective" and any(clean(item.get("label")) == "头条题材角色" for item in items):
+        items = [item for item in items if clean(item.get("label")) != "领涨中军"]
     sections: list[dict[str, Any]] = []
     for item in sorted(items, key=lambda value: (item_priority(value), -float(value.get("valid_score") or 0))):
         body = concise_body(item)
@@ -286,7 +349,8 @@ def prepare_sections(items: list[dict[str, Any]], group_id: str) -> list[dict[st
             continue
         section = dict(item)
         section["body"] = body
-        if group_id in {"background_fact", "historical_tag"}:
+        section["is_decision_candidate"] = group_id in CURRENT_GROUPS and clean(section.get("display_level")) != "background"
+        if group_id in {"background_fact", "historical_tag", "unknown"}:
             section["collapsed"] = True
         sections.append(section)
         if len(sections) >= limits.get(group_id, 5):
@@ -304,8 +368,18 @@ def first_line(item: dict[str, Any] | None, limit: int = 96) -> str:
     return ""
 
 
+def first_matching(items: list[dict[str, Any]], types: set[str], pattern: re.Pattern[str] | None = None) -> dict[str, Any] | None:
+    for item in sorted(items, key=item_priority):
+        if clean(item.get("type")) not in types:
+            continue
+        if pattern and not pattern.search(clean(item.get("body"))):
+            continue
+        return item
+    return None
+
+
 def summary_facts(items: list[dict[str, Any]]) -> list[str]:
-    facts = []
+    facts: list[str] = []
     for item in sorted(items, key=item_priority):
         text = first_line(item, 92)
         if text and not any(text in old or old in text for old in facts):
@@ -315,11 +389,11 @@ def summary_facts(items: list[dict[str, Any]]) -> list[str]:
     return facts
 
 
-def evidence_level(items: list[dict[str, Any]], row: dict[str, Any]) -> dict[str, str]:
-    if any(clean(item.get("type")) in {"impact", "core", "move", "announcement"} for item in items):
-        return {"level": "强", "level_class": "strong", "basis": "当前/盘后确认证据，不含背景和历史标签"}
-    if any(clean(item.get("type")) in {"period", "lhb", "initiative", "influence", "support"} for item in items):
-        return {"level": "中", "level_class": "", "basis": "当前/盘后结构证据，不含背景和历史标签"}
+def evidence_level(items: list[dict[str, Any]]) -> dict[str, str]:
+    if any(clean(item.get("type")) in HARD_TYPES for item in items):
+        return {"level": "强", "level_class": "strong", "basis": "只统计今日有效和盘后确认，不统计背景、历史和待核来源"}
+    if any(clean(item.get("type")) in STRUCTURE_TYPES | {"move", "final", "facts"} for item in items):
+        return {"level": "中", "level_class": "", "basis": "只统计今日有效和盘后确认，不统计背景、历史和待核来源"}
     return {"level": "待补全", "level_class": "weak", "basis": "缺少可解释今日异动的有效证据"}
 
 
@@ -327,12 +401,12 @@ def build_summary(items: list[dict[str, Any]], row: dict[str, Any]) -> dict[str,
     scoped = decision_items(items)
     by_type = {clean(item.get("type")): item for item in scoped}
     by_label = {clean(item.get("label")): item for item in scoped}
-    level = evidence_level(scoped, row)
+    level = evidence_level(scoped)
     reason = first_line(by_type.get("move") or by_type.get("final") or by_type.get("impact"), 90)
+    hard = first_matching(scoped, HARD_TYPES, HARD_KEYWORDS) or first_matching(scoped, HARD_TYPES)
+    funds = by_type.get("lhb") or by_label.get("龙虎榜席位")
+    strength = by_type.get("period") or by_type.get("initiative") or by_label.get("区间领头")
     influence = by_type.get("influence") or by_label.get("带动性")
-    initiative = by_type.get("initiative") or by_label.get("主动性")
-    sustain = by_type.get("support") or by_label.get("持续依据") or by_type.get("period")
-    flaw = first_line(by_type.get("flaw") or by_label.get("最大瑕疵"), 90)
     gap = first_line(by_type.get("gap") or by_label.get("证据缺口"), 90)
     if level["level"] == "待补全" and not gap:
         gap = "建议补充：当天公告、互动易、行业消息、同题材扩散或模型归因"
@@ -342,13 +416,14 @@ def build_summary(items: list[dict[str, Any]], row: dict[str, Any]) -> dict[str,
         "level_class": level["level_class"],
         "reason": reason,
         "cards": [
-            {"label": "持续性", "value": first_line(sustain) or level["level"], "tone": ""},
-            {"label": "带动性", "value": first_line(influence), "tone": ""},
-            {"label": "主动性", "value": first_line(initiative), "tone": ""},
+            {"label": "硬证据", "value": first_line(hard, 86), "tone": "good" if hard else ""},
+            {"label": "资金确认", "value": first_line(funds, 86), "tone": "hot" if funds else ""},
+            {"label": "强度位置", "value": first_line(strength, 86), "tone": "rank" if strength else ""},
+            {"label": "带动性", "value": first_line(influence, 86), "tone": ""},
         ],
         "chips": [],
         "facts": summary_facts(scoped),
-        "flaw": flaw,
+        "flaw": first_line(by_type.get("flaw") or by_label.get("最大瑕疵"), 90),
         "gap": gap,
         "basis": level["basis"],
     }
@@ -365,6 +440,9 @@ def source_tokens(items: list[dict[str, Any]]) -> list[dict[str, str]]:
             "source_confidence": clean(item.get("source_confidence")),
             "label": clean(item.get("label")),
             "availability": clean(item.get("availability")),
+            "evidence_group": clean(item.get("evidence_group")),
+            "valid_status": clean(item.get("valid_status")),
+            "display_level": clean(item.get("display_level")),
             "data_date": clean(item.get("data_date") or item.get("evidence_date")),
             "updated_at": clean(item.get("updated_at")),
             "updated_token": token,
@@ -393,7 +471,7 @@ def build_evidence_view(row: dict[str, Any]) -> dict[str, Any]:
     items = evidence_items(row)
     tokens = source_tokens(items)
     layers = []
-    for group_id in ("current_effective", "post_close_confirm", "background_fact", "historical_tag", "unknown"):
+    for group_id in VISIBLE_GROUPS:
         group_items = [item for item in items if infer_group(item) == group_id]
         sections = prepare_sections(group_items, group_id)
         if not sections:

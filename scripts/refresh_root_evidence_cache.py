@@ -14,6 +14,7 @@ from stock_move_scout.feed.root_cache import (
     process_root_evidence_cache_dirty,
     refresh_root_evidence_cache,
 )
+from stock_move_scout.research_pool import ResearchPoolProvider
 
 from stock_scout_mysql import add_mysql_args, mysql_config_from_args
 
@@ -25,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--dirty-only", action="store_true", help="Only process dirty queue rows.")
     parser.add_argument("--force", action="store_true", help="Force refresh cache for the requested scope.")
+    parser.add_argument("--research-pool-only", dest="research_pool_only", action="store_true", help="Only process active research pool stocks.")
     add_mysql_args(parser)
     return parser.parse_args()
 
@@ -39,10 +41,17 @@ def main() -> int:
     ensure_root_evidence_cache_table(config)
     trade_date = latest_root_evidence_trade_date(config) if args.trade_date == "latest" else args.trade_date
     result: dict[str, int | str] = {"trade_date": trade_date}
+    research_codes = None
+    if args.research_pool_only and not args.code:
+        research_codes = ResearchPoolProvider(config).latest_codes(trade_date)
+    if args.research_pool_only and not args.code and not research_codes:
+        result.update({"effective_dirty": 0, "effective_rebuilt": 0, "effective_failed": 0, "dirty": 0, "refreshed": 0, "failed": 0})
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if args.dirty_only:
-        result.update(process_root_evidence_cache_dirty(config, trade_date, args.limit, args.code))
+        result.update(process_root_evidence_cache_dirty(config, trade_date, args.limit, args.code, research_codes))
     else:
-        codes = [args.code] if args.code else None
+        codes = [args.code] if args.code else (research_codes if args.research_pool_only else None)
         result.update(refresh_root_evidence_cache(config, trade_date, codes=codes, force=args.force))
     print(json.dumps(result, ensure_ascii=False))
     return 0

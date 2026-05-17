@@ -18,6 +18,7 @@ from stock_scout_mysql import (
     sql_number,
     sql_string,
 )
+from stock_move_scout.research_pool import ResearchPoolProvider
 
 
 API_URL = "https://basic.10jqka.com.cn/fuyao/f10_stock_index/concept/v1/stock_concept_list"
@@ -44,13 +45,33 @@ def market_id_for(code: str, market: str = "") -> str:
     return "33"
 
 
-def load_universe(config: MySqlConfig, offset: int, limit: int, code: str = "") -> list[dict[str, str]]:
+def load_universe(
+    config: MySqlConfig,
+    offset: int,
+    limit: int,
+    code: str = "",
+    codes: list[str] | None = None,
+) -> list[dict[str, str]]:
     if code:
         sql = f"""
         SELECT code, name, market
         FROM stocks
         WHERE code={sql_string(code)}
         LIMIT 1;
+        """
+    elif codes is not None:
+        clean_codes = sorted({str(item or "").strip() for item in codes if str(item or "").strip()})
+        if not clean_codes:
+            return []
+        sql = f"""
+        SELECT code, name, market
+        FROM stocks
+        WHERE code IN ({','.join(sql_string(item) for item in clean_codes)})
+          AND COALESCE(is_st, 0)=0
+          AND name NOT LIKE '%退市%'
+          AND name NOT LIKE '%ST%'
+        ORDER BY FIELD(code, {','.join(sql_string(item) for item in clean_codes)})
+        LIMIT {int(limit)} OFFSET {int(offset)};
         """
     else:
         sql = f"""
@@ -207,9 +228,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code", default="", help="Collect one stock code only.")
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--trade-date", default=datetime.now().date().isoformat())
     parser.add_argument("--timeout", type=int, default=10)
     parser.add_argument("--pause", type=float, default=0.08)
     parser.add_argument("--chunk-size", type=int, default=300)
+    parser.add_argument("--research-pool-only", dest="research_pool_only", action="store_true", help="Only collect active research pool stocks.")
     add_mysql_args(parser)
     return parser.parse_args()
 
@@ -217,7 +240,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = mysql_config_from_args(args)
-    stocks = load_universe(config, args.offset, args.limit, args.code.strip())
+    pool_codes = None
+    if args.research_pool_only and not args.code.strip():
+        pool_codes = ResearchPoolProvider(config).latest_codes(str(args.trade_date))
+    stocks = load_universe(config, args.offset, args.limit, args.code.strip(), pool_codes)
     rows: list[dict[str, Any]] = []
     status_counts: dict[str, int] = {}
     ok_codes: list[str] = []

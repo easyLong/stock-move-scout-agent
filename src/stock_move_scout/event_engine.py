@@ -169,8 +169,7 @@ def build_move_events(config: MySqlConfig, trade_date: str, *, limit: int = 0, c
         AND sm.name NOT LIKE '%退市%'
         AND (
           sm.rank_speed <= 20
-          OR COALESCE(sm.speed, 0) >= 1
-          OR COALESCE(sm.amount_delta_15s, 0) >= 30000000
+          OR COALESCE(sm.speed, 0) >= 1.5
         )
         {code_filter_scan}
       ORDER BY sr.scanned_at DESC, sm.rank_speed ASC

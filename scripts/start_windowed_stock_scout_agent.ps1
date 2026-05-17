@@ -1,7 +1,7 @@
 param(
     [switch]$MysqlEnabled = $true,
     [string]$MysqlUser = "root",
-    [string]$MysqlPassword = $env:MYSQL_PWD,
+    [string]$MysqlPassword = $(if ($env:MYSQL_PWD) { $env:MYSQL_PWD } else { "123456" }),
     [string]$MysqlHost = "127.0.0.1",
     [int]$MysqlPort = 3306
 )
@@ -38,13 +38,17 @@ if (Test-Path $pidPath) {
 
 $script = Join-Path $root "scripts\windowed_stock_scout_agent.py"
 $args = @(
+    "-u",
     $script,
-    "--scan-interval", "15",
-    "--window-seconds", "300",
-    "--scan-top", "20",
-    "--min-speed-signal", "1.0",
-    "--min-amount-delta-15s", "30000000",
-    "--min-amount-delta-speed", "0.5",
+    "--scan-interval", "5",
+    "--window-seconds", "30",
+    "--emit-interval", "15",
+    "--scan-top", "50",
+    "--min-speed-signal", "1.5",
+    "--min-single-speed", "1.8",
+    "--min-15s-speed", "1.5",
+    "--opening-warmup-seconds", "30",
+    "--stop-new-windows-before-close-seconds", "60",
     "--aggregate-top", "5",
     "--evidence-top", "5",
     "--min-evidence-pct-change", "0",
@@ -55,6 +59,7 @@ $args = @(
     "--community-verify-retries", "0",
     "--community-bridge-timeout", "40",
     "--mysql-primary",
+    "--research-pool-only",
     "--no-file-output"
 )
 

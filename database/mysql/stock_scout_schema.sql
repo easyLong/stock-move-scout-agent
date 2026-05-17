@@ -62,15 +62,16 @@ CREATE TABLE IF NOT EXISTS stock_ths_root_items (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   code CHAR(6) NOT NULL COMMENT 'A股代码',
   stock_name VARCHAR(64) NOT NULL DEFAULT '',
-  item_kind ENUM('important_event','hot_news','announcement','theme_point','other') NOT NULL DEFAULT 'other',
+  item_kind ENUM('important_event') NOT NULL DEFAULT 'important_event',
   item_key VARCHAR(64) NOT NULL COMMENT '采集端生成的去重key，建议sha1(kind/date/title/url/content)',
-  source_section VARCHAR(64) NOT NULL DEFAULT '' COMMENT '页面区块，如 #news/theme_key_points/event',
+  source_section VARCHAR(64) NOT NULL DEFAULT '' COMMENT '页面区块，如 #pointnew',
   source_rank INT NOT NULL DEFAULT 0 COMMENT '页面内顺序',
-  item_date DATE NULL COMMENT '新闻/公告发布日期、事件日期或题材要点update_date',
+  item_date DATE NULL COMMENT '重要事件日期',
   title VARCHAR(512) NOT NULL DEFAULT '',
   content MEDIUMTEXT NULL,
+  detail_content MEDIUMTEXT NULL COMMENT '重要事件展开详情',
   url VARCHAR(1024) NOT NULL DEFAULT '',
-  tags JSON NULL COMMENT '题材、公告类型、事件类型等标签',
+  tags JSON NULL COMMENT '重要事件标签',
   importance TINYINT NOT NULL DEFAULT 0 COMMENT '预留：0未知，1低，2中，3高',
   source_status VARCHAR(255) NOT NULL DEFAULT '',
   raw_json JSON NULL,
@@ -84,7 +85,55 @@ CREATE TABLE IF NOT EXISTS stock_ths_root_items (
   CONSTRAINT fk_ths_root_items_stock
     FOREIGN KEY (code) REFERENCES stocks(code)
     ON DELETE CASCADE
-) ENGINE=InnoDB COMMENT='同花顺F10根页面多条信息：重要事件、新闻公告、题材要点';
+) ENGINE=InnoDB COMMENT='同花顺F10根页面重要事件';
+
+CREATE TABLE IF NOT EXISTS stock_effective_fact_rules (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  rule_group VARCHAR(64) NOT NULL,
+  rule_type VARCHAR(64) NOT NULL,
+  pattern VARCHAR(512) NOT NULL,
+  enabled TINYINT NOT NULL DEFAULT 1,
+  note VARCHAR(255) NOT NULL DEFAULT '',
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_effective_fact_rule (rule_group, rule_type, pattern),
+  KEY idx_effective_fact_rule_lookup (rule_group, rule_type, enabled)
+) ENGINE=InnoDB COMMENT='有效事实过滤规则：龙虎榜强规则、低价值标题过滤等';
+
+CREATE OR REPLACE VIEW stock_current_effective_facts_view AS
+SELECT
+  i.code,
+  i.stock_name,
+  'stock_ths_root_items' AS source_table,
+  CONCAT('stock_ths_root_items:', i.id) AS source_key,
+  'important_event' AS fact_type,
+  COALESCE(JSON_UNQUOTE(JSON_EXTRACT(i.tags, '$[0]')), '') AS fact_subtype,
+  i.title AS fact_title,
+  LEFT(
+    CONCAT_WS(' ',
+      COALESCE(NULLIF(i.content, ''), i.title),
+      NULLIF(i.detail_content, '')
+    ),
+    1200
+  ) AS fact_body,
+  i.item_date AS fact_date,
+  i.item_date AS valid_from,
+  DATE_ADD(i.item_date, INTERVAL 10 DAY) AS valid_until,
+  JSON_OBJECT(
+    'root_item_id', i.id,
+    'item_key', i.item_key,
+    'source_section', i.source_section,
+    'source_rank', i.source_rank,
+    'url', i.url,
+    'detail_content', COALESCE(i.detail_content, ''),
+    'tags', COALESCE(i.tags, JSON_ARRAY()),
+    'raw_json', COALESCE(i.raw_json, JSON_OBJECT()),
+    'rule', 'recent_important_event_10d'
+  ) AS payload
+FROM stock_ths_root_items i
+WHERE i.item_kind='important_event'
+  AND i.item_date IS NOT NULL
+  AND NOT (COALESCE(i.title, '') REGEXP '^融资融券$|^发布公告$|^投资互动$|^股东人数变化$|^股东大会$|^分配预案$|^实施分红$|^异动提醒$|^大宗交易$');
 
 CREATE TABLE IF NOT EXISTS stock_daily_bars (
   code CHAR(6) NOT NULL,
@@ -105,45 +154,6 @@ CREATE TABLE IF NOT EXISTS stock_daily_bars (
   KEY idx_stock_daily_bars_day (trade_date),
   KEY idx_stock_daily_bars_code_day (code, trade_date)
 ) ENGINE=InnoDB COMMENT='Daily stock bars for derived evidence validation';
-
-CREATE TABLE IF NOT EXISTS stock_announcement_effects (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  code CHAR(6) NOT NULL,
-  stock_name VARCHAR(64) NOT NULL DEFAULT '',
-  root_item_id BIGINT UNSIGNED NOT NULL,
-  event_key VARCHAR(96) NOT NULL,
-  event_date DATE NOT NULL,
-  event_type VARCHAR(32) NOT NULL DEFAULT '',
-  event_subtype VARCHAR(64) NOT NULL DEFAULT '',
-  title VARCHAR(512) NOT NULL DEFAULT '',
-  summary TEXT NULL,
-  tag VARCHAR(64) NOT NULL DEFAULT '',
-  base_trade_date DATE NULL,
-  base_close DECIMAL(12,4) NULL,
-  verify_trade_date DATE NULL,
-  verify_close DECIMAL(12,4) NULL,
-  verify_pct DECIMAL(10,4) NULL,
-  verify_limit_up TINYINT NOT NULL DEFAULT 0,
-  verify_score DECIMAL(6,2) NOT NULL DEFAULT 0,
-  current_trade_date DATE NULL,
-  current_close DECIMAL(12,4) NULL,
-  current_pct_from_base DECIMAL(10,4) NULL,
-  avg_pct_from_base DECIMAL(10,4) NULL,
-  max_pct_from_base DECIMAL(10,4) NULL,
-  min_low_pct_from_base DECIMAL(10,4) NULL,
-  effect_status ENUM('unverified','active','faded','ignored') NOT NULL DEFAULT 'unverified',
-  effect_score DECIMAL(6,2) NOT NULL DEFAULT 0,
-  faded_trade_date DATE NULL,
-  faded_reason VARCHAR(255) NOT NULL DEFAULT '',
-  last_checked_trade_date DATE NULL,
-  raw_json JSON NULL,
-  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  UNIQUE KEY uk_announcement_effect_root (root_item_id),
-  UNIQUE KEY uk_announcement_effect_key (code, event_key),
-  KEY idx_announcement_effect_code_status (code, effect_status, event_date),
-  KEY idx_announcement_effect_date_status (event_date, effect_status)
-) ENGINE=InnoDB COMMENT='Market-validated announcement and important-event effects';
 
 CREATE TABLE IF NOT EXISTS stock_effective_facts (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -390,6 +400,79 @@ CREATE TABLE IF NOT EXISTS scan_movers (
     FOREIGN KEY (scan_run_id) REFERENCES scan_runs(id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB COMMENT='单次扫描 TopN 明细';
+
+CREATE TABLE IF NOT EXISTS market_width_snapshots (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  snapshot_id VARCHAR(32) NOT NULL,
+  trade_date DATE NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  source VARCHAR(64) NOT NULL DEFAULT 'akshare_stock_zh_a_spot',
+  market_scope VARCHAR(32) NOT NULL DEFAULT 'cn_a_main',
+  total_count INT NOT NULL DEFAULT 0,
+  up_count INT NOT NULL DEFAULT 0,
+  down_count INT NOT NULL DEFAULT 0,
+  flat_count INT NOT NULL DEFAULT 0,
+  up3_count INT NOT NULL DEFAULT 0,
+  down3_count INT NOT NULL DEFAULT 0,
+  up5_count INT NOT NULL DEFAULT 0,
+  down5_count INT NOT NULL DEFAULT 0,
+  limit_up_count INT NOT NULL DEFAULT 0,
+  limit_down_count INT NOT NULL DEFAULT 0,
+  amount_top50_count INT NOT NULL DEFAULT 0,
+  amount_top50_up_count INT NOT NULL DEFAULT 0,
+  amount_top50_down_count INT NOT NULL DEFAULT 0,
+  amount_top50_flat_count INT NOT NULL DEFAULT 0,
+  amount_top50_up3_count INT NOT NULL DEFAULT 0,
+  amount_top50_down3_count INT NOT NULL DEFAULT 0,
+  amount_top50_up5_count INT NOT NULL DEFAULT 0,
+  amount_top50_down5_count INT NOT NULL DEFAULT 0,
+  research_pool_trade_date DATE NULL,
+  research_pool_rule VARCHAR(64) NOT NULL DEFAULT '',
+  research_pool_count INT NOT NULL DEFAULT 0,
+  research_pool_up_count INT NOT NULL DEFAULT 0,
+  research_pool_down_count INT NOT NULL DEFAULT 0,
+  research_pool_flat_count INT NOT NULL DEFAULT 0,
+  research_pool_up3_count INT NOT NULL DEFAULT 0,
+  research_pool_down3_count INT NOT NULL DEFAULT 0,
+  research_pool_up5_count INT NOT NULL DEFAULT 0,
+  research_pool_down5_count INT NOT NULL DEFAULT 0,
+  sh_index_price DECIMAL(12,4) NULL,
+  sh_index_pct_change DECIMAL(10,4) NULL,
+  sh_index_amount DECIMAL(24,2) NULL,
+  sh_index_volume BIGINT NULL,
+  total_volume BIGINT NULL,
+  total_amount DECIMAL(24,2) NOT NULL DEFAULT 0,
+  top50_amount DECIMAL(24,2) NOT NULL DEFAULT 0,
+  raw_meta JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_market_width_snapshot_id (snapshot_id),
+  KEY idx_market_width_trade_time (trade_date, captured_at),
+  KEY idx_market_width_created_at (created_at)
+) ENGINE=InnoDB COMMENT='盘中市场概览快照：全市场、成交额Top50、研究池宽度统计';
+
+CREATE TABLE IF NOT EXISTS market_width_amount_top50 (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  snapshot_id VARCHAR(32) NOT NULL,
+  trade_date DATE NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  rank_no INT NOT NULL DEFAULT 0,
+  code CHAR(6) NOT NULL,
+  name VARCHAR(64) NOT NULL DEFAULT '',
+  latest_price DECIMAL(12,4) NULL,
+  pct_change DECIMAL(10,4) NULL,
+  amount DECIMAL(20,2) NULL,
+  volume BIGINT NULL,
+  raw_row JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_market_width_top_snapshot_code (snapshot_id, code),
+  KEY idx_market_width_top_trade_rank (trade_date, captured_at, rank_no),
+  KEY idx_market_width_top_code_time (code, captured_at),
+  CONSTRAINT fk_market_width_top_snapshot
+    FOREIGN KEY (snapshot_id) REFERENCES market_width_snapshots(snapshot_id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB COMMENT='盘中成交额最大Top50快照';
 
 CREATE TABLE IF NOT EXISTS scan_anchor_stats (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -820,6 +903,26 @@ CREATE TABLE IF NOT EXISTS daily_market_themes (
   KEY idx_daily_market_themes_generated (generated_at)
 ) ENGINE=InnoDB COMMENT='每日盘前催化主题，由市场资讯加工生成';
 
+CREATE TABLE IF NOT EXISTS ths_market_after_close_summaries (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  trade_date DATE NOT NULL,
+  source VARCHAR(64) NOT NULL DEFAULT 'ths_after_close_summary',
+  source_item_id VARCHAR(128) NOT NULL DEFAULT '',
+  title VARCHAR(512) NOT NULL DEFAULT '',
+  summary TEXT NULL,
+  content MEDIUMTEXT NULL,
+  url VARCHAR(1024) NOT NULL DEFAULT '',
+  published_at DATETIME(3) NULL,
+  source_status VARCHAR(255) NOT NULL DEFAULT '',
+  raw_json JSON NULL,
+  collected_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_ths_market_after_close_item (trade_date, source_item_id),
+  KEY idx_ths_market_after_close_date (trade_date, published_at),
+  KEY idx_ths_market_after_close_collected (collected_at)
+) ENGINE=InnoDB COMMENT='THS after-close market review summary';
+
 CREATE TABLE IF NOT EXISTS ths_hot_concept_events (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   trade_date DATE NOT NULL,
@@ -870,33 +973,85 @@ CREATE TABLE IF NOT EXISTS ths_hot_concept_members (
   KEY idx_ths_hot_member_event (event_id)
 ) ENGINE=InnoDB COMMENT='同花顺今天炒什么主题成分股';
 
-CREATE TABLE IF NOT EXISTS ths_limit_up_review_items (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+CREATE TABLE IF NOT EXISTS ths_homepage_headline_themes (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   trade_date DATE NOT NULL,
-  code CHAR(6) NOT NULL DEFAULT '',
-  stock_name VARCHAR(64) NOT NULL DEFAULT '',
+  snapshot_id VARCHAR(32) NOT NULL,
+  rank_no INT NOT NULL DEFAULT 0,
+  theme_id VARCHAR(64) NOT NULL DEFAULT '',
   theme_name VARCHAR(128) NOT NULL DEFAULT '',
-  reason VARCHAR(1024) NOT NULL DEFAULT '',
-  limit_up_days INT NOT NULL DEFAULT 0,
-  first_limit_time VARCHAR(32) NOT NULL DEFAULT '',
-  last_limit_time VARCHAR(32) NOT NULL DEFAULT '',
-  open_count INT NOT NULL DEFAULT 0,
-  seal_amount DECIMAL(20,2) NULL,
-  turnover_amount DECIMAL(20,2) NULL,
-  turnover_rate DECIMAL(12,4) NULL,
-  free_float_value DECIMAL(20,2) NULL,
-  total_market_value DECIMAL(20,2) NULL,
-  status VARCHAR(32) NOT NULL DEFAULT 'limit_up',
-  source VARCHAR(64) NOT NULL DEFAULT 'ths_limit_up_review',
+  theme_url VARCHAR(1024) NOT NULL DEFAULT '',
+  index_code VARCHAR(32) NOT NULL DEFAULT '',
+  block_name VARCHAR(128) NOT NULL DEFAULT '',
+  block_gain DECIMAL(12,4) NULL,
+  source VARCHAR(64) NOT NULL DEFAULT 'ths_homepage_headline',
+  page_url VARCHAR(1024) NOT NULL DEFAULT '',
   raw_json JSON NULL,
   collected_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_ths_limit_review_date_stock_theme (trade_date, code, theme_name),
-  KEY idx_ths_limit_review_date_theme (trade_date, theme_name),
-  KEY idx_ths_limit_review_code_date (code, trade_date),
-  KEY idx_ths_limit_review_source (source, trade_date)
-) ENGINE=InnoDB COMMENT='THS limit-up review items: market attribution for limit-up stocks.';
+  UNIQUE KEY uk_ths_home_headline_snapshot_rank (snapshot_id, rank_no),
+  UNIQUE KEY uk_ths_home_headline_date_theme (trade_date, source, theme_name),
+  KEY idx_ths_home_headline_date_rank (trade_date, rank_no),
+  KEY idx_ths_home_headline_collected (collected_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='THS homepage headline topic row themes.';
+
+CREATE TABLE IF NOT EXISTS ths_homepage_headline_theme_members (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  trade_date DATE NOT NULL,
+  snapshot_id VARCHAR(32) NOT NULL,
+  theme_rank INT NOT NULL DEFAULT 0,
+  theme_id VARCHAR(64) NOT NULL DEFAULT '',
+  theme_name VARCHAR(128) NOT NULL DEFAULT '',
+  index_code VARCHAR(32) NOT NULL DEFAULT '',
+  block_name VARCHAR(128) NOT NULL DEFAULT '',
+  stock_rank INT NOT NULL DEFAULT 0,
+  stock_code CHAR(6) NOT NULL DEFAULT '',
+  stock_name VARCHAR(64) NOT NULL DEFAULT '',
+  stock_market_id VARCHAR(32) NOT NULL DEFAULT '',
+  gain DECIMAL(12,4) NULL,
+  source VARCHAR(64) NOT NULL DEFAULT 'ths_homepage_headline',
+  raw_json JSON NULL,
+  collected_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_ths_home_member_snapshot_theme_stock (snapshot_id, theme_id, stock_code),
+  KEY idx_ths_home_member_date_theme (trade_date, theme_name, stock_rank),
+  KEY idx_ths_home_member_date_stock (trade_date, stock_code),
+  KEY idx_ths_home_member_index (index_code, stock_rank)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='Hot component stocks shown under THS homepage headline themes.';
+
+CREATE TABLE IF NOT EXISTS limit_up_pool_items (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  trade_date DATE NOT NULL,
+  code CHAR(6) NOT NULL,
+  stock_name VARCHAR(64) NOT NULL DEFAULT '',
+  pool_type VARCHAR(32) NOT NULL DEFAULT 'limit_up',
+  status VARCHAR(32) NOT NULL DEFAULT 'limit_up',
+  pct_change DECIMAL(10,4) NULL,
+  latest_price DECIMAL(12,4) NULL,
+  turnover_amount DECIMAL(20,2) NULL,
+  float_market_value DECIMAL(20,2) NULL,
+  total_market_value DECIMAL(20,2) NULL,
+  turnover_rate DECIMAL(12,4) NULL,
+  seal_amount DECIMAL(20,2) NULL,
+  first_limit_time VARCHAR(32) NOT NULL DEFAULT '',
+  last_limit_time VARCHAR(32) NOT NULL DEFAULT '',
+  open_count INT NOT NULL DEFAULT 0,
+  limit_up_stat VARCHAR(32) NOT NULL DEFAULT '',
+  limit_up_days INT NOT NULL DEFAULT 0,
+  industry_name VARCHAR(128) NOT NULL DEFAULT '',
+  source VARCHAR(64) NOT NULL DEFAULT 'eastmoney_akshare_stock_zt_pool_em',
+  raw_json JSON NULL,
+  collected_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_limit_up_pool_day_source_code (trade_date, source, pool_type, code),
+  KEY idx_limit_up_pool_day_time (trade_date, first_limit_time),
+  KEY idx_limit_up_pool_code_day (code, trade_date),
+  KEY idx_limit_up_pool_day_status (trade_date, status),
+  KEY idx_limit_up_pool_day_industry (trade_date, industry_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='Limit-up pool items from market data providers.';
 
 CREATE TABLE IF NOT EXISTS ths_stock_concept_explanations (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -922,29 +1077,6 @@ CREATE TABLE IF NOT EXISTS ths_stock_concept_explanations (
   KEY idx_ths_stock_concept_name (concept_name),
   KEY idx_ths_stock_concept_quote (quote_code)
 ) ENGINE=InnoDB COMMENT='THS stock concept page explanations: why a stock belongs to a concept.';
-
-CREATE TABLE IF NOT EXISTS stock_theme_reason_bank (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  code CHAR(6) NOT NULL,
-  stock_name VARCHAR(64) NOT NULL DEFAULT '',
-  anchor_name VARCHAR(128) NOT NULL DEFAULT '',
-  theme_name VARCHAR(128) NOT NULL DEFAULT '',
-  reason_text VARCHAR(1024) NOT NULL DEFAULT '',
-  source ENUM('ths_limit_up_review','ths_hot_concept','ths_stock_concept','ths_root_theme_point','concept_tag') NOT NULL DEFAULT 'ths_root_theme_point',
-  source_date DATE NULL,
-  source_key VARCHAR(255) NOT NULL DEFAULT '',
-  confidence DECIMAL(12,4) NOT NULL DEFAULT 0,
-  priority INT NOT NULL DEFAULT 0,
-  status ENUM('active','expired') NOT NULL DEFAULT 'active',
-  raw_json JSON NULL,
-  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (id),
-  UNIQUE KEY uk_stock_theme_reason (code, anchor_name, theme_name, source, source_key),
-  KEY idx_stock_theme_reason_code_anchor (code, anchor_name, status, priority, confidence),
-  KEY idx_stock_theme_reason_theme (anchor_name, theme_name, status),
-  KEY idx_stock_theme_reason_source (source, source_date)
-) ENGINE=InnoDB COMMENT='Global stock-theme reason bank: why a stock belongs to a theme.';
 
 CREATE TABLE IF NOT EXISTS active_market_anchors (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -1247,6 +1379,95 @@ CREATE TABLE IF NOT EXISTS pipeline_events (
     ON DELETE SET NULL
 ) ENGINE=InnoDB COMMENT='流程耗时、状态、错误流水';
 
+CREATE TABLE IF NOT EXISTS research_pool_snapshots (
+  trade_date DATE NOT NULL,
+  rule VARCHAR(64) NOT NULL DEFAULT 'recent_limit_up_or_5d_gain_top',
+  limit_up_days INT NOT NULL DEFAULT 5,
+  gain_period_days INT NOT NULL DEFAULT 5,
+  gain_top INT NOT NULL DEFAULT 30,
+  code_count INT NOT NULL DEFAULT 0,
+  source_dates_json JSON NULL,
+  params_json JSON NULL,
+  source_hash CHAR(64) NOT NULL DEFAULT '',
+  generated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, rule, limit_up_days, gain_period_days, gain_top),
+  KEY idx_research_pool_snapshots_generated (generated_at)
+) ENGINE=InnoDB COMMENT='Materialized daily research-pool snapshot headers.';
+
+CREATE TABLE IF NOT EXISTS research_pool_items (
+  trade_date DATE NOT NULL,
+  rule VARCHAR(64) NOT NULL DEFAULT 'recent_limit_up_or_5d_gain_top',
+  limit_up_days INT NOT NULL DEFAULT 5,
+  gain_period_days INT NOT NULL DEFAULT 5,
+  gain_top INT NOT NULL DEFAULT 30,
+  code CHAR(6) NOT NULL,
+  stock_name VARCHAR(64) NOT NULL DEFAULT '',
+  pool_rank INT NOT NULL DEFAULT 0,
+  source_kind VARCHAR(32) NOT NULL DEFAULT '',
+  source_priority INT NOT NULL DEFAULT 0,
+  source_rank INT NOT NULL DEFAULT 0,
+  source_label VARCHAR(255) NOT NULL DEFAULT '',
+  source_trade_date DATE NULL,
+  limit_up_day_count INT NOT NULL DEFAULT 0,
+  rank_5d INT NULL,
+  pct_5d DECIMAL(10,4) NULL,
+  latest_pct DECIMAL(10,4) NULL,
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, rule, limit_up_days, gain_period_days, gain_top, code),
+  KEY idx_research_pool_items_day_rank (trade_date, rule, pool_rank),
+  KEY idx_research_pool_items_code_day (code, trade_date),
+  KEY idx_research_pool_items_source (trade_date, source_kind, source_rank)
+) ENGINE=InnoDB COMMENT='Materialized daily research-pool members consumed by incremental collectors.';
+
+CREATE TABLE IF NOT EXISTS research_pool_theme_members (
+  trade_date DATE NOT NULL,
+  code CHAR(6) NOT NULL,
+  stock_name VARCHAR(64) NOT NULL DEFAULT '',
+  pool_rank INT NOT NULL DEFAULT 0,
+  pool_source_kind VARCHAR(32) NOT NULL DEFAULT '',
+  concept_name VARCHAR(128) NOT NULL DEFAULT '',
+  concept_id VARCHAR(64) NOT NULL DEFAULT '',
+  reason_explain VARCHAR(2048) NOT NULL DEFAULT '',
+  fit_rank INT NOT NULL DEFAULT 0,
+  theme_name VARCHAR(128) NOT NULL DEFAULT '',
+  theme_rank INT NOT NULL DEFAULT 999,
+  is_headline_theme TINYINT NOT NULL DEFAULT 0,
+  match_type VARCHAR(64) NOT NULL DEFAULT '',
+  match_score DECIMAL(10,4) NOT NULL DEFAULT 0,
+  source_table VARCHAR(64) NOT NULL DEFAULT 'ths_stock_concept_explanations',
+  source_key VARCHAR(128) NOT NULL DEFAULT '',
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, code, theme_name, concept_name),
+  KEY idx_research_pool_theme_day_theme (trade_date, theme_name, is_headline_theme, match_score),
+  KEY idx_research_pool_theme_day_code (trade_date, code, pool_rank),
+  KEY idx_research_pool_theme_headline (trade_date, is_headline_theme, theme_rank)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='Research-pool stocks mapped to THS concept explanations and headline theme dimensions.';
+
+CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
+  trade_date DATE NOT NULL,
+  rule VARCHAR(64) NOT NULL DEFAULT 'recent_limit_up_or_5d_gain_top',
+  limit_up_days INT NOT NULL DEFAULT 5,
+  gain_period_days INT NOT NULL DEFAULT 5,
+  gain_top INT NOT NULL DEFAULT 30,
+  source VARCHAR(64) NOT NULL DEFAULT 'post_close_confirm',
+  leader_count INT NOT NULL DEFAULT 0,
+  scope_count INT NOT NULL DEFAULT 0,
+  source_hash CHAR(64) NOT NULL DEFAULT '',
+  payload_json JSON NOT NULL,
+  generated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, rule, limit_up_days, gain_period_days, gain_top, source),
+  KEY idx_leaderboard_snapshots_generated (generated_at),
+  KEY idx_leaderboard_snapshots_source (source, trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='Post-close confirmed leaderboard payload snapshots.';
+
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
   task_id VARCHAR(64) NOT NULL,
   task_name VARCHAR(255) NOT NULL DEFAULT '',
@@ -1329,6 +1550,39 @@ CREATE TABLE IF NOT EXISTS task_runs (
     FOREIGN KEY (queue_id) REFERENCES task_queue(queue_id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB COMMENT='Execution history for queued tasks.';
+
+CREATE TABLE IF NOT EXISTS scheduled_task_health_checks (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  check_date DATE NOT NULL,
+  checked_at DATETIME(3) NOT NULL,
+  task_id VARCHAR(64) NOT NULL,
+  task_name VARCHAR(255) NOT NULL DEFAULT '',
+  task_kind VARCHAR(64) NOT NULL DEFAULT '',
+  task_type VARCHAR(32) NOT NULL DEFAULT '',
+  enabled TINYINT NOT NULL DEFAULT 1,
+  expected_at DATETIME(3) NULL,
+  next_run_after DATETIME(3) NULL,
+  last_enqueued_at DATETIME(3) NULL,
+  last_started_at DATETIME(3) NULL,
+  last_finished_at DATETIME(3) NULL,
+  last_success_at DATETIME(3) NULL,
+  last_status VARCHAR(32) NOT NULL DEFAULT '',
+  queue_pending_count INT NOT NULL DEFAULT 0,
+  queue_running_count INT NOT NULL DEFAULT 0,
+  queue_dead_count INT NOT NULL DEFAULT 0,
+  queue_done_count INT NOT NULL DEFAULT 0,
+  health ENUM('ok','not_due','missed','failed','overdue','pending','disabled') NOT NULL DEFAULT 'ok',
+  severity ENUM('info','warning','critical') NOT NULL DEFAULT 'info',
+  issue_code VARCHAR(64) NOT NULL DEFAULT '',
+  message VARCHAR(1024) NOT NULL DEFAULT '',
+  detail_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uniq_task_health_check_date_task (check_date, task_id),
+  KEY idx_task_health_checks_health (check_date, health, severity),
+  KEY idx_task_health_checks_task (task_id, checked_at)
+) ENGINE=InnoDB COMMENT='Daily scheduler health check results for missed, delayed, and failed tasks.';
 
 CREATE TABLE IF NOT EXISTS worker_heartbeats (
   worker_id VARCHAR(128) NOT NULL,

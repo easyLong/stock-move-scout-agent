@@ -166,9 +166,21 @@ def enqueue_root_evidence_cache_dirty_many(
     return count
 
 
-def fetch_root_evidence_cache_dirty(config: MySqlConfig, trade_date: str, limit: int, code: str = "") -> list[dict[str, str]]:
+def fetch_root_evidence_cache_dirty(
+    config: MySqlConfig,
+    trade_date: str,
+    limit: int,
+    code: str = "",
+    codes: list[str] | None = None,
+) -> list[dict[str, str]]:
     ensure_root_evidence_cache_table(config)
     code_filter = f"AND code={sql_string(code)}" if code else ""
+    if not code_filter:
+        clean_codes = sorted({str(item or "").strip() for item in (codes or []) if str(item or "").strip()})
+        if clean_codes:
+            code_filter = f"AND code IN ({','.join(sql_string(item) for item in clean_codes)})"
+        elif codes is not None:
+            code_filter = "AND 1=0"
     sql = f"""
     SELECT id, code, stock_name
     FROM stock_root_evidence_cache_dirty_queue
@@ -200,6 +212,22 @@ def fetch_root_evidence_cache_dirty(config: MySqlConfig, trade_date: str, limit:
             """,
         )
     return out
+
+
+def root_evidence_cache_missing_codes(config: MySqlConfig, trade_date: str, codes: list[str]) -> list[str]:
+    clean_codes = sorted({str(code or "").strip() for code in codes if str(code or "").strip()})
+    if not clean_codes:
+        return []
+    pool_sql = " UNION ALL ".join(f"SELECT {sql_string(code)} AS code" for code in clean_codes)
+    sql = f"""
+    SELECT pool.code
+    FROM ({pool_sql}) pool
+    LEFT JOIN stock_root_evidence_cache c
+      ON c.trade_date={sql_string(trade_date)}
+     AND c.code=pool.code
+    WHERE c.code IS NULL;
+    """
+    return [row[0] for row in mysql_rows(run_mysql(config, sql, batch=True, raw=True)) if row and row[0]]
 
 
 def mark_root_evidence_cache_dirty(config: MySqlConfig, dirty_id: str, status: str, error: str = "") -> None:
@@ -250,7 +278,7 @@ def refresh_root_evidence_cache_from_effective_facts(
       SELECT DISTINCT code
       FROM stock_effective_facts
       WHERE trade_date=CAST({day} AS DATE)
-        AND evidence_group IN ('current_effective', 'post_close_confirm')
+        AND evidence_group='current_effective'
         AND display_level IN ('primary', 'secondary')
         AND valid_status IN ('active', 'watch')
     ),
@@ -283,9 +311,9 @@ def refresh_root_evidence_cache_from_effective_facts(
       FROM stock_effective_facts f
       JOIN eligible_codes ec ON ec.code=f.code
       WHERE f.trade_date=CAST({day} AS DATE)
-        AND f.evidence_group IN ('current_effective', 'post_close_confirm', 'background_fact', 'historical_tag')
-        AND f.display_level IN ('primary', 'secondary', 'background')
-        AND f.valid_status IN ('active', 'watch', 'historical', 'expired')
+        AND f.evidence_group='current_effective'
+        AND f.display_level IN ('primary', 'secondary')
+        AND f.valid_status IN ('active', 'watch')
         {code_filter}
     ),
     selected AS (
@@ -345,11 +373,8 @@ def refresh_root_evidence_cache_from_effective_facts(
               ELSE CASE
               WHEN valid_status IN ('expired', 'historical') THEN '历史标签'
               ELSE CASE source_table
-              WHEN 'stock_announcement_effects' THEN '公告有效层'
-              WHEN 'stock_lhb_seat_evidence' THEN '龙虎榜席位'
-              WHEN 'stock_period_rankings' THEN '问财区间排名'
-              WHEN 'ths_limit_up_review_items' THEN '涨停复盘'
-              WHEN 'stock_theme_reason_bank' THEN '题材理由库'
+              WHEN 'stock_ths_root_items' THEN '重要事件'
+              WHEN 'ths_stock_concept_explanations' THEN '同花顺概念解释'
               ELSE source_table
               END
               END
@@ -357,10 +382,7 @@ def refresh_root_evidence_cache_from_effective_facts(
             'source_table', source_table,
             'source_key', source_key,
             'source_confidence', source_confidence,
-            'source_generation', CASE
-              WHEN source_table IN ('stock_lhb_seat_evidence', 'stock_period_rankings', 'ths_limit_up_review_items') THEN 'after_close'
-              ELSE 'precomputed'
-            END,
+            'source_generation', 'precomputed',
             'availability', CASE evidence_group
               WHEN 'current_effective' THEN 'cached_readable'
               WHEN 'post_close_confirm' THEN 'after_close_confirm'
@@ -376,10 +398,6 @@ def refresh_root_evidence_cache_from_effective_facts(
                   SELECT DATE(scanned_at) AS prev_day FROM scan_runs WHERE accepted=1 AND DATE(scanned_at) < CAST({day} AS DATE)
                   UNION ALL
                   SELECT DATE(ended_at) AS prev_day FROM windows WHERE status='done' AND DATE(ended_at) < CAST({day} AS DATE)
-                  UNION ALL
-                  SELECT DATE(trade_date) AS prev_day FROM stock_period_rankings WHERE trade_date < CAST({day} AS DATE)
-                  UNION ALL
-                  SELECT DATE(trade_date) AS prev_day FROM stock_lhb_seat_evidence WHERE trade_date < CAST({day} AS DATE)
                 ) prev_days
                 WHERE WEEKDAY(prev_day) < 5
               ) THEN 'prev_trade_day'
@@ -394,7 +412,8 @@ def refresh_root_evidence_cache_from_effective_facts(
               WHEN evidence_group='background_fact' THEN ''
               ELSE COALESCE(DATE_FORMAT(fact_date, '%Y-%m-%d'), '')
             END,
-            'body', LEFT(COALESCE(NULLIF(fact_body, ''), fact_title), 420),
+            'body', LEFT(COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(payload, '$.display_body')), ''), NULLIF(fact_body, ''), fact_title), 420),
+            'display_lines', COALESCE(JSON_EXTRACT(payload, '$.display_lines'), JSON_ARRAY()),
             'priority', CASE evidence_group
               WHEN 'historical_tag' THEN 95
               WHEN 'background_fact' THEN 70
@@ -458,6 +477,35 @@ def refresh_root_evidence_cache_from_effective_facts(
     """
     run_mysql(config, sql)
     if clean_codes:
+        pool_sql = " UNION ALL ".join(f"SELECT {sql_string(code)} AS code" for code in clean_codes)
+        run_mysql(
+            config,
+            f"""
+            INSERT INTO stock_root_evidence_cache(
+              trade_date, code, items, root_count, latest_source_updated_at, generated_at, updated_at
+            )
+            SELECT
+              CAST({day} AS DATE),
+              pool.code,
+              JSON_ARRAY(),
+              0,
+              NULL,
+              CURRENT_TIMESTAMP(3),
+              CURRENT_TIMESTAMP(3)
+            FROM ({pool_sql}) pool
+            LEFT JOIN stock_root_evidence_cache c
+              ON c.trade_date=CAST({day} AS DATE)
+             AND c.code=pool.code
+            WHERE c.code IS NULL
+            ON DUPLICATE KEY UPDATE
+              items=VALUES(items),
+              root_count=VALUES(root_count),
+              latest_source_updated_at=VALUES(latest_source_updated_at),
+              generated_at=VALUES(generated_at),
+              updated_at=CURRENT_TIMESTAMP(3);
+            """,
+        )
+    if clean_codes:
         refreshed = len(clean_codes)
     else:
         refreshed_rows = mysql_rows(
@@ -505,193 +553,17 @@ def refresh_root_evidence_cache(
     if clean_codes:
         effective_result["deleted"] = len(clean_codes)
     return effective_result
-    day = sql_string(trade_date)
-    code_filter = _code_filter_sql(clean_codes)
-    sql = f"""
-    SET SESSION group_concat_max_len=16384;
-    INSERT INTO stock_root_evidence_cache(
-      trade_date, code, items, root_count, latest_source_updated_at, generated_at, updated_at
-    )
-    WITH
-    root_evidence_scored AS (
-      SELECT
-        i.*,
-        COALESCE(ae.effect_status, '') AS announcement_effect_status,
-        COALESCE(ae.faded_reason, '') AS announcement_effect_reason,
-        ae.verify_score AS announcement_verify_score,
-        CASE
-          WHEN i.title='业绩披露' THEN 0
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '一季报|季度报告|年报|半年报|业绩预告|业绩快报|净利润|营收|利润分配|分配预案' THEN 1
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '回购|增持' THEN 2
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '龙虎榜|龙 虎 榜' THEN 3
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '合同|订单|中标|收购|重组|资产收购|资产出售|并购' THEN 4
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '异动|股票交易异常波动' THEN 5
-          WHEN i.item_kind='theme_point' THEN 6
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '新增概念|投资互动|互动易' THEN 7
-          WHEN i.item_kind='announcement' THEN 8
-          ELSE 8
-        END AS root_priority,
-        CASE
-          WHEN i.title='业绩披露' OR CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '一季报|季度报告|年报|半年报|业绩预告|业绩快报|净利润|营收|利润分配|分配预案' THEN 'performance'
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '回购|增持' THEN 'buyback'
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '龙虎榜|龙 虎 榜' THEN 'lhb'
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '合同|订单|中标|收购|重组|资产收购|资产出售|并购' THEN 'deal'
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '异动|股票交易异常波动' THEN 'abnormal_move'
-          WHEN i.item_kind='theme_point' THEN 'theme'
-          WHEN CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '新增概念|投资互动|互动易' THEN 'concept'
-          WHEN i.item_kind='announcement' THEN 'announcement'
-          ELSE 'event'
-        END AS root_bucket
-      FROM stock_ths_root_items i
-      LEFT JOIN stock_announcement_effects ae ON ae.root_item_id = i.id
-      WHERE i.item_kind IN ('important_event', 'announcement', 'theme_point', 'hot_news')
-        {code_filter}
-        AND (i.item_date IS NULL OR i.item_date <= {day})
-        AND (i.item_date IS NULL OR i.item_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 240 DAY))
-        AND COALESCE(ae.effect_status, '') NOT IN ('ignored', 'faded')
-        AND (
-          i.item_kind IN ('theme_point', 'hot_news')
-          OR (i.item_kind='announcement' AND COALESCE(ae.effect_status, '')='active')
-          OR (
-            i.item_kind='important_event'
-            AND (
-              COALESCE(ae.effect_status, '')='active'
-              OR CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '龙 虎 榜|龙虎榜'
-            )
-          )
-        )
-        AND (
-          i.item_kind='theme_point'
-          OR CONCAT(i.title, ' ', COALESCE(i.content, '')) REGEXP '业绩披露|一季报|季度报告|年报|半年报|业绩预告|业绩快报|净利润|营收|利润分配|分配预案|回购|增持|龙虎榜|龙 虎 榜|合同|订单|中标|收购|重组|资产收购|资产出售|并购|异动|股票交易异常波动|新增概念|投资互动|互动易'
-        )
-    ),
-    root_evidence_deduped AS (
-      SELECT ranked.*
-      FROM (
-        SELECT
-          s.*,
-          ROW_NUMBER() OVER (
-            PARTITION BY s.code, COALESCE(NULLIF(s.url, ''), CONCAT(s.title, ':', LEFT(COALESCE(s.content, ''), 120)), s.item_key)
-            ORDER BY s.root_priority ASC, COALESCE(s.item_date, DATE('1000-01-01')) DESC, s.source_rank ASC, s.updated_at DESC
-          ) AS dedupe_rn
-        FROM root_evidence_scored s
-      ) ranked
-      WHERE ranked.dedupe_rn=1
-    ),
-    root_evidence_bucketed AS (
-      SELECT
-        d.*,
-        ROW_NUMBER() OVER (
-          PARTITION BY d.code, d.root_bucket
-          ORDER BY d.root_priority ASC, COALESCE(d.item_date, DATE('1000-01-01')) DESC, d.source_rank ASC, d.updated_at DESC
-        ) AS bucket_rn
-      FROM root_evidence_deduped d
-    ),
-    root_evidence_ranked AS (
-      SELECT
-        d.*,
-        ROW_NUMBER() OVER (
-          PARTITION BY d.code
-          ORDER BY d.root_priority ASC, COALESCE(d.item_date, DATE('1000-01-01')) DESC, d.source_rank ASC, d.updated_at DESC
-        ) AS root_rn
-      FROM root_evidence_bucketed d
-      WHERE d.bucket_rn <= CASE WHEN d.root_bucket IN ('performance', 'theme') THEN 2 ELSE 1 END
-    ),
-    packed AS (
-      SELECT
-        code,
-        MAX(updated_at) AS latest_source_updated_at,
-        COUNT(*) AS root_count,
-        CONCAT('[', GROUP_CONCAT(
-          JSON_OBJECT(
-            'layer', 'async',
-            'label', CASE
-              WHEN item_kind='announcement' THEN '公告'
-              WHEN item_kind='theme_point' THEN '题材证据'
-              ELSE '事件'
-            END,
-            'type', CASE
-              WHEN item_kind='announcement' THEN 'announcement'
-              WHEN item_kind='theme_point' THEN 'theme'
-              ELSE 'event'
-            END,
-            'source', CASE
-              WHEN item_kind='announcement' THEN '公告粗筛'
-              WHEN item_kind='theme_point' THEN '题材要点'
-              ELSE '重要事件'
-            END,
-            'source_table', 'stock_ths_root_items',
-            'source_key', CONCAT('stock_ths_root_items:', id),
-            'source_confidence', 'explicit',
-            'source_generation', 'precomputed',
-            'data_date', COALESCE(DATE_FORMAT(item_date, '%Y-%m-%d'), DATE_FORMAT(collected_at, '%Y-%m-%d')),
-            'updated_at', DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s'),
-            'collected_at', DATE_FORMAT(collected_at, '%Y-%m-%d %H:%i:%s'),
-            'evidence_date', COALESCE(DATE_FORMAT(item_date, '%Y-%m-%d'), ''),
-            'body', LEFT(
-              CONCAT(
-                IF(item_date IS NULL, '', CONCAT(DATE_FORMAT(item_date, '%m-%d'), ' ')),
-                CASE
-                  WHEN COALESCE(content, '') <> '' AND title IN ('发布公告', '业绩披露', '分配预案', '融资融券', '龙 虎 榜', '新增概念', '股票回购') THEN content
-                  WHEN COALESCE(content, '') <> '' AND item_kind <> 'announcement' THEN CONCAT(title, '：', content)
-                  ELSE title
-                END
-              ),
-              360
-            ),
-            'priority', root_priority + 70,
-            'payload', JSON_OBJECT(
-              'item_kind', item_kind,
-              'item_key', item_key,
-              'title', title,
-              'content', LEFT(COALESCE(content, ''), 600),
-              'url', url,
-              'source_section', source_section,
-              'source_rank', source_rank
-              ,'announcement_effect_status', announcement_effect_status
-              ,'announcement_verify_score', announcement_verify_score
-            )
-          )
-          ORDER BY root_rn SEPARATOR ','
-        ), ']') AS items
-      FROM root_evidence_ranked
-      WHERE root_rn <= 6
-      GROUP BY code
-    )
-    SELECT
-      CAST({day} AS DATE),
-      code,
-      CAST(items AS JSON),
-      root_count,
-      latest_source_updated_at,
-      CURRENT_TIMESTAMP(3),
-      CURRENT_TIMESTAMP(3)
-    FROM packed
-    ON DUPLICATE KEY UPDATE
-      items=VALUES(items),
-      root_count=VALUES(root_count),
-      latest_source_updated_at=VALUES(latest_source_updated_at),
-      generated_at=VALUES(generated_at),
-      updated_at=CURRENT_TIMESTAMP(3);
-    """
-    run_mysql(config, sql)
-    refreshed = len(clean_codes)
-    if not clean_codes:
-        refreshed_rows = mysql_rows(
-            run_mysql(
-                config,
-                f"SELECT COUNT(*) FROM stock_root_evidence_cache WHERE trade_date={sql_string(trade_date)};",
-                batch=True,
-                raw=True,
-            )
-        )
-        refreshed = int(refreshed_rows[0][0]) if refreshed_rows and refreshed_rows[0] else 0
-    return {"refreshed": refreshed, "deleted": len(clean_codes), "mode": 1 if clean_codes else 2}
 
 
-def process_root_evidence_cache_dirty(config: MySqlConfig, trade_date: str, limit: int = 50, code: str = "") -> dict[str, int]:
-    effective_result = process_effective_facts_dirty(config, trade_date, limit, code)
-    dirty_rows = fetch_root_evidence_cache_dirty(config, trade_date, limit, code)
+def process_root_evidence_cache_dirty(
+    config: MySqlConfig,
+    trade_date: str,
+    limit: int = 50,
+    code: str = "",
+    codes: list[str] | None = None,
+) -> dict[str, int]:
+    effective_result = process_effective_facts_dirty(config, trade_date, limit, code, codes)
+    dirty_rows = fetch_root_evidence_cache_dirty(config, trade_date, limit, code, codes)
     refreshed = 0
     failed = 0
     for item in dirty_rows:
@@ -712,8 +584,14 @@ def process_root_evidence_cache_dirty(config: MySqlConfig, trade_date: str, limi
     }
 
 
-def process_effective_facts_dirty(config: MySqlConfig, trade_date: str, limit: int = 50, code: str = "") -> dict[str, int]:
-    dirty_rows = fetch_effective_facts_dirty(config, trade_date, limit, code)
+def process_effective_facts_dirty(
+    config: MySqlConfig,
+    trade_date: str,
+    limit: int = 50,
+    code: str = "",
+    codes: list[str] | None = None,
+) -> dict[str, int]:
+    dirty_rows = fetch_effective_facts_dirty(config, trade_date, limit, code, codes)
     rebuilt = 0
     failed = 0
     for item in dirty_rows:
@@ -750,4 +628,5 @@ __all__ = [
     "refresh_root_evidence_cache_from_effective_facts",
     "root_evidence_cache_code_exists",
     "root_evidence_cache_exists",
+    "root_evidence_cache_missing_codes",
 ]

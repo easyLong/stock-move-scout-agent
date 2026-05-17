@@ -6,8 +6,43 @@ from typing import Any
 DEPRECATED_TASK_IDS = (
     "build_cold_universe",
     "cold_company_profile_batch_0",
+    "import_latest_mysql",
     "warm_hard_evidence_auto",
+    "ths_root_extended_items",
+    "research_pool_snapshot",
+    "research_pool_theme_members",
+    "headline_theme_role_evidence",
+    "effective_facts",
+    "async_evidence_source_sync",
+    "async_evidence_summary",
+    "root_evidence_cache_dirty",
+    "stock_theme_reason_bank",
+    "iwencai_period_rankings",
+    "ths_limit_up_review",
+    "auction_trend_summary",
+    "stock_move_judgement_dirty",
+    "daily_root_evidence_pipeline",
+    "next_trade_day_evidence_prepare",
+    "post_close_next_trade_day_evidence_prepare",
 )
+
+
+ARCHIVED_TASK_PREFIXES = (
+    "hot_evidence_worker_",
+)
+
+
+TRADING_TIME_TASK_IDS = frozenset(
+    {
+        "anchor_realtime_roles",
+        "event_engine",
+        "market_width_snapshot",
+        "stock_move_judgements",
+    }
+)
+
+
+PREOPEN_TIME_TASK_IDS = frozenset({"auction_candidates"})
 
 
 SCHEDULED_TASKS: list[dict[str, Any]] = [
@@ -28,16 +63,41 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
     {
         "task_id": "ths_root_extended_items",
         "task_name": "根页面扩展信息",
-        "task_description": "每晚全量刷新同花顺根页面近期事件、公告、题材要点。",
+        "task_description": "每天刷新研究池股票的同花顺F10根页面重要事件。",
         "task_kind": "ths_root_extended_items",
         "task_type": "cold",
-        "enabled": 1,
+        "enabled": 0,
         "schedule_type": "interval",
         "interval": 86400,
         "priority": 70,
         "timeout": 1800,
-        "payload": {"batch_size": 100, "cache_only": False, "workers": 4, "request_timeout": 8, "max_pages": 1},
+        "payload": {"batch_size": 100, "cache_only": False, "workers": 4, "request_timeout": 8, "max_pages": 1, "research_pool_only": True},
         "dedupe": "ths_root_extended_items:{run_key}:{offset}",
+    },
+    {
+        "task_id": "pre_trade_night_evidence_prepare",
+        "task_name": "交易日前夜证据准备",
+        "task_description": "交易日前一晚刷新研究池、同花顺F10重要事件、有效事实、模型总结和根证据缓存，服务下一个交易日。",
+        "task_kind": "daily_root_evidence_pipeline",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 47,
+        "timeout": 3600,
+        "payload": {
+            "batch_size": 500,
+            "workers": 4,
+            "request_timeout": 12,
+            "timeout": 1200,
+            "per_kind_limit": 8,
+            "model_config": "default",
+            "model_timeout": 60,
+            "fallback_without_model": True,
+            "preserve_trade_date": True,
+            "service_date_mode": "next_trade_day",
+        },
+        "dedupe": "pre_trade_night_evidence_prepare:{run_key}",
     },
     {
         "task_id": "morning_market_news",
@@ -90,6 +150,34 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "dedupe": "morning_reference_post:{run_key}",
     },
     {
+        "task_id": "scheduled_task_health_check",
+        "task_name": "Scheduled Task Health Check",
+        "task_description": "Daily 08:00 check for scheduled tasks that missed their due time or failed recently.",
+        "task_kind": "scheduled_task_health_check",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 40,
+        "timeout": 120,
+        "payload": {"grace_minutes": 15, "lookback_days": 3},
+        "dedupe": "scheduled_task_health_check:{run_key}",
+    },
+    {
+        "task_id": "ths_market_after_close_summary",
+        "task_name": "THS After-Close Market Summary",
+        "task_description": "Collect THS after-close market review as previous-day market context for morning reference posts.",
+        "task_kind": "ths_market_after_close_summary",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 54,
+        "timeout": 180,
+        "payload": {"timeout": 12},
+        "dedupe": "ths_market_after_close_summary:{run_key}",
+    },
+    {
         "task_id": "ths_hot_concepts",
         "task_name": "低频数据：同花顺今天炒什么",
         "task_description": "每天收盘后更新一次同花顺今天炒什么事件、主题成分股，并重建近14日有效锚点池。",
@@ -104,18 +192,32 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "dedupe": "ths_hot_concepts:{run_key}",
     },
     {
-        "task_id": "ths_limit_up_review",
-        "task_name": "THS Limit-Up Review",
-        "task_description": "Collect THS limit-up review attribution and rebuild recent limit-up theme anchors.",
-        "task_kind": "ths_limit_up_review",
-        "task_type": "cold",
+        "task_id": "ths_homepage_headline_themes",
+        "task_name": "THS Homepage Headline Themes",
+        "task_description": "交易日开盘前和午盘后刷新同花顺首页头条题材。",
+        "task_kind": "ths_homepage_headline_themes",
+        "task_type": "warm",
         "enabled": 1,
         "schedule_type": "interval",
         "interval": 86400,
-        "priority": 67,
-        "timeout": 900,
-        "payload": {"days": 1, "timeout": 12, "pause": 0.2, "lookback_days": 14},
-        "dedupe": "ths_limit_up_review:{run_key}",
+        "priority": 43,
+        "timeout": 300,
+        "payload": {"timeout": 15, "pause": 0.03, "max_pages": 80, "fail_on_empty": True},
+        "dedupe": "ths_homepage_headline_themes:{minute_key}",
+    },
+    {
+        "task_id": "eastmoney_limit_up_pool",
+        "task_name": "Eastmoney Limit-Up Pool",
+        "task_description": "Collect confirmed limit-up pool from AkShare stock_zt_pool_em.",
+        "task_kind": "eastmoney_limit_up_pool",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 44,
+        "timeout": 300,
+        "payload": {"days": 1, "pause": 0.3, "retries": 3, "fail_on_empty": True},
+        "dedupe": "eastmoney_limit_up_pool:{run_key}",
     },
     {
         "task_id": "ths_stock_concepts",
@@ -128,70 +230,50 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "interval": 86400,
         "priority": 64,
         "timeout": 900,
-        "payload": {"batch_size": 200, "timeout": 10, "pause": 0.08, "chunk_size": 300},
+        "payload": {"batch_size": 200, "timeout": 10, "pause": 0.08, "chunk_size": 300, "research_pool_only": True},
         "dedupe": "ths_stock_concepts:{run_key}:{offset}",
     },
     {
-        "task_id": "stock_theme_reason_bank",
-        "task_name": "Stock Theme Reason Bank",
-        "task_description": "Rebuild global stock-theme reason bank from THS hot concepts, stock concept explanations, and fallback tags.",
-        "task_kind": "stock_theme_reason_bank",
-        "task_type": "cold",
-        "enabled": 1,
-        "schedule_type": "interval",
-        "interval": 86400,
-        "priority": 66,
-        "timeout": 900,
-        "payload": {"include_stock_concepts": True, "include_concept_tags": False, "chunk_size": 500},
-        "dedupe": "stock_theme_reason_bank:{run_key}",
-    },
-    {
-        "task_id": "iwencai_period_rankings",
-        "task_name": "iWenCai Period Rankings",
-        "task_description": "Collect iWenCai 3/5/10-day gain rankings for anchor leadership scoring.",
-        "task_kind": "iwencai_period_rankings",
+        "task_id": "research_pool_snapshot",
+        "task_name": "Research Pool Snapshot",
+        "task_description": "Materialize the daily research pool after close, once limit-up pool and daily bars are refreshed.",
+        "task_kind": "research_pool_snapshot",
         "task_type": "warm",
-        "enabled": 1,
+        "enabled": 0,
         "schedule_type": "interval",
         "interval": 86400,
         "priority": 45,
         "timeout": 180,
-        "payload": {"periods": "3,5,10", "top": 50, "universe": "沪深A股"},
-        "dedupe": "iwencai_period_rankings:{run_key}",
+        "payload": {"limit_up_days": 5, "gain_period_days": 5, "gain_top": 30, "force": True},
+        "dedupe": "research_pool_snapshot:{run_key}",
     },
     {
-        "task_id": "lhb_seat_evidence",
-        "task_name": "LHB Seat Evidence",
-        "task_description": "Collect useful Dragon-Tiger list seat structure: famous active traders, institutions, northbound, and top buy seats.",
-        "task_kind": "lhb_seat_evidence",
+        "task_id": "post_close_leaderboard_snapshot",
+        "task_name": "Post-Close Leaderboard Snapshot",
+        "task_description": "After limit-up pool and daily bars are ready, rebuild the confirmed research pool and materialize leaderboard snapshot.",
+        "task_kind": "post_close_leaderboard_snapshot",
         "task_type": "warm",
         "enabled": 1,
         "schedule_type": "interval",
         "interval": 86400,
         "priority": 46,
         "timeout": 300,
-        "payload": {"limit": 120, "judgement_codes": True},
-        "dedupe": "lhb_seat_evidence:{run_key}",
+        "payload": {"limit_up_days": 5, "gain_period_days": 5, "gain_top": 30, "force": True},
+        "dedupe": "post_close_leaderboard_snapshot:{run_key}",
     },
     {
-        "task_id": "announcement_effects",
-        "task_name": "Announcement Effects",
-        "task_description": "Build market-validated announcement and important-event effects from stock_ths_root_items.",
-        "task_kind": "announcement_effects",
+        "task_id": "research_pool_theme_members",
+        "task_name": "Research Pool Theme Members",
+        "task_description": "Materialize research-pool stocks mapped to THS F10 concept explanations and today's headline theme dimension.",
+        "task_kind": "research_pool_theme_members",
         "task_type": "warm",
-        "enabled": 1,
+        "enabled": 0,
         "schedule_type": "interval",
         "interval": 86400,
-        "priority": 47,
-        "timeout": 900,
-        "payload": {
-            "lookback_days": 240,
-            "stale_after_days": 31,
-            "sleep_seconds": 0.15,
-            "refresh_bars": True,
-            "allow_local_fallback": False,
-        },
-        "dedupe": "announcement_effects:{run_key}",
+        "priority": 46,
+        "timeout": 180,
+        "payload": {"force": True},
+        "dedupe": "research_pool_theme_members:{run_key}",
     },
     {
         "task_id": "effective_facts",
@@ -199,12 +281,12 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "task_description": "Build filtered effective fact layer for evidence cache, UI, and model payloads.",
         "task_kind": "effective_facts",
         "task_type": "warm",
-        "enabled": 1,
+        "enabled": 0,
         "schedule_type": "interval",
         "interval": 86400,
-        "priority": 48,
+        "priority": 49,
         "timeout": 300,
-        "payload": {},
+        "payload": {"research_pool_only": True},
         "dedupe": "effective_facts:{run_key}",
     },
     {
@@ -213,12 +295,12 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "task_description": "Refresh per-stock evidence fingerprints and enqueue only changed stocks for model analysis.",
         "task_kind": "async_evidence_source_sync",
         "task_type": "warm",
-        "enabled": 1,
+        "enabled": 0,
         "schedule_type": "interval",
         "interval": 60,
         "priority": 46,
         "timeout": 120,
-        "payload": {"limit": 50, "per_kind_limit": 8, "model_config": "default", "timeout": 30, "fallback_without_model": True},
+        "payload": {"limit": 50, "per_kind_limit": 8, "model_config": "default", "timeout": 30, "fallback_without_model": True, "research_pool_only": True},
         "dedupe": "async_evidence_source_sync:{minute_key}",
     },
     {
@@ -227,12 +309,12 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "task_description": "Consume changed stock root evidence rows and refresh affected stock cache only.",
         "task_kind": "root_evidence_cache_dirty",
         "task_type": "warm",
-        "enabled": 1,
+        "enabled": 0,
         "schedule_type": "interval",
         "interval": 30,
         "priority": 45,
         "timeout": 120,
-        "payload": {"limit": 50},
+        "payload": {"limit": 50, "research_pool_only": True},
         "dedupe": "root_evidence_cache_dirty:{minute_key}",
     },
     {
@@ -255,12 +337,12 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "task_description": "Consume pending changed evidence rows and summarize them with model analysis.",
         "task_kind": "async_evidence_summary",
         "task_type": "warm",
-        "enabled": 1,
+        "enabled": 0,
         "schedule_type": "interval",
         "interval": 300,
         "priority": 48,
         "timeout": 300,
-        "payload": {"limit": 10, "per_kind_limit": 8, "model_config": "default", "timeout": 60, "dirty_only": True, "fallback_without_model": True},
+        "payload": {"limit": 10, "per_kind_limit": 8, "model_config": "default", "timeout": 60, "dirty_only": True, "fallback_without_model": True, "research_pool_only": True},
         "dedupe": "async_evidence_summary:{minute_key}",
     },
     {
@@ -274,22 +356,8 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "interval": 60,
         "priority": 49,
         "timeout": 120,
-        "payload": {"scan_top": 20, "window_top": 5, "limit": 500, "latest_only": True},
+        "payload": {"scan_top": 20, "window_top": 5, "limit": 500, "latest_only": True, "research_pool_only": True},
         "dedupe": "stock_move_judgements:{minute_key}",
-    },
-    {
-        "task_id": "stock_move_judgement_dirty",
-        "task_name": "Stock Move Judgement Dirty",
-        "task_description": "Consume changed evidence rows and rebuild affected move judgements.",
-        "task_kind": "stock_move_judgements",
-        "task_type": "hot",
-        "enabled": 1,
-        "schedule_type": "interval",
-        "interval": 60,
-        "priority": 50,
-        "timeout": 120,
-        "payload": {"scan_top": 20, "window_top": 5, "limit": 80, "latest_only": False, "dirty_only": True},
-        "dedupe": "stock_move_judgement_dirty:{minute_key}",
     },
     {
         "task_id": "anchor_realtime_roles",
@@ -302,13 +370,62 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "interval": 60,
         "priority": 35,
         "timeout": 90,
-        "payload": {"levels": "strong,medium", "medium_cap": 120, "min_members": 2, "batch_size": 80, "tdx_timeout": 3, "trading_only": True},
+        "payload": {"levels": "strong,medium", "medium_cap": 240, "min_members": 2, "batch_size": 80, "tdx_timeout": 3, "trading_only": True},
         "dedupe": "anchor_realtime_roles:{minute_key}",
     },
     {
+        "task_id": "headline_theme_role_evidence",
+        "task_name": "Headline Theme Role Evidence",
+        "task_description": "Precompute mostly-static headline-theme concept explanation payloads for evidence detail.",
+        "task_kind": "headline_theme_role_evidence",
+        "task_type": "warm",
+        "enabled": 0,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 47,
+        "timeout": 90,
+        "payload": {"force": True},
+        "dedupe": "headline_theme_role_evidence:{run_key}",
+    },
+    {
+        "task_id": "market_width_snapshot",
+        "task_name": "市场概览快照",
+        "task_description": "盘中分钟级采集全市场涨跌家数、3%强弱家数和成交额Top50。",
+        "task_kind": "market_width_snapshot",
+        "task_type": "hot",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 60,
+        "priority": 36,
+        "timeout": 90,
+        "payload": {"source": "tdx", "include_bj": False, "include_st": False, "batch_size": 80, "tdx_timeout": 3},
+        "dedupe": "market_width_snapshot:{minute_key}",
+    },
+    {
+        "task_id": "market_width_daily_close",
+        "task_name": "Market Width Daily Close",
+        "task_description": "After close, refresh daily bars and build confirmed close market-width snapshot for five-day structure.",
+        "task_kind": "market_width_daily_close",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 44,
+        "timeout": 1800,
+        "payload": {
+            "min_rows": 4000,
+            "workers": 12,
+            "batch_size": 900,
+            "wait_minutes": 20,
+            "retry_seconds": 120,
+            "refresh_bars": True,
+        },
+        "dedupe": "market_width_daily_close:{run_key}",
+    },
+    {
         "task_id": "auction_candidates",
-        "task_name": "09:25竞价候选池",
-        "task_description": "09:25按高开幅度、竞价金额、今日主题命中、板块共振生成开盘前候选池。",
+        "task_name": "09:15竞价封单Top3",
+        "task_description": "09:15-09:25持续刷新集合竞价，只保留涨停且封单额最大的Top3，并同步生成竞价摘要。",
         "task_kind": "auction_candidates",
         "task_type": "warm",
         "enabled": 1,
@@ -317,9 +434,9 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "priority": 58,
         "timeout": 540,
         "payload": {
-            "limit": 50,
-            "min_auction_pct": 1.0,
-            "min_auction_amount": 10000000,
+            "limit": 3,
+            "min_auction_pct": 0.0,
+            "min_auction_amount": 0,
             "theme_limit": 20,
             "timeout": 3,
             "batch_size": 80,
@@ -327,7 +444,7 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
             "loop_until": "09:25",
             "minute_interval": 60,
             "minute_top": 10,
-            "seal_top": 10,
+            "seal_top": 3,
         },
         "dedupe": "auction_candidates:{run_key}",
     },
@@ -337,7 +454,7 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "task_description": "Compress 09:20-09:25 auction minute radar into per-stock trend score, label, key points, and action hint.",
         "task_kind": "auction_trend_summary",
         "task_type": "warm",
-        "enabled": 1,
+        "enabled": 0,
         "schedule_type": "interval",
         "interval": 86400,
         "priority": 59,
@@ -348,25 +465,115 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
 ]
 
 
+SCHEDULED_TASKS = [
+    task
+    for task in SCHEDULED_TASKS
+    if str(task.get("task_id") or "") not in DEPRECATED_TASK_IDS
+    and not any(str(task.get("task_id") or "").startswith(prefix) for prefix in ARCHIVED_TASK_PREFIXES)
+]
+
+
+def _next_trade_day_timestamp(time_text: str) -> str:
+    return (
+        "TIMESTAMP("
+        "CASE "
+        "WHEN WEEKDAY(DATE_ADD(CURDATE(), INTERVAL 1 DAY)) = 5 THEN DATE_ADD(CURDATE(), INTERVAL 3 DAY) "
+        "WHEN WEEKDAY(DATE_ADD(CURDATE(), INTERVAL 1 DAY)) = 6 THEN DATE_ADD(CURDATE(), INTERVAL 2 DAY) "
+        "ELSE DATE_ADD(CURDATE(), INTERVAL 1 DAY) END, "
+        f"'{time_text}')"
+    )
+
+
+def _today_or_next_trade_day_timestamp(time_text: str) -> str:
+    next_day = _next_trade_day_timestamp(time_text)
+    return (
+        "CASE "
+        f"WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '{time_text}') "
+        f"WHEN TIME(NOW()) < '{time_text}' THEN TIMESTAMP(CURDATE(), '{time_text}') "
+        f"ELSE {next_day} END"
+    )
+
+
+def _next_pre_trade_night_timestamp(time_text: str) -> str:
+    return (
+        "TIMESTAMP("
+        "DATE_ADD(CURDATE(), INTERVAL "
+        "CASE "
+        f"WHEN TIME(NOW()) < '{time_text}' AND WEEKDAY(DATE_ADD(CURDATE(), INTERVAL 1 DAY)) < 5 THEN 0 "
+        "WHEN WEEKDAY(DATE_ADD(CURDATE(), INTERVAL 2 DAY)) < 5 THEN 1 "
+        "WHEN WEEKDAY(DATE_ADD(CURDATE(), INTERVAL 3 DAY)) < 5 THEN 2 "
+        "WHEN WEEKDAY(DATE_ADD(CURDATE(), INTERVAL 4 DAY)) < 5 THEN 3 "
+        "WHEN WEEKDAY(DATE_ADD(CURDATE(), INTERVAL 5 DAY)) < 5 THEN 4 "
+        "WHEN WEEKDAY(DATE_ADD(CURDATE(), INTERVAL 6 DAY)) < 5 THEN 5 "
+        "ELSE 6 END DAY), "
+        f"'{time_text}')"
+    )
+
+
 NEXT_RUN_SQL_BY_TASK = {
-    "ths_root_extended_items": "IF(TIME(NOW()) < '22:00:00', TIMESTAMP(CURDATE(), '22:00:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '22:00:00'))",
-    "morning_market_news": "IF(TIME(NOW()) < '08:30:00', TIMESTAMP(CURDATE(), '08:30:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '08:30:00'))",
-    "daily_market_themes": "IF(TIME(NOW()) < '08:32:00', TIMESTAMP(CURDATE(), '08:32:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '08:32:00'))",
-    "morning_reference_post": "IF(TIME(NOW()) < '08:35:00', TIMESTAMP(CURDATE(), '08:35:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '08:35:00'))",
-    "ths_hot_concepts": "IF(TIME(NOW()) < '15:30:00', TIMESTAMP(CURDATE(), '15:30:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '15:30:00'))",
-    "ths_limit_up_review": "IF(TIME(NOW()) < '15:40:00', TIMESTAMP(CURDATE(), '15:40:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '15:40:00'))",
-    "ths_stock_concepts": "IF(TIME(NOW()) < '15:35:00', TIMESTAMP(CURDATE(), '15:35:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '15:35:00'))",
-    "stock_theme_reason_bank": "IF(TIME(NOW()) < '16:20:00', TIMESTAMP(CURDATE(), '16:20:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '16:20:00'))",
-    "iwencai_period_rankings": "IF(TIME(NOW()) < '15:20:00', TIMESTAMP(CURDATE(), '15:20:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '15:20:00'))",
-    "lhb_seat_evidence": "IF(TIME(NOW()) < '15:35:00', TIMESTAMP(CURDATE(), '15:35:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '15:35:00'))",
-    "announcement_effects": "IF(TIME(NOW()) < '22:45:00', TIMESTAMP(CURDATE(), '22:45:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '22:45:00'))",
+    "ths_root_extended_items": _today_or_next_trade_day_timestamp("22:00:00"),
+    "pre_trade_night_evidence_prepare": _next_pre_trade_night_timestamp("22:30:00"),
+    "morning_market_news": _today_or_next_trade_day_timestamp("08:30:00"),
+    "daily_market_themes": _today_or_next_trade_day_timestamp("08:32:00"),
+    "morning_reference_post": _today_or_next_trade_day_timestamp("08:35:00"),
+    "scheduled_task_health_check": _today_or_next_trade_day_timestamp("08:00:00"),
+    "ths_market_after_close_summary": _today_or_next_trade_day_timestamp("15:45:00"),
+    "ths_hot_concepts": _today_or_next_trade_day_timestamp("15:30:00"),
+    "ths_homepage_headline_themes": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:10:00') "
+        "WHEN TIME(NOW()) < '09:10:00' THEN TIMESTAMP(CURDATE(), '09:10:00') "
+        "WHEN TIME(NOW()) < '11:45:00' THEN TIMESTAMP(CURDATE(), '11:45:00') "
+        f"ELSE {_next_trade_day_timestamp('09:10:00')} END"
+    ),
+    "eastmoney_limit_up_pool": _today_or_next_trade_day_timestamp("15:25:00"),
+    "research_pool_snapshot": _today_or_next_trade_day_timestamp("16:20:00"),
+    "post_close_leaderboard_snapshot": _today_or_next_trade_day_timestamp("16:20:00"),
+    "ths_stock_concepts": _today_or_next_trade_day_timestamp("16:30:00"),
+    "research_pool_theme_members": _today_or_next_trade_day_timestamp("09:15:00"),
+    "headline_theme_role_evidence": _today_or_next_trade_day_timestamp("09:16:00"),
+    "effective_facts": _today_or_next_trade_day_timestamp("23:05:00"),
     "async_evidence_source_sync": "IF(TIME(NOW()) < '09:35:00', TIMESTAMP(CURDATE(), '09:35:00'), NOW(3))",
     "root_evidence_cache_dirty": "IF(TIME(NOW()) < '09:35:00', TIMESTAMP(CURDATE(), '09:35:00'), NOW(3))",
-    "event_engine": "IF(TIME(NOW()) < '09:35:00', TIMESTAMP(CURDATE(), '09:35:00'), NOW(3))",
+    "event_engine": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:35:00') "
+        "WHEN TIME(NOW()) < '09:35:00' THEN TIMESTAMP(CURDATE(), '09:35:00') "
+        "WHEN TIME(NOW()) < '11:29:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
+        "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        f"ELSE {_next_trade_day_timestamp('09:35:00')} END"
+    ),
     "async_evidence_summary": "IF(TIME(NOW()) < '09:35:00', TIMESTAMP(CURDATE(), '09:35:00'), NOW(3))",
-    "stock_move_judgements": "IF(TIME(NOW()) < '09:35:00', TIMESTAMP(CURDATE(), '09:35:00'), NOW(3))",
-    "stock_move_judgement_dirty": "IF(TIME(NOW()) < '09:35:00', TIMESTAMP(CURDATE(), '09:35:00'), NOW(3))",
-    "auction_candidates": "IF(TIME(NOW()) < '09:20:00', TIMESTAMP(CURDATE(), '09:20:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '09:20:00'))",
+    "stock_move_judgements": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:35:00') "
+        "WHEN TIME(NOW()) < '09:35:00' THEN TIMESTAMP(CURDATE(), '09:35:00') "
+        "WHEN TIME(NOW()) < '11:29:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
+        "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        f"ELSE {_next_trade_day_timestamp('09:35:00')} END"
+    ),
+    "anchor_realtime_roles": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:30:00') "
+        "WHEN TIME(NOW()) < '09:30:00' THEN TIMESTAMP(CURDATE(), '09:30:00') "
+        "WHEN TIME(NOW()) < '11:29:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
+        "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        f"ELSE {_next_trade_day_timestamp('09:30:00')} END"
+    ),
+    "market_width_snapshot": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:30:00') "
+        "WHEN TIME(NOW()) < '09:30:00' THEN TIMESTAMP(CURDATE(), '09:30:00') "
+        "WHEN TIME(NOW()) < '11:29:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
+        "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        f"ELSE {_next_trade_day_timestamp('09:30:00')} END"
+    ),
+    "market_width_daily_close": _today_or_next_trade_day_timestamp("16:05:00"),
+    "auction_candidates": _today_or_next_trade_day_timestamp("09:15:00"),
     "auction_trend_summary": "IF(TIME(NOW()) < '09:26:00', TIMESTAMP(CURDATE(), '09:26:00'), TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 1 DAY), '09:26:00'))",
 }
 

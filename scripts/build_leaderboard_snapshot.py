@@ -1,0 +1,57 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from stock_move_scout.db import add_mysql_args, mysql_config_from_args
+from stock_move_scout.feed.leaderboard_snapshot import materialize_leaderboard_snapshot
+from stock_move_scout.research_pool import (
+    DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
+    DEFAULT_RESEARCH_POOL_GAIN_TOP,
+    DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Materialize post-close confirmed leaderboard snapshot.")
+    add_mysql_args(parser)
+    parser.add_argument("--trade-date", default=date.today().isoformat())
+    parser.add_argument("--limit-up-days", type=int, default=DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS)
+    parser.add_argument("--gain-period-days", type=int, default=DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS)
+    parser.add_argument("--gain-top", type=int, default=DEFAULT_RESEARCH_POOL_GAIN_TOP)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--skip-research-pool", action="store_true", help="Use existing research_pool_items without rebuilding it.")
+    parser.add_argument("--skip-dependency-check", action="store_true", help="Allow snapshot generation before post-close source tables are complete.")
+    return parser.parse_args()
+
+
+def main() -> int:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    args = parse_args()
+    if not args.mysql_enabled:
+        raise SystemExit("--mysql-enabled is required")
+    result = materialize_leaderboard_snapshot(
+        mysql_config_from_args(args),
+        str(args.trade_date),
+        limit_up_days=max(1, int(args.limit_up_days)),
+        gain_period_days=max(1, int(args.gain_period_days)),
+        gain_top=max(1, int(args.gain_top)),
+        force=bool(args.force),
+        rebuild_research_pool=not bool(args.skip_research_pool),
+        check_dependencies=not bool(args.skip_dependency_check),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -13,10 +13,13 @@ from datetime import date, datetime, timedelta, time as clock_time
 from pathlib import Path
 from typing import Any
 
-from stock_scout_mysql import add_mysql_args, mysql_config_from_args
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from stock_scout_mysql import add_mysql_args, mysql_config_from_args, mysql_rows, run_mysql, sql_string
 from stock_scout_mysql import record_scan_result as record_mysql_scan_result
 from stock_scout_mysql import record_window_result as record_mysql_window_result
 from stock_scout_mysql import latest_window_rank_rows, enqueue_hot_evidence_task, load_active_anchor_member_map, load_theme_reason_map, theme_reason_anchor_candidates, theme_reason_candidate_rank
+from stock_move_scout.research_pool import ResearchPoolProvider
 
 
 BASE_COLUMNS = [
@@ -48,6 +51,7 @@ BASE_COLUMNS = [
     "concept_count",
     "server",
     "basis",
+    "is_index",
 ]
 
 WINDOW_COLUMNS = BASE_COLUMNS + [
@@ -98,6 +102,11 @@ def project_root() -> Path:
 
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def session_open_text(now: datetime | None = None) -> str:
+    now = now or datetime.now()
+    return now.replace(hour=9, minute=30, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def market_phase(now: datetime | None = None) -> str:
@@ -170,6 +179,106 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(file))
 
 
+def parse_time_text(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(text[:26], fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def is_index_row(row: dict[str, Any]) -> bool:
+    return str(row.get("is_index") or "") == "1" or (
+        str(row.get("market") or "") == "1" and str(row.get("code") or "") == "000001" and "指数" in str(row.get("name") or "")
+    )
+
+
+def market_open_warmup(now: datetime, seconds: int) -> bool:
+    if seconds <= 0:
+        return False
+    current = now.time()
+    if clock_time(9, 30) <= current < clock_time(9, 31):
+        start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        return (now - start).total_seconds() < seconds
+    return False
+
+
+def confirm_realtime_rows(args: argparse.Namespace, raw_rows: list[dict[str, str]], scanned_at: str) -> list[dict[str, Any]]:
+    scanned_dt = parse_time_text(scanned_at) or datetime.now()
+    history: dict[str, list[dict[str, Any]]] = getattr(args, "_confirm_history", {})
+    confirmed: list[dict[str, Any]] = []
+    warmup = market_open_warmup(scanned_dt, int(args.opening_warmup_seconds))
+    recent_cutoff = scanned_dt - timedelta(seconds=max(20, int(args.emit_interval) + int(args.scan_interval) * 2))
+
+    for row in raw_rows:
+        if is_index_row(row) or is_excluded_mover(row):
+            continue
+        code = str(row.get("code") or "").strip()
+        if not code:
+            continue
+        item = dict(row)
+        item_dt = parse_time_text(item.get("captured_at")) or scanned_dt
+        item["_dt"] = item_dt
+        bucket = [old for old in history.get(code, []) if old.get("_dt") and old["_dt"] >= recent_cutoff]
+        bucket.append(item)
+        history[code] = bucket[-8:]
+        if warmup:
+            continue
+
+        price = to_float(item.get("price"))
+        speed_5s = to_float(item.get("speed"))
+        basis_parts: list[str] = []
+        signal_speed = 0.0
+        if speed_5s >= float(args.min_single_speed):
+            basis_parts.append(f"5s_speed>={float(args.min_single_speed):g}")
+            signal_speed = max(signal_speed, speed_5s)
+
+        compare_rows = [
+            old for old in bucket[:-1]
+            if old.get("_dt") and (item_dt - old["_dt"]).total_seconds() >= max(8, int(args.emit_interval) - 1)
+        ]
+        base = compare_rows[0] if compare_rows else None
+        if base and price > 0:
+            base_price = to_float(base.get("price"))
+            if base_price > 0:
+                speed_15s = (price / base_price - 1) * 100
+                if speed_15s >= float(args.min_15s_speed):
+                    basis_parts.append(f"15s_speed>={float(args.min_15s_speed):g}")
+                    signal_speed = max(signal_speed, speed_15s)
+
+        positive_recent = [old for old in bucket[-3:] if to_float(old.get("speed")) > 0]
+        if len(positive_recent) >= 2 and signal_speed >= float(args.min_speed_signal):
+            basis_parts.append("two_positive_ticks")
+
+        if not basis_parts:
+            continue
+        out = dict(item)
+        out.pop("_dt", None)
+        out["speed_5s"] = f"{speed_5s:.4f}"
+        if signal_speed:
+            out["speed"] = f"{signal_speed:.4f}"
+        out["basis"] = "confirmed_" + "+".join(dict.fromkeys(basis_parts))
+        confirmed.append(out)
+
+    setattr(args, "_confirm_history", history)
+    confirmed.sort(
+        key=lambda row: (
+            -to_float(row.get("speed")),
+            -to_float(row.get("amount_delta_15s")),
+            -to_float(row.get("amount")),
+        )
+    )
+    if int(args.scan_top) > 0:
+        confirmed = confirmed[: int(args.scan_top)]
+    for idx, row in enumerate(confirmed, start=1):
+        row["rank_speed"] = idx
+    return confirmed
+
+
 def write_csv(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as file:
@@ -237,6 +346,95 @@ def previous_rank_rows(args: argparse.Namespace) -> list[dict[str, str]]:
         except Exception as exc:
             print(f"[{now_text()}] mysql_previous_rank_warning {type(exc).__name__}:{exc}")
     return read_csv(args.window_top10_csv)
+
+
+def load_cumulative_scan_samples(
+    args: argparse.Namespace,
+    started_at: str,
+    ended_at: str,
+    research_pool_codes: list[str],
+) -> list[list[dict[str, Any]]]:
+    if not args.mysql_enabled:
+        return []
+    code_filter = ""
+    if research_pool_codes:
+        codes_sql = ",".join(sql_string(code) for code in research_pool_codes)
+        code_filter = f"AND sm.code IN ({codes_sql})"
+    sql = f"""
+    SELECT
+      sr.run_id,
+      DATE_FORMAT(sr.scanned_at, '%Y-%m-%d %H:%i:%s'),
+      DATE_FORMAT(sm.captured_at, '%Y-%m-%d %H:%i:%s'),
+      sm.rank_speed,
+      sm.rank_pct_change,
+      COALESCE(JSON_UNQUOTE(JSON_EXTRACT(sm.raw_row, '$.market')), ''),
+      sm.code,
+      sm.name,
+      sm.price,
+      sm.speed,
+      sm.pct_change,
+      sm.amount,
+      COALESCE(sm.amount_delta_15s, ''),
+      sm.volume,
+      COALESCE(sm.volume_delta_15s, ''),
+      sm.current_volume,
+      sm.bid1,
+      sm.ask1,
+      sm.industry,
+      sm.sub_industry,
+      COALESCE(JSON_UNQUOTE(JSON_EXTRACT(sm.raw_row, '$.industry_code')), ''),
+      COALESCE(JSON_UNQUOTE(JSON_EXTRACT(sm.raw_row, '$.sub_industry_code')), ''),
+      COALESCE(
+        NULLIF(JSON_UNQUOTE(JSON_EXTRACT(sm.raw_row, '$.concepts')), ''),
+        REPLACE(REPLACE(REPLACE(CAST(sm.concepts AS CHAR), '[', ''), ']', ''), '"', '')
+      ),
+      COALESCE(JSON_UNQUOTE(JSON_EXTRACT(sm.raw_row, '$.concept_count')), '0'),
+      COALESCE(JSON_UNQUOTE(JSON_EXTRACT(sm.raw_row, '$.server')), ''),
+      sm.basis
+    FROM scan_runs sr
+    JOIN scan_movers sm ON sm.scan_run_id = sr.id
+    WHERE sr.scanned_at >= {sql_string(started_at)}
+      AND sr.scanned_at <= {sql_string(ended_at)}
+      AND sr.accepted = 1
+      AND COALESCE(sm.speed, 0) >= {float(args.min_speed_signal)}
+      AND sm.name NOT LIKE '%ST%'
+      AND sm.name NOT LIKE '%退市%'
+      {code_filter}
+    ORDER BY sr.scanned_at ASC, sm.rank_speed ASC;
+    """
+    fields = [
+        "scan_run_id",
+        "scanned_at",
+        "captured_at",
+        "rank_speed",
+        "rank_pct_change",
+        "market",
+        "code",
+        "name",
+        "price",
+        "speed",
+        "pct_change",
+        "amount",
+        "amount_delta_15s",
+        "vol",
+        "vol_delta_15s",
+        "cur_vol",
+        "bid1",
+        "ask1",
+        "industry",
+        "sub_industry",
+        "industry_code",
+        "sub_industry_code",
+        "concepts",
+        "concept_count",
+        "server",
+        "basis",
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in mysql_rows(run_mysql(mysql_config_from_args(args), sql, batch=True, raw=True)):
+        item = dict(zip(fields, row))
+        grouped.setdefault(str(item.get("scanned_at") or item.get("scan_run_id") or ""), []).append(item)
+    return [grouped[key] for key in sorted(grouped)]
 
 
 def safe_id(value: str) -> str:
@@ -459,10 +657,8 @@ def related_theme_reason_info_for(
 
 def theme_reason_rank(info: dict[str, Any]) -> tuple[float, float, int]:
     source_rank = {
-        "ths_limit_up_review": 5,
         "ths_hot_concept": 4,
         "ths_stock_concept": 3,
-        "ths_root_theme_point": 2,
         "concept_tag": 1,
     }
     return (
@@ -741,7 +937,7 @@ def build_window_roles(
                         "amount_yi": round(amount_yi(row), 2),
                         "leader_code": leader.get("code", ""),
                         "core_code": core.get("code", ""),
-                        "anchor_source": "active_market_anchor" if had_active_anchor else "theme_reason_bank" if reason_info else "no_theme_anchor",
+                        "anchor_source": "research_pool_theme_members" if had_active_anchor else "ths_stock_concept" if reason_info else "no_theme_anchor",
                         "anchor_status": active_info.get("status", ""),
                         "anchor_match_level": active_info.get("match_level", ""),
                         "anchor_matched_term": active_info.get("matched_term", ""),
@@ -755,7 +951,7 @@ def build_window_roles(
                         "theme_reason_source": reason_info.get("source", ""),
                         "theme_reason_confidence": to_float(reason_info.get("confidence")) if reason_info else 0.0,
                         "theme_reason_priority": to_float(reason_info.get("priority")) if reason_info else 0.0,
-                        "anchor_method": "active_market_anchor_then_linked_static_bucket",
+                        "anchor_method": "research_pool_theme_then_linked_static_bucket",
                     },
                 }
             )
@@ -820,27 +1016,36 @@ def run_command(command: list[str], cwd: Path, timeout: int) -> tuple[int, str, 
     return result.returncode, output[-5000:], elapsed_ms(started)
 
 
+def current_scan_codes(args: argparse.Namespace) -> list[str]:
+    return list(getattr(args, "_current_scan_codes", []) or [])
+
+
 def scan_once(args: argparse.Namespace, root: Path) -> dict[str, Any]:
+    codes = current_scan_codes(args)
+    scan_limit = max(int(args.scan_top), len(codes)) if codes else int(args.scan_top)
     command = [
         sys.executable,
         str(root / "scripts" / "tdx_mover_watcher.py"),
         "--once",
         "--top",
-        str(args.scan_top),
+        str(scan_limit),
         "--max-signal-rows",
-        str(args.scan_top),
+        str(scan_limit),
         "--min-speed-signal",
         str(args.min_speed_signal),
-        "--min-amount-delta-15s",
-        str(args.min_amount_delta_15s),
-        "--min-amount-delta-speed",
-        str(args.min_amount_delta_speed),
         "--interval",
         str(args.scan_interval),
+        "--fresh-snapshot-max-age-seconds",
+        str(max(60, int(args.scan_interval) * 4)),
+        "--no-pct-change-first-run-signal",
     ]
+    if codes:
+        command.extend(["--codes", ",".join(codes)])
     returncode, output, duration_ms = run_command(command, root, args.scan_timeout)
     meta = read_json(args.tdx_meta_json)
-    rows = read_csv(args.speed_latest_csv)
+    raw_rows = read_csv(args.full_market_csv)
+    scanned_at = now_text()
+    rows = confirm_realtime_rows(args, raw_rows, scanned_at) if returncode == 0 else []
     phase = str(meta.get("market_phase") or meta.get("phase") or "")
     preserve_last = bool(meta.get("preserve_last_mover"))
     restored = bool(meta.get("restored_speed_latest") or meta.get("restored_judgement_latest"))
@@ -848,7 +1053,7 @@ def scan_once(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     accepted_preserve = args.include_preserved or not (restored or preserve_last)
     accepted = returncode == 0 and rows and accepted_preserve and accepted_phase
     return {
-        "scanned_at": now_text(),
+        "scanned_at": scanned_at,
         "returncode": returncode,
         "ok": returncode == 0,
         "accepted": accepted,
@@ -857,9 +1062,24 @@ def scan_once(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "preserve_last": preserve_last,
         "restored": restored,
         "row_count": len(rows),
+        "scan_scope": "recent_limit_up_or_5d_gain_top30" if codes else "default",
+        "scan_scope_code_count": len(codes),
+        "scan_limit": scan_limit,
+        "raw_quote_count": len(raw_rows),
+        "emit_interval": args.emit_interval,
+        "min_single_speed": args.min_single_speed,
+        "min_15s_speed": args.min_15s_speed,
+        "opening_warmup_seconds": args.opening_warmup_seconds,
         "rows": rows if accepted else [],
         "output_tail": output,
     }
+
+
+def load_window_research_pool_codes(args: argparse.Namespace) -> list[str]:
+    if not args.research_pool_only:
+        return []
+    codes = ResearchPoolProvider(mysql_config_from_args(args)).latest_codes(date.today().isoformat())
+    return [str(code).strip() for code in codes if str(code).strip()]
 
 
 def pick_better_row(current: dict[str, str], candidate: dict[str, str]) -> dict[str, str]:
@@ -1046,12 +1266,15 @@ def evidence_candidate_rows(args: argparse.Namespace, rows: list[dict[str, Any]]
 
 def parse_args() -> argparse.Namespace:
     root = project_root()
-    parser = argparse.ArgumentParser(description="Run 15s mover scans, rank repeated appearances, and trigger evidence every window.")
+    parser = argparse.ArgumentParser(description="Run quote scans, confirm realtime movers, and refresh cumulative stable ranks.")
     parser.add_argument("--once", action="store_true", help="run one aggregation window and exit")
-    parser.add_argument("--scan-interval", type=int, default=15)
-    parser.add_argument("--window-seconds", type=int, default=300)
+    parser.add_argument("--scan-interval", type=int, default=5)
+    parser.add_argument("--window-seconds", type=int, default=30)
+    parser.add_argument("--emit-interval", type=int, default=15)
     parser.add_argument("--scan-top", type=int, default=20)
-    parser.add_argument("--min-speed-signal", type=float, default=1.0)
+    parser.add_argument("--min-speed-signal", type=float, default=1.5)
+    parser.add_argument("--min-single-speed", type=float, default=1.8)
+    parser.add_argument("--min-15s-speed", type=float, default=1.5)
     parser.add_argument("--min-amount-delta-15s", type=float, default=30_000_000)
     parser.add_argument("--min-amount-delta-speed", type=float, default=0.5)
     parser.add_argument("--aggregate-top", type=int, default=5)
@@ -1067,6 +1290,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-preserved", action="store_true")
     parser.add_argument("--include-non-trading", action="store_true")
     parser.add_argument("--non-trading-sleep-seconds", type=int, default=60)
+    parser.add_argument("--opening-warmup-seconds", type=int, default=30)
+    parser.add_argument("--stop-new-windows-before-close-seconds", type=int, default=60)
+    parser.add_argument("--research-pool-only", dest="research_pool_only", action="store_true", help="scan and aggregate only active research pool stocks")
     parser.add_argument("--no-evidence", action="store_true")
     parser.add_argument("--community-manual-verify-wait", type=int, default=8)
     parser.add_argument("--community-verify-retries", type=int, default=0)
@@ -1076,6 +1302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=os.environ.get("OPENAI_MODEL", ""))
     parser.add_argument("--openai-base-url", default=os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or "")
     parser.add_argument("--speed-latest-csv", type=Path, default=root / "data" / "stock" / "tdx_mover_speed_top10_latest.csv")
+    parser.add_argument("--full-market-csv", type=Path, default=root / "data" / "stock" / "tdx_full_market_latest.csv")
     parser.add_argument("--tdx-meta-json", type=Path, default=root / "data" / "stock" / "tdx_mover_meta.json")
     parser.add_argument("--window-top10-csv", type=Path, default=root / "data" / "stock" / "tdx_mover_window_top10_latest.csv")
     parser.add_argument("--window-history-csv", type=Path, default=root / "data" / "stock" / "tdx_mover_window_top10_history.csv")
@@ -1096,9 +1323,32 @@ def run_window(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "reason": "outside_a_share_trading_time",
             "market_phase": market_phase(),
         }
+    if (
+        not args.include_non_trading
+        and remaining_seconds <= int(args.stop_new_windows_before_close_seconds)
+    ):
+        if not args.once:
+            time.sleep(max(1, min(remaining_seconds + 2, int(args.non_trading_sleep_seconds))))
+        return {
+            "updated_at": now_text(),
+            "status": "skipped",
+            "reason": "near_market_close",
+            "market_phase": market_phase(),
+            "trading_seconds_remaining": remaining_seconds,
+        }
     started = time.monotonic()
-    window_started_at = now_text()
-    run_id = safe_id(window_started_at)
+    run_started_at = now_text()
+    window_started_at = session_open_text()
+    run_id = "cum_" + safe_id(run_started_at)
+    research_pool_codes = load_window_research_pool_codes(args)
+    setattr(args, "_current_scan_codes", research_pool_codes)
+    if args.research_pool_only and not research_pool_codes:
+        return {
+            "updated_at": now_text(),
+            "status": "skipped",
+            "reason": "empty_recent_limit_up_or_5d_gain_top30_research_pool",
+            "market_phase": market_phase(),
+        }
     run_dir = args.snapshot_dir / run_id
     snapshot_top10_csv = run_dir / "window_top10.csv"
     snapshot_evidence_csv = run_dir / "evidence_top10.csv"
@@ -1130,7 +1380,10 @@ def run_window(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             time.sleep(max(0, args.scan_interval - elapsed))
 
     window_ended_at = now_text()
-    aggregated = aggregate_window(samples, args.aggregate_top, window_started_at, window_ended_at, previous_rank_map(previous_rows))
+    cumulative_samples = load_cumulative_scan_samples(args, window_started_at, window_ended_at, research_pool_codes)
+    aggregation_samples = cumulative_samples or samples
+    aggregate_limit = int(args.aggregate_top)
+    aggregated = aggregate_window(aggregation_samples, aggregate_limit, window_started_at, window_ended_at, previous_rank_map(previous_rows))
     active_anchor_map: dict[str, list[dict[str, Any]]] = {}
     theme_reason_map: dict[str, dict[str, dict[str, Any]]] = {}
     if args.mysql_enabled:
@@ -1152,7 +1405,9 @@ def run_window(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "window_ended_at": window_ended_at,
         "top10_csv": str(snapshot_evidence_csv),
         "window_top10_csv": str(snapshot_top10_csv),
-        "accepted_scans": len(samples),
+        "accepted_scans": len(aggregation_samples),
+        "current_window_accepted_scans": len(samples),
+        "cumulative_from_open": True,
         "top": [
             {
                 "rank_speed": row.get("rank_speed", ""),
@@ -1175,11 +1430,11 @@ def run_window(args: argparse.Namespace, root: Path) -> dict[str, Any]:
             "min_evidence_pct_change": args.min_evidence_pct_change,
             "include_st_evidence": args.include_st_evidence,
         }
-    elif len(samples) < args.min_accepted_scans:
+    elif len(aggregation_samples) < args.min_accepted_scans:
         evidence = {
             "launched": False,
             "queued": False,
-            "reason": f"accepted_scans_below_min_{len(samples)}_lt_{args.min_accepted_scans}",
+            "reason": f"accepted_scans_below_min_{len(aggregation_samples)}_lt_{args.min_accepted_scans}",
         }
     elif not args.no_evidence:
         evidence = launch_evidence_worker(args, root, evidence_request)
@@ -1199,7 +1454,12 @@ def run_window(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         "trading_seconds_remaining_at_start": remaining_seconds,
         "trading_time_only": not args.include_non_trading,
         "target_scans": target_scans,
-        "accepted_scans": len(samples),
+        "accepted_scans": len(aggregation_samples),
+        "current_window_accepted_scans": len(samples),
+        "cumulative_from_open": True,
+        "scan_scope": "recent_limit_up_or_5d_gain_top30" if args.research_pool_only else "default",
+        "scan_scope_code_count": len(research_pool_codes),
+        "aggregate_limit": aggregate_limit,
         "min_accepted_scans": args.min_accepted_scans,
         "aggregated_count": len(aggregated),
         "window_top10_csv": str(args.window_top10_csv),
@@ -1236,7 +1496,7 @@ def run_window(args: argparse.Namespace, root: Path) -> dict[str, Any]:
         write_json(args.window_meta_json, meta)
         write_json(snapshot_meta_json, meta)
     print(
-        f"[{meta['updated_at']}] window_done accepted_scans={len(samples)} "
+        f"[{meta['updated_at']}] window_done accepted_scans={len(aggregation_samples)} current_scans={len(samples)} "
         f"top={len(aggregated)} evidence_launched={evidence.get('launched')}"
     )
     return meta

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-DEFAULT_MIN_SPEED_SIGNAL = 1.0
+DEFAULT_MIN_SPEED_SIGNAL = 1.5
 DEFAULT_MIN_AMOUNT_DELTA_15S = 30_000_000.0
 DEFAULT_MIN_AMOUNT_DELTA_SPEED = 0.5
 
@@ -30,7 +30,7 @@ class RealtimeSignal:
 def is_excluded_stock_name(name: Any) -> bool:
     text = str(name or "").strip()
     upper = text.upper()
-    return "ST" in upper or "退市" in text or "閫€甯" in text
+    return "ST" in upper or "退市" in text
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -55,13 +55,10 @@ def realtime_signal(
 
     cfg = config or RealtimeFilterConfig()
     speed_value = safe_float(speed)
-    amount_delta_value = safe_float(amount_delta_15s)
     reasons: list[str] = []
 
     if speed_value >= cfg.min_speed_signal:
         reasons.append(f"speed>={cfg.min_speed_signal:g}")
-    if amount_delta_value >= cfg.min_amount_delta_15s and speed_value > cfg.min_amount_delta_speed:
-        reasons.append(f"amount_delta_15s>={cfg.min_amount_delta_15s:g}&speed>{cfg.min_amount_delta_speed:g}")
 
     return RealtimeSignal(bool(reasons), tuple(reasons))
 

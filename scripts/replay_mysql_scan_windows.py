@@ -140,7 +140,7 @@ def apply_signal_filter(
         if is_excluded_mover(row):
             continue
         speed = to_float(row.get("speed"))
-        if speed >= min_speed_signal or (amount_delta >= min_amount_delta_15s and speed > min_amount_delta_speed):
+        if speed >= min_speed_signal:
             filtered.append(row)
 
     return filtered
@@ -192,7 +192,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aggregate-top", type=int, default=5)
     parser.add_argument("--evidence-top", type=int, default=5)
     parser.add_argument("--min-accepted-scans", type=int, default=3)
-    parser.add_argument("--min-speed-signal", type=float, default=1.0)
+    parser.add_argument("--min-speed-signal", type=float, default=1.5)
     parser.add_argument("--min-amount-delta-15s", type=float, default=30_000_000)
     parser.add_argument("--min-amount-delta-speed", type=float, default=0.5)
     parser.add_argument("--min-evidence-pct-change", type=float, default=0.0)

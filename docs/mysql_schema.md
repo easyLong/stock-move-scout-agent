@@ -1,73 +1,59 @@
-# 股票异动侦察 MySQL 表设计
+# MySQL 表说明
 
-## 原则
+## 研究池
 
-MySQL 是唯一业务状态源。
+| 表 | 用途 |
+| --- | --- |
+| `research_pool_snapshots` | 每个服务交易日的研究池快照 |
+| `research_pool_items` | 研究池成分，区分情绪票和趋势票来源 |
+| `research_pool_theme_members` | 研究池股票和同花顺题材/概念解释的关系 |
 
-## 核心表
+研究池服务日必须是交易日。周末服务日数据应视为脏数据并清理。
 
-```text
-stocks                    股票基础信息
-stock_company_profiles    冷数据，公司画像/主营/官网
+## 盘中行情和市场概览
 
-scan_runs                 每次通达信扫描
-scan_movers               每次扫描 TopN 明细
+| 表 | 用途 |
+| --- | --- |
+| `scan_runs` / `scan_movers` | 盘中实时扫描 |
+| `windows` / `window_movers` | 开盘至今窗口强度 |
+| `market_width_snapshots` | 全市场、成交额Top50、研究池宽度快照 |
+| `market_width_amount_top50` | 每个市场概览快照的成交额Top50 |
 
-windows                   5分钟聚合窗口
-window_movers             窗口排名
-evidence_candidates       当前窗口待补证据股票
+新逻辑只使用 `research_pool_*` 字段，旧问财 Top50 物理字段已移除。
 
-community_posts           雪球原帖
-community_evidence        社区叙事提炼
-community_evidence_posts  叙事与原帖引用关系
+## 涨停池和日K
 
-official_evidence         公告/新闻/互动易/官网新闻
-window_official_evidence  窗口与官方证据引用关系
+| 表 | 用途 |
+| --- | --- |
+| `limit_up_pool_items` | 东方财富涨停池，来自 AkShare `stock_zt_pool_em` |
+| `stock_daily_bars` | 日K，主要来自 AkShare `stock_zh_a_hist` |
 
-evidence_layers           综合证据层
-generated_posts           最终文案
+`post_close_leaderboard_snapshot` 必须在这两类数据和收盘市场宽度完整后运行。
 
-scheduled_tasks           周期任务定义
-task_queue                可执行任务队列
-task_runs                 执行历史
-worker_heartbeats         worker 心跳
-pipeline_events           流程事件
-```
+## 有效事实和证据缓存
 
-## 常用查询
+| 表/视图 | 用途 |
+| --- | --- |
+| `stock_ths_root_items` | F10 近期重要事件原始事实 |
+| `stock_current_effective_facts_view` | 近10日有效事实候选视图 |
+| `stock_effective_facts` | 有效事实落库 |
+| `async_evidence_summaries` | 有效事实总结 |
+| `stock_root_evidence_cache` | Web 根证据缓存 |
 
-最新窗口榜：
+## 领头羊
 
-```sql
-SELECT rank_no, code, name, appearance_count, avg_rank_speed, max_speed, latest_pct_change
-FROM v_latest_window_movers
-ORDER BY rank_no;
-```
+| 表 | 用途 |
+| --- | --- |
+| `leaderboard_snapshots` | 收盘确认版领头羊整页快照 |
 
-最新证据层：
+盘中 `leaders` 页面读最近收盘确认快照；盘后 16:20 后读当天确认快照。
 
-```sql
-SELECT rank_no, code, evidence_strength, community_status, evidence_gaps
-FROM v_latest_evidence_layers
-ORDER BY rank_no;
-```
+## 已退出主链路
 
-最终文案：
-
-```sql
-SELECT gp.code, s.name, gp.content
-FROM generated_posts gp
-JOIN windows w ON w.id = gp.window_id
-LEFT JOIN stocks s ON s.code = gp.code
-WHERE w.window_id = '20260507_134934'
-  AND gp.post_type = 'dav_info_gap'
-ORDER BY gp.id;
-```
-
-任务状态：
-
-```sql
-SELECT task_type, task_kind, status, COUNT(*)
-FROM task_queue
-GROUP BY task_type, task_kind, status;
-```
+| 对象 | 状态 |
+| --- | --- |
+| `stock_active_facts` | 已退出 |
+| `stock_announcement_effects` | 已退出 |
+| `stock_theme_reason_bank` | 已退出 |
+| `ths_limit_up_review_items` | 已退出 |
+| `stock_move_judgement_dirty_queue` | 已归档 |

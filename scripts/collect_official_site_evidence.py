@@ -229,12 +229,14 @@ def make_root_item(
     item_date: str,
     title: str,
     content: str = "",
+    detail_content: str = "",
     url: str = "",
     tags: list[str] | None = None,
     source_status: str = "ths_root_ok",
     raw: dict[str, Any] | None = None,
+    key_content: str = "",
 ) -> dict[str, Any]:
-    key = item_key(kind, item_date, title, url, content)
+    key = item_key(kind, item_date, title, url, key_content or content)
     return {
         "code": code,
         "stock_name": stock_name,
@@ -245,6 +247,7 @@ def make_root_item(
         "item_date": item_date,
         "title": compact(title, 512),
         "content": compact(content, 4000),
+        "detail_content": compact(detail_content, 8000),
         "url": absolute_ths_url(url),
         "tags": tags or [],
         "importance": 0,
@@ -266,7 +269,11 @@ def parse_pointnew_items(soup: BeautifulSoup, code: str, stock_name: str, fetche
         body = cells[1]
         label_node = body.find("strong")
         label = compact(label_node.get_text(" ", strip=True), 80).rstrip(":：") if label_node else "重要事件"
+        detail_content = compact(" ".join(node.get_text(" ", strip=True) for node in body.select(".check_else")), 8000)
         for noisy in body.select("a.check_details, a.hla, span.open_btn, span.close_btn"):
+            noisy.decompose()
+        full_text = compact(body.get_text(" ", strip=True), 4000)
+        for noisy in body.select(".check_else"):
             noisy.decompose()
         url = ""
         link = body.find("a", href=True)
@@ -288,103 +295,135 @@ def parse_pointnew_items(soup: BeautifulSoup, code: str, stock_name: str, fetche
                 item_date,
                 title,
                 text,
+                detail_content,
                 url,
                 [label],
-                raw={"date_text": cells[0].get_text(" ", strip=True)},
+                raw={"date_text": cells[0].get_text(" ", strip=True), "has_detail": bool(detail_content)},
+                key_content=full_text,
             )
         )
     return items
 
 
-def parse_news_items(soup: BeautifulSoup, code: str, stock_name: str, fetched_at: datetime) -> list[dict[str, Any]]:
-    root = soup.select_one("#news")
+def parse_lhb_detail_items(soup: BeautifulSoup, code: str, stock_name: str, fetched_at: datetime) -> list[dict[str, Any]]:
+    root = soup.select_one("#payback")
     if not root:
         return []
+    tab_dates: dict[str, str] = {}
+    for link in root.select(".m_tab a[targ]"):
+        tab_id = str(link.get("targ") or "").strip()
+        date_text = parse_date_text(link.get_text(" ", strip=True), fetched_at)
+        if tab_id and date_text:
+            tab_dates[tab_id] = date_text
     items: list[dict[str, Any]] = []
-    rank = 0
-    for block in root.select(".newslist"):
-        heading = compact((block.select_one(".news_title") or block).get_text(" ", strip=True), 80)
-        if "热点新闻" in heading:
-            kind = "hot_news"
-        elif "公司公告" in heading:
-            kind = "announcement"
-        else:
+    for rank, panel in enumerate(root.select(".m_tab_content[id]"), start=1):
+        panel_id = str(panel.get("id") or "").strip()
+        item_date = tab_dates.get(panel_id) or parse_date_text(panel.get_text(" ", strip=True), fetched_at)
+        if not item_date:
             continue
-        for link in block.select("li a[href]"):
-            url = absolute_ths_url(str(link.get("href") or ""))
-            title = compact(link.get("title") or link.get_text(" ", strip=True), 512)
-            if not title or title == "更多>>":
+        reason_node = panel.select_one(".the_reasons em") or panel.select_one(".the_reasons")
+        reason = compact(reason_node.get_text(" ", strip=True), 260) if reason_node else ""
+        seats: list[dict[str, Any]] = []
+        totals: list[str] = []
+        for row_no, tr in enumerate(panel.select("tbody tr"), start=1):
+            cells = tr.find_all(["th", "td"])
+            texts = [compact(cell.get_text(" ", strip=True), 260) for cell in cells]
+            if not texts:
                 continue
-            date_node = link.find("span", class_="gray")
-            date_text = date_node.get_text(" ", strip=True) if date_node else ""
-            item_date = parse_date_text(date_text, fetched_at)
-            if date_node:
-                date_node.extract()
-                title = compact(link.get("title") or link.get_text(" ", strip=True), 512)
-            rank += 1
-            items.append(
-                make_root_item(
-                    code,
-                    stock_name,
-                    kind,
-                    "#news",
-                    rank,
-                    item_date,
-                    title,
-                    "",
-                    url,
-                    [heading.replace("更多>>", "").strip()],
-                    raw={"date_text": date_text, "heading": heading},
-                )
+            if len(texts) < 6:
+                total_text = compact(" ".join(texts), 120)
+                if total_text:
+                    totals.append(total_text)
+                continue
+            th = tr.find("th")
+            seat_link = th.find("a") if th else None
+            seat_name = compact(seat_link.get_text(" ", strip=True), 180) if seat_link else texts[0]
+            labels: list[dict[str, str]] = []
+            if th:
+                for label in th.select("label.label"):
+                    label_node = label.select_one("span")
+                    label_name = compact(label_node.get_text(" ", strip=True), 48) if label_node else ""
+                    tip_node = label.select_one(".label-tips")
+                    label_tip = compact(tip_node.get_text(" ", strip=True), 500) if tip_node else ""
+                    if label_name:
+                        labels.append({"name": label_name, "explain": label_tip})
+            side = ""
+            marker = " ".join(
+                str(value or "")
+                for value in [
+                    seat_link.get("newtaid") if seat_link else "",
+                    seat_link.get("href") if seat_link else "",
+                ]
             )
-    return items
-
-
-def fetch_theme_point_items(code: str, stock_name: str, market_id: str, timeout: int) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
-    if not code or not market_id:
-        return [], "theme_missing_market", []
-    url = f"https://basic.10jqka.com.cn/fuyao/f10_stock_index/concept/v1/theme_key_points?subject={market_id}-{code}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": f"https://basic.10jqka.com.cn/{code}/",
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=timeout)
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:
-        return [], f"theme_error:{type(exc).__name__}:{exc}", []
-    if int(payload.get("status_code", -1)) != 0:
-        return [], f"theme_status:{payload.get('status_code')}:{payload.get('status_msg', '')}", []
-    data = payload.get("data") or []
-    rows = data if isinstance(data, list) else []
-    items: list[dict[str, Any]] = []
-    for rank, item in enumerate(rows, start=1):
-        if not isinstance(item, dict):
+            if "mairu" in marker:
+                side = "buy"
+            elif "maichu" in marker:
+                side = "sell"
+            seats.append(
+                {
+                    "row_no": row_no,
+                    "side": side,
+                    "seat_name": seat_name,
+                    "buy_amount": texts[1],
+                    "buy_ratio": texts[2],
+                    "sell_amount": texts[3],
+                    "sell_ratio": texts[4],
+                    "net_amount": texts[5],
+                    "labels": labels,
+                    "url": absolute_ths_url(str(seat_link.get("href") or "")) if seat_link else "",
+                }
+            )
+        if not seats and not totals:
             continue
-        title = compact(item.get("title", ""), 512)
-        content = compact(item.get("content", ""), 4000)
-        item_date = parse_date_text(str(item.get("update_date", "")))
-        if not title and not content:
-            continue
+        tagged_lines: list[str] = []
+        detail_lines: list[str] = []
+        for seat in seats:
+            label_text = "、".join(label.get("name", "") for label in seat.get("labels", []) if label.get("name"))
+            side_text = {"buy": "买入席位", "sell": "卖出席位"}.get(str(seat.get("side") or ""), "席位")
+            money_text = f"买入{seat.get('buy_amount', '')}，卖出{seat.get('sell_amount', '')}，净额{seat.get('net_amount', '')}"
+            line = f"{side_text}：{seat.get('seat_name', '')}；{money_text}"
+            if label_text:
+                line += f"；席位标签：{label_text}"
+                tagged_lines.append(line)
+            detail_lines.append(line)
+            for label in seat.get("labels", []):
+                if label.get("name") and label.get("explain"):
+                    detail_lines.append(f"{label.get('name')}解释：{label.get('explain')}")
+        content_parts = []
+        if reason:
+            content_parts.append(f"上榜原因：{reason}")
+        content_parts.extend(totals[:3])
+        content_parts.extend(tagged_lines[:3])
+        detail_parts = []
+        if reason:
+            detail_parts.append(f"上榜原因：{reason}")
+        detail_parts.extend(detail_lines)
+        detail_parts.extend(totals)
         items.append(
             make_root_item(
                 code,
                 stock_name,
-                "theme_point",
-                "theme_key_points",
+                "important_event",
+                "#payback",
                 rank,
                 item_date,
-                title or content[:120],
-                content,
-                url,
-                ["题材要点"],
-                "theme_ok",
-                raw=item,
+                "\u9f99 \u864e \u699c",
+                "；".join(content_parts),
+                "\n".join(detail_parts),
+                "",
+                ["\u9f99\u864e\u699c"],
+                source_status="ths_lhb_detail_ok",
+                raw={
+                    "date_text": item_date,
+                    "reason": reason,
+                    "lhb_seats": seats,
+                    "lhb_totals": totals,
+                    "has_detail": bool(detail_parts),
+                },
+                key_content="\n".join(detail_parts) or "；".join(content_parts),
             )
         )
-    return items, "theme_ok", rows[:20]
+    return items
 
 
 def get_ths_root_profile(code: str, timeout: int, stock_name: str = "") -> dict[str, Any]:
@@ -421,14 +460,12 @@ def get_ths_root_profile(code: str, timeout: int, stock_name: str = "") -> dict[
             1200,
         )
     )
-    root_items = parse_pointnew_items(soup, code, stock_name, fetched_at_dt) + parse_news_items(soup, code, stock_name, fetched_at_dt)
-    theme_items, theme_status, theme_raw = fetch_theme_point_items(code, stock_name, market_id, timeout)
-    root_items.extend(theme_items)
+    root_items = parse_pointnew_items(soup, code, stock_name, fetched_at_dt)
+    root_items.extend(parse_lhb_detail_items(soup, code, stock_name, fetched_at_dt))
     status = "ths_profile_ok" if any([company_highlights, main_business, sw_industry, concept_tags]) else "ths_profile_empty"
     section_counts: dict[str, int] = {}
     for item in root_items:
         section_counts[item.get("item_kind", "other")] = section_counts.get(item.get("item_kind", "other"), 0) + 1
-    status = ";".join([status, theme_status])
     profile_json = {
         "company_highlights": company_highlights,
         "main_business": main_business,
@@ -457,13 +494,9 @@ def get_ths_root_profile(code: str, timeout: int, stock_name: str = "") -> dict[
             "sections_json": {
                 "section_counts": section_counts,
                 "pointnew_text": compact((soup.select_one("#pointnew") or "").get_text(" ", strip=True) if soup.select_one("#pointnew") else "", 1600),
-                "news_text": compact((soup.select_one("#news") or "").get_text(" ", strip=True) if soup.select_one("#news") else "", 1200),
             },
             "raw_json": {
                 "page_stock_code": page_stock_code,
-                "theme_status": theme_status,
-                "theme_count": len(theme_items),
-                "theme_sample": theme_raw[:3],
             },
         },
     }

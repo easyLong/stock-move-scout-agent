@@ -39,7 +39,7 @@ def build_display_contract(row: dict[str, Any], scored: dict[str, Any], texts: d
     detail = scored.get("score_detail") or {}
     influence_reasons = detail.get("influence_reasons") or []
     initiative_reasons = detail.get("initiative_reasons") or []
-    leadership_reasons = detail.get("anchor_leadership_reasons") or []
+    leadership_reasons = []
     tape_reasons = detail.get("tape_confirm_reasons") or []
     risk_flags = detail.get("risk_flags") or []
     speed = as_float(row.get("speed"))

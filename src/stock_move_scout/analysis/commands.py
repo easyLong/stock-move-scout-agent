@@ -4,6 +4,10 @@ from pathlib import Path
 from typing import Any
 
 
+def _research_pool_only(payload: dict[str, Any]) -> bool:
+    return bool(payload.get("research_pool_only"))
+
+
 def build_analysis_command(
     *,
     kind: str,
@@ -31,6 +35,21 @@ def build_analysis_command(
             command.append("--trading-only")
         if payload.get("servers"):
             command.extend(["--servers", str(payload.get("servers"))])
+        if payload.get("trade_date"):
+            command.extend(["--trade-date", str(payload.get("trade_date"))])
+        if _research_pool_only(payload):
+            command.append("--research-pool-only")
+        return command + mysql_args
+
+    if kind == "headline_theme_role_evidence":
+        command = [
+            python_executable,
+            str(root / "scripts" / "build_headline_theme_role_evidence.py"),
+        ]
+        if payload.get("trade_date"):
+            command.extend(["--trade-date", str(payload.get("trade_date"))])
+        if payload.get("force", True):
+            command.append("--force")
         return command + mysql_args
 
     return None

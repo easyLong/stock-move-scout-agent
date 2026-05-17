@@ -402,10 +402,6 @@ def format_root_item(row: dict[str, str], limit: int = 36) -> str:
     title = compact_text(row.get("title", ""), 90)
     content = compact_text(row.get("content", ""), 120)
     body = content if title in ("发布公告", "业绩披露", "分配预案", "异动提醒") and content else title
-    if row.get("item_kind") == "announcement":
-        body = title
-    if row.get("item_kind") == "theme_point" and content:
-        body = f"{title}：{content}"
     body = re.sub(r"^《(.+?)》.*$", r"\1", body).strip()
     body = strip_stock_prefix(body)
     body = body.strip(" 《》")
@@ -450,14 +446,14 @@ def mysql_ths_root_evidence_rows(config: Any, window_id: str) -> tuple[list[dict
       JOIN window_movers wm ON wm.code = i.code
       JOIN windows w ON w.id = wm.window_id
       WHERE w.window_id = {sql_string(window_id)}
-        AND i.item_kind IN ('important_event', 'announcement', 'theme_point')
+        AND i.item_kind='important_event'
     )
     SELECT
       code, item_kind, item_date, title, content, url, tags, source_rank
     FROM ranked
     WHERE rn <= 5
     ORDER BY code,
-      FIELD(item_kind, 'important_event', 'announcement', 'theme_point'),
+      FIELD(item_kind, 'important_event'),
       item_date DESC,
       source_rank ASC;
     """
@@ -484,15 +480,13 @@ def mysql_ths_root_evidence_rows(config: Any, window_id: str) -> tuple[list[dict
     amount_keywords = ["元", "万元", "亿元", "金额", "收入", "利润", "产量", "订单", "合同"]
     for code, kinds in by_stock.items():
         important = kinds.get("important_event", [])
-        announcements = kinds.get("announcement", [])
-        theme_points = kinds.get("theme_point", [])
         routine_titles = {"融资融券", "股东大会", "股东人数变化", "投资互动", "发布公告"}
         signal_important = [item for item in important if item.get("title") not in routine_titles]
-        if not signal_important and not announcements:
+        if not signal_important:
             signal_important = important[:2]
-        hard_items = signal_important + announcements
+        hard_items = signal_important
         hard_text = " ".join(first_nonempty(item.get("content"), item.get("title")) for item in hard_items)
-        hard_summary = summarize_root_items(signal_important[:1] + announcements, "事件/公告", 3)
+        hard_summary = summarize_root_items(signal_important[:1], "事件", 3)
         if hard_summary:
             catalyst_types = classify_catalyst_types(hard_text)
             order_text = "；".join(format_root_item(item, 90) for item in hard_items if has_any(first_nonempty(item.get("content"), item.get("title")), ["订单", "合同", "中标", "合作", "客户", "协议"]))
@@ -503,7 +497,7 @@ def mysql_ths_root_evidence_rows(config: Any, window_id: str) -> tuple[list[dict
                     "code": code,
                     "hard_catalyst_summary": hard_summary,
                     "hard_evidence_strength": "强硬证据" if has_any(hard_text, strong_keywords) else "中等硬证据",
-                    "hard_catalyst_types": catalyst_types or "近期事件/公告",
+                    "hard_catalyst_types": catalyst_types or "近期重要事件",
                     "stone_evidence_summary": summarize_root_items(important, "事件", 3),
                     "order_cooperation_evidence": compact_text(order_text, 260),
                     "order_cooperation_hard_evidence": compact_text(order_text, 420),
@@ -511,24 +505,6 @@ def mysql_ths_root_evidence_rows(config: Any, window_id: str) -> tuple[list[dict
                     "financial_evidence": compact_text(amount_text if has_any(hard_text, ["业绩", "净利润", "收入", "利润", "一季报", "年报"]) else "", 260),
                     "risk_evidence": compact_text(risk_text, 260),
                     "evidence_gap": "",
-                }
-            )
-        if theme_points:
-            theme_summary = summarize_root_items(theme_points, "题材要点", 4)
-            theme_text = " ".join(first_nonempty(item.get("content"), item.get("title")) for item in theme_points)
-            supplemental_rows.append(
-                {
-                    "code": code,
-                    "supplemental_strength": "根页补充证据",
-                    "supplemental_summary": theme_summary,
-                    "news_evidence": "",
-                    "irm_evidence": "",
-                    "official_news_evidence": compact_text(theme_summary, 300),
-                    "order_cooperation_supplement": compact_text("；".join(format_root_item(item, 90) for item in theme_points if has_any(first_nonempty(item.get("content"), item.get("title")), ["合作", "协议", "客户", "订单", "合同"])), 420),
-                    "customer_partner_supplement": compact_text("；".join(format_root_item(item, 90) for item in theme_points if has_any(first_nonempty(item.get("content"), item.get("title")), ["客户", "合作方", "供应商", "下游", "上游"])), 360),
-                    "amount_terms_supplement": compact_text("；".join(format_root_item(item, 90) for item in theme_points if has_any(first_nonempty(item.get("content"), item.get("title")), amount_keywords)), 360),
-                    "evidence_gap": "",
-                    "theme_text": theme_text,
                 }
             )
     return hard_rows, supplemental_rows
@@ -688,7 +664,7 @@ def hard_evidence_fields(row: dict[str, str] | None) -> dict[str, str]:
             "financial_evidence": "",
             "ma_evidence": "",
             "risk_evidence": "",
-            "hard_evidence_gap": "根页面暂无近期事件/公告",
+            "hard_evidence_gap": "根页面暂无近期重要事件",
         }
     return {
         "hard_evidence_summary": compact_text(row.get("hard_catalyst_summary", ""), 170),
@@ -717,7 +693,7 @@ def supplemental_evidence_fields(row: dict[str, str] | None) -> dict[str, str]:
             "order_cooperation_supplement": "",
             "customer_partner_supplement": "",
             "amount_terms_supplement": "",
-            "supplemental_evidence_gap": "根页面暂无题材要点",
+            "supplemental_evidence_gap": "根页面暂无重要事件",
         }
     return {
         "supplemental_strength": compact_text(row.get("supplemental_strength", ""), 80),
@@ -760,11 +736,11 @@ def evidence_strength(
     if hard_order_detail and (has_community or has_sector):
         return "硬证据较强", "公告原文出现订单/合作/客户等片段，并与行情或叙事线索可交叉验证"
     if hard_summary and hard_strength == "强硬证据" and (has_community or has_sector):
-        return "硬证据待核", "同花顺根页面出现近期公告/事件，需点开原文确认细节"
+        return "硬证据待核", "同花顺根页面出现近期重要事件，需点开原文确认细节"
     if supplemental_order and (supplemental_customer or supplemental_amount):
-        return "补充证据较强", "题材要点命中合作/客户/金额线索，需要回同花顺原文二次核验"
+        return "补充证据较强", "补充线索命中合作/客户/金额线索，需要回原文二次核验"
     if supplemental_order or supplemental_strength in ("中等补充证据", "根页补充证据") and supplemental_summary and has_community:
-        return "补充证据中等", "题材要点可支持社区叙事，但还需要近期事件/公告闭环"
+        return "补充证据中等", "补充线索可支持社区叙事，但还需要近期重要事件闭环"
     if hard_amount and hard_summary and (has_community or has_sector):
         return "硬证据中等", "公告原文出现金额/条款片段，但仍需确认是否直接解释本次异动"
     if (hard_strength == "强硬证据" or has_direct_hard_title) and (has_community or has_sector):
@@ -807,16 +783,16 @@ def next_action(strength: str) -> str:
     if strength == "硬证据待核":
         return "点开公告原文，确认标题级催化是否有金额、客户和履约条件"
     if strength == "补充证据较强":
-        return "打开题材要点原文，确认合作方、金额、期限和是否为上市公司口径"
+        return "打开原文，确认合作方、金额、期限和是否为上市公司口径"
     if strength == "补充证据中等":
-        return "用近期事件/公告继续核实题材要点"
+        return "用近期重要事件继续核实补充线索"
     if strength == "线索较强":
-        return "优先看近期事件/公告，验证社区叙事是否真实"
+        return "优先看近期重要事件，验证社区叙事是否真实"
     if strength == "线索中等":
-        return "补近期事件和公告，确认是否有硬催化"
+        return "补近期重要事件，确认是否有硬催化"
     if strength == "线索偏弱":
         return "扩大社区样本或换源到股吧/新闻"
-    return "先补社区热帖，再看根页面近期事件/公告"
+    return "先补社区热帖，再看根页面近期重要事件"
 
 
 def build_rows(
