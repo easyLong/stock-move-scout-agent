@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1240" viewBox="0 0 1800 1240">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f7f9fc"/>
+      <stop offset="55%" stop-color="#f2f6f8"/>
+      <stop offset="100%" stop-color="#f8f7f2"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#506070"/>
+    </marker>
+    <marker id="hotArrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c4553d"/>
+    </marker>
+    <marker id="coldArrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#34699a"/>
+    </marker>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#29323a" flood-opacity="0.11"/>
+    </filter>
+    <style>
+      .title { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; font-size: 44px; font-weight: 800; fill: #202a33; }
+      .subtitle { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; font-size: 20px; fill: #596775; }
+      .section-title { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; font-size: 24px; font-weight: 800; fill: #27313b; }
+      .card-title { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; font-size: 20px; font-weight: 800; fill: #25313b; }
+      .small-title { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; font-size: 17px; font-weight: 700; fill: #25313b; }
+      .text { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; font-size: 16px; fill: #42505c; }
+      .mini { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; font-size: 14px; fill: #62707d; }
+      .tag { font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; font-size: 14px; font-weight: 700; fill: #ffffff; }
+      .code { font-family: Consolas, "Microsoft YaHei", monospace; font-size: 14px; fill: #4d5964; }
+      .box { rx: 18; filter: url(#shadow); stroke-width: 1.2; }
+      .thin { stroke: #506070; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .hot { stroke: #c4553d; stroke-width: 2.6; fill: none; marker-end: url(#hotArrow); }
+      .cold { stroke: #34699a; stroke-width: 2.6; fill: none; marker-end: url(#coldArrow); }
+      .dash { stroke-dasharray: 8 8; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1240" fill="url(#bg)"/>
+  <text x="70" y="72" class="title">股票异动侦查项目架构图</text>
+  <text x="72" y="110" class="subtitle">研究池驱动 · 盘后冷数据确认 · 盘中热数据扫描 · 有效证据缓存优先 · 页面快速展示</text>
+
+  <rect x="1390" y="46" width="330" height="74" rx="18" fill="#ffffff" stroke="#d8e0e7"/>
+  <text x="1415" y="78" class="small-title">核心目标</text>
+  <text x="1415" y="103" class="mini">个股异动 → 定位原因 → 找真正有效证据</text>
+
+  <!-- Data source layer -->
+  <rect x="70" y="160" width="330" height="820" class="box" fill="#ffffff" stroke="#dbe3ea"/>
+  <text x="100" y="205" class="section-title">1. 数据源层</text>
+
+  <rect x="100" y="235" width="270" height="128" rx="14" fill="#fef5f1" stroke="#f0cfc3"/>
+  <rect x="116" y="252" width="58" height="25" rx="12" fill="#c4553d"/>
+  <text x="130" y="270" class="tag">HOT</text>
+  <text x="116" y="304" class="card-title">实时行情</text>
+  <text x="116" y="331" class="text">通达信快照</text>
+  <text x="116" y="354" class="mini">涨速 / 成交额 / 市场宽度</text>
+
+  <rect x="100" y="385" width="270" height="142" rx="14" fill="#eef7ff" stroke="#c4d9ee"/>
+  <rect x="116" y="402" width="66" height="25" rx="12" fill="#34699a"/>
+  <text x="130" y="420" class="tag">COLD</text>
+  <text x="116" y="454" class="card-title">盘后确认</text>
+  <text x="116" y="481" class="text">东方财富涨停池</text>
+  <text x="116" y="504" class="mini">AkShare 日 K / 收盘市场概览</text>
+
+  <rect x="100" y="550" width="270" height="155" rx="14" fill="#f2fbf4" stroke="#c9e7d0"/>
+  <rect x="116" y="567" width="66" height="25" rx="12" fill="#4a8b5f"/>
+  <text x="128" y="585" class="tag">FACT</text>
+  <text x="116" y="619" class="card-title">同花顺 F10 / 题材</text>
+  <text x="116" y="646" class="text">近期重要事件 / 概念解释</text>
+  <text x="116" y="669" class="mini">首页头条题材盘后冻结</text>
+  <text x="116" y="692" class="mini">盘后市场小结服务早参</text>
+
+  <rect x="100" y="728" width="270" height="155" rx="14" fill="#fff9e9" stroke="#ead8a1"/>
+  <rect x="116" y="745" width="62" height="25" rx="12" fill="#b98721"/>
+  <text x="130" y="763" class="tag">KPL</text>
+  <text x="116" y="797" class="card-title">开盘啦</text>
+  <text x="116" y="824" class="text">精选强度 / 复盘啦原因</text>
+  <text x="116" y="847" class="mini">个股精选板块 / 预测量能</text>
+  <text x="116" y="870" class="mini">开盘啦领头羊与市场概览</text>
+
+  <rect x="100" y="905" width="270" height="50" rx="14" fill="#f7f4ff" stroke="#d7cbed"/>
+  <text x="116" y="936" class="text">财联社 / 华尔街见闻：早参消息</text>
+
+  <!-- Raw storage -->
+  <rect x="475" y="160" width="360" height="820" class="box" fill="#ffffff" stroke="#dbe3ea"/>
+  <text x="505" y="205" class="section-title">2. 原始事实与 MySQL</text>
+  <text x="505" y="235" class="mini">所有业务状态先落库，文件只做日志、缓存、导出</text>
+
+  <rect x="505" y="270" width="300" height="92" rx="14" fill="#f7fafc" stroke="#dbe3ea"/>
+  <text x="525" y="302" class="small-title">盘中扫描表</text>
+  <text x="525" y="329" class="code">scan_runs / scan_movers</text>
+  <text x="525" y="352" class="code">windows / window_movers</text>
+
+  <rect x="505" y="390" width="300" height="92" rx="14" fill="#f7fafc" stroke="#dbe3ea"/>
+  <text x="525" y="422" class="small-title">收盘确认表</text>
+  <text x="525" y="449" class="code">limit_up_pool_items</text>
+  <text x="525" y="472" class="code">stock_daily_bars</text>
+
+  <rect x="505" y="510" width="300" height="114" rx="14" fill="#f7fafc" stroke="#dbe3ea"/>
+  <text x="525" y="542" class="small-title">F10 与题材表</text>
+  <text x="525" y="569" class="code">stock_ths_root_items</text>
+  <text x="525" y="592" class="code">ths_stock_concept_explanations</text>
+  <text x="525" y="615" class="code">ths_homepage_headline_themes</text>
+
+  <rect x="505" y="652" width="300" height="138" rx="14" fill="#f7fafc" stroke="#dbe3ea"/>
+  <text x="525" y="684" class="small-title">开盘啦表</text>
+  <text x="525" y="711" class="code">kpl_plate_featured_strengths</text>
+  <text x="525" y="734" class="code">kpl_replay_limit_theme_*</text>
+  <text x="525" y="757" class="code">kpl_stock_featured_sections</text>
+  <text x="525" y="780" class="code">kpl_market_capacity_*</text>
+
+  <rect x="505" y="818" width="300" height="114" rx="14" fill="#f7fafc" stroke="#dbe3ea"/>
+  <text x="525" y="850" class="small-title">调度与运维</text>
+  <text x="525" y="877" class="code">scheduled_tasks / task_queue</text>
+  <text x="525" y="900" class="code">task_runs / health_checks</text>
+  <text x="525" y="923" class="code">check_architecture_consistency.py</text>
+
+  <!-- Research pool and post close -->
+  <rect x="910" y="160" width="410" height="820" class="box" fill="#ffffff" stroke="#dbe3ea"/>
+  <text x="940" y="205" class="section-title">3. 研究池与盘后确认</text>
+
+  <rect x="940" y="250" width="350" height="170" rx="16" fill="#eff8f4" stroke="#c9e7d0"/>
+  <text x="965" y="286" class="card-title">研究池：全项目增量边界</text>
+  <text x="965" y="320" class="text">情绪票：近 5 日有涨停</text>
+  <text x="965" y="348" class="text">趋势票：近 5 日无涨停 + 5 日涨幅 Top30</text>
+  <text x="965" y="376" class="mini">统一剔除 ST / 退市 / 北交所</text>
+  <text x="965" y="400" class="code">research_pool_snapshots / research_pool_items</text>
+
+  <rect x="940" y="455" width="350" height="220" rx="16" fill="#eef7ff" stroke="#c4d9ee"/>
+  <text x="965" y="491" class="card-title">盘后冷数据时间线</text>
+  <text x="965" y="525" class="text">15:25 涨停池</text>
+  <text x="965" y="553" class="text">16:05 收盘市场概览 + 日 K</text>
+  <text x="965" y="581" class="text">16:25 研究池快照</text>
+  <text x="965" y="609" class="text">20:45 同花顺领头羊快照</text>
+  <text x="965" y="637" class="text">21:00 开盘啦领头羊快照</text>
+  <text x="965" y="665" class="text">22:30 下一交易日证据底稿</text>
+
+  <rect x="940" y="710" width="350" height="166" rx="16" fill="#fff9e9" stroke="#ead8a1"/>
+  <text x="965" y="746" class="card-title">领头羊快照</text>
+  <text x="965" y="780" class="text">同花顺：首页题材冻结快照</text>
+  <text x="965" y="808" class="text">开盘啦：精选强度 Top8</text>
+  <text x="965" y="836" class="mini">盘中读最近收盘确认快照</text>
+  <text x="965" y="860" class="code">leaderboard_snapshots</text>
+
+  <!-- Evidence and realtime -->
+  <rect x="1395" y="160" width="335" height="820" class="box" fill="#ffffff" stroke="#dbe3ea"/>
+  <text x="1425" y="205" class="section-title">4. 证据与实时展示</text>
+
+  <rect x="1425" y="250" width="275" height="214" rx="16" fill="#f2fbf4" stroke="#c9e7d0"/>
+  <text x="1448" y="286" class="card-title">有效事实 / 证据缓存</text>
+  <text x="1448" y="320" class="code">stock_ths_root_items</text>
+  <text x="1448" y="346" class="code">→ stock_current_effective_facts_view</text>
+  <text x="1448" y="372" class="code">→ stock_effective_facts</text>
+  <text x="1448" y="398" class="code">→ async_evidence_summaries</text>
+  <text x="1448" y="424" class="code">→ stock_root_evidence_cache</text>
+  <text x="1448" y="449" class="mini">无有效事实不调用模型；hash 不变复用总结</text>
+
+  <rect x="1425" y="500" width="275" height="178" rx="16" fill="#fef5f1" stroke="#f0cfc3"/>
+  <text x="1448" y="536" class="card-title">盘中热数据</text>
+  <text x="1448" y="570" class="text">5 秒扫描研究池</text>
+  <text x="1448" y="598" class="text">市场概览 / 开盘啦预测量能</text>
+  <text x="1448" y="626" class="text">题材内领涨 / 中军角色</text>
+  <text x="1448" y="654" class="code">event_engine / stock_move_judgements</text>
+
+  <rect x="1425" y="714" width="275" height="190" rx="16" fill="#f7f4ff" stroke="#d7cbed"/>
+  <text x="1448" y="750" class="card-title">Web 展示层</text>
+  <text x="1448" y="784" class="text">异动情报流</text>
+  <text x="1448" y="812" class="text">市场概览</text>
+  <text x="1448" y="840" class="text">领头羊 / 开盘啦领头羊</text>
+  <text x="1448" y="868" class="text">证据详情 / 早参帖子</text>
+  <text x="1448" y="892" class="mini">优先读快照和根证据缓存</text>
+
+  <!-- Arrows -->
+  <path class="thin" d="M 400 300 C 430 300, 440 300, 475 315"/>
+  <path class="thin" d="M 400 455 C 430 455, 440 440, 475 435"/>
+  <path class="thin" d="M 400 630 C 430 630, 440 575, 475 567"/>
+  <path class="thin" d="M 400 805 C 430 805, 440 730, 475 720"/>
+  <path class="cold" d="M 835 435 C 870 435, 875 335, 910 335"/>
+  <path class="cold" d="M 835 682 C 870 682, 875 570, 910 565"/>
+  <path class="cold" d="M 1290 565 C 1335 565, 1350 355, 1395 355"/>
+  <path class="hot" d="M 805 315 C 840 315, 865 870, 1395 590"/>
+  <path class="hot" d="M 1320 793 C 1355 793, 1365 590, 1395 590"/>
+  <path class="thin" d="M 1700 809 C 1740 809, 1740 1000, 885 1000 C 500 1000, 470 915, 400 915"/>
+  <path class="thin dash" d="M 1562 714 C 1562 690, 1562 690, 1562 678"/>
+
+  <!-- Contract footer -->
+  <rect x="70" y="1034" width="1660" height="140" rx="20" fill="#ffffff" stroke="#dbe3ea" filter="url(#shadow)"/>
+  <text x="100" y="1076" class="section-title">日期契约与主流程约束</text>
+  <text x="100" y="1112" class="text">service_trade_date：页面服务交易日；base_trade_date：证据底稿基准日；leader_data_trade_date：领头羊实际计算日。</text>
+  <text x="100" y="1142" class="text">盘中页面使用 T 日热数据；领头羊盘中读最近收盘确认快照；T 日收盘后生成 T 日快照服务 T+1。</text>
+  <text x="100" y="1172" class="text">已退出主链路：问财 Top50 研究池、ths_limit_up_review_items、stock_theme_reason_bank、stock_announcement_effects、stock_active_facts、stock_move_judgement_dirty_queue。</text>
+
+  <rect x="1418" y="1080" width="118" height="30" rx="15" fill="#c4553d"/>
+  <text x="1442" y="1101" class="tag">盘中热</text>
+  <rect x="1550" y="1080" width="118" height="30" rx="15" fill="#34699a"/>
+  <text x="1574" y="1101" class="tag">盘后冷</text>
+  <rect x="1682" y="1080" width="26" height="30" rx="13" fill="#4a8b5f"/>
+</svg>

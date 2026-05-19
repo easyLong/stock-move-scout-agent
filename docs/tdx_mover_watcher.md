@@ -8,12 +8,12 @@
 
 - 发现研究池股票的实时异动。
 - 保存每个扫描点的涨速、成交额、成交额增量等指标。
-- 聚合窗口强度。
+- 聚合开盘至今窗口强度。
 - 为异动情报流、实时领涨、稳定异动提供数据。
 
-## 当前扫描范围
+## 扫描范围
 
-底层扫描范围以研究池为核心，并额外保留指数等辅助标的，方便后续开发区间 Top 和市场共振。
+底层扫描范围以研究池为核心，并额外保留上证指数等辅助标的，方便后续开发区间 Top 和市场共振。
 
 研究池来自：
 
@@ -26,15 +26,13 @@ research_pool_items
 ## 数据链路
 
 ```text
-tdx_mover_watcher.py
+realtime_mover_scan
   -> scan_runs
   -> scan_movers
-  -> windowed_stock_scout_agent.py
   -> windows
   -> window_movers
-  -> build_event_engine.py
+  -> event_engine
   -> stock_move_events / derived_signals / stock_move_evidence
-  -> build_stock_move_judgements.py
   -> stock_move_judgements
   -> 异动情报流
 ```
@@ -45,9 +43,9 @@ tdx_mover_watcher.py
 | --- | --- |
 | `scan_runs` | 一次扫描批次 |
 | `scan_movers` | 当前扫描点命中的异动股票 |
-| `windows` | 时间窗口 |
+| `windows` | 开盘至今窗口 |
 | `window_movers` | 窗口内累计强度 |
-| `stock_move_events` | 归一化事件 |
+| `stock_move_events` | 归一化异动事件 |
 | `stock_move_judgements` | 异动解释和延续性判断 |
 
 ## 异动条件
@@ -61,7 +59,7 @@ tdx_mover_watcher.py
 
 ## 实时领涨
 
-实时领涨展示当前能看到的所有相关股票，并按开盘至当前的累计强度计算 Top。
+实时领涨展示当前能看到的所有相关股票，并按开盘至当前累计强度排序。
 
 设计要点：
 
@@ -72,7 +70,7 @@ tdx_mover_watcher.py
 
 ## 稳定异动
 
-稳定异动是全局 Top5，放在异动情报流最前面。
+稳定异动是全局 Top5，放在异动情报流前面。
 
 展示内容：
 
@@ -85,10 +83,12 @@ tdx_mover_watcher.py
 
 相关热任务只在交易日交易时间运行：
 
+- `realtime_mover_scan`
 - `event_engine`
 - `stock_move_judgements`
 - `anchor_realtime_roles`
 - `market_width_snapshot`
+- `kpl_plate_strength`
 
 集合竞价任务：
 
@@ -111,7 +111,7 @@ tdx_mover_watcher.py
 - `scan_runs` 是否覆盖目标时间段。
 - `scan_movers` 是否有目标股票。
 - `window_movers` 是否正常生成。
-- 交易时间判断是否把当前时段跳过。
+- 交易时间判断是否跳过了当前时段。
 
 ### 为什么页面卡？
 

@@ -110,3 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     script_name, args = script_argv(argv[0], argv[1:])
     return run_script(script_name, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
