@@ -374,6 +374,7 @@ def refresh_root_evidence_cache_from_effective_facts(
               WHEN valid_status IN ('expired', 'historical') THEN '历史标签'
               ELSE CASE source_table
               WHEN 'stock_ths_root_items' THEN '重要事件'
+              WHEN 'kpl_stock_limit_up_reasons' THEN '开盘啦涨停归因'
               WHEN 'ths_stock_concept_explanations' THEN '同花顺概念解释'
               ELSE source_table
               END

@@ -330,6 +330,10 @@ HTML = r"""<!doctype html>
       border-left: 3px solid #f0b86a;
       background: #fffaf2;
     }
+    .detail-card.kpl {
+      border-left: 3px solid #ef4444;
+      background: linear-gradient(90deg, #fff7f7 0%, #ffffff 42%);
+    }
     .detail-card.summary {
       border-left: 3px solid #c4b5fd;
       background: #fbfaff;
@@ -374,6 +378,41 @@ HTML = r"""<!doctype html>
     }
     .detail-card-body .theme-role-reason {
       -webkit-line-clamp: 1;
+    }
+    .kpl-reason-title {
+      color: #991b1b;
+      font-size: 14px;
+      font-weight: 900;
+      line-height: 1.35;
+    }
+    .kpl-reason-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+    }
+    .kpl-reason-meta span {
+      display: inline-flex;
+      align-items: center;
+      min-height: 22px;
+      border: 1px solid #fecaca;
+      border-radius: 999px;
+      background: #fff;
+      color: #9f1239;
+      padding: 0 7px;
+      font-size: 11px;
+      font-weight: 800;
+    }
+    .kpl-reason-lines {
+      display: grid;
+      gap: 5px;
+    }
+    .kpl-reason-line {
+      border: 1px solid #fee2e2;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.76);
+      padding: 7px 8px;
+      color: #334155;
+      line-height: 1.55;
     }
     .evidence-summary {
       border: 1px solid #e5e7eb;
@@ -1665,6 +1704,7 @@ HTML = r"""<!doctype html>
     <div class="meta">
       <a class="nav-link" href="/market-width">市场概览</a>
       <a class="nav-link" href="/leaders">领头羊</a>
+      <a class="nav-link" href="/kpl-leaders">开盘啦领头羊</a>
       <span><span class="dot"></span> 自动刷新</span>
       <span id="refreshText">等待数据</span>
     </div>
@@ -1709,7 +1749,9 @@ HTML = r"""<!doctype html>
       return [row.kind, row.event_time, row.code, row.title].map(clean).join("|");
     }
     function stockUrl(code) {
-      return `https://stockpage.10jqka.com.cn/${encodeURIComponent(clean(code))}/`;
+      const value = clean(code);
+      const prefix = /^6/.test(value) ? "SH" : /^[489]/.test(value) ? "BJ" : "SZ";
+      return `https://xueqiu.com/S/${prefix}${encodeURIComponent(value)}`;
     }
     function stockAnchorHtml(row) {
       const title = row.title || `${row.name || ""} ${row.code || ""}`;
@@ -1969,6 +2011,15 @@ HTML = r"""<!doctype html>
         body,
         display_lines: displayLines,
         source: clean(item.source || ""),
+        source_table: clean(item.source_table || ""),
+        source_key: clean(item.source_key || ""),
+        source_registry: item.source_registry ?? null,
+        evidence_role: clean(item.evidence_role || item.payload?.evidence_role || ""),
+        evidence_group: clean(item.evidence_group || item.payload?.evidence_group || ""),
+        display_level: clean(item.display_level || ""),
+        valid_status: clean(item.valid_status || item.payload?.valid_status || ""),
+        evidence_date: clean(item.evidence_date || item.data_date || item.payload?.fact_date || ""),
+        data_date: clean(item.data_date || ""),
         type: clean(item.type || evidenceType(label)),
         priority: Number(item.priority ?? evidenceMeta(evidenceType(label)).priority),
         payload: item.payload ?? null,
@@ -2973,6 +3024,72 @@ HTML = r"""<!doctype html>
         150
       );
     }
+    function isKplLimitUpReason(part) {
+      const payload = parseJsonObject(part?.payload);
+      return clean(part?.source_table || "") === "kpl_stock_limit_up_reasons"
+        || clean(part?.source || "").includes("开盘啦涨停归因")
+        || clean(payload.fact_type || "") === "limit_up_reason"
+        || clean(payload.valid_reason || "") === "kpl_limit_up_reason_10d";
+    }
+    function normalizedEvidenceText(text) {
+      return clean(text)
+        .replace(/[^\u4e00-\u9fa5A-Za-z0-9]+/g, "")
+        .toLowerCase();
+    }
+    function kplDedupText(part) {
+      const payload = parseJsonObject(part?.payload);
+      return normalizedEvidenceText([
+        payload.reason_title,
+        payload.boom_theme,
+        payload.display_body,
+        ...(Array.isArray(part?.display_lines) ? part.display_lines : []),
+        part?.body
+      ].filter(Boolean).join(" "));
+    }
+    function duplicateImportantEventWithKpl(part, kplParts) {
+      if (clean(part?.source_table || "") !== "stock_ths_root_items") return false;
+      const text = normalizedEvidenceText([
+        ...(Array.isArray(part?.display_lines) ? part.display_lines : []),
+        part?.body
+      ].filter(Boolean).join(" "));
+      if (text.length < 12) return false;
+      const factDate = clean(part?.evidence_date || part?.data_date || "");
+      return kplParts.some(kpl => {
+        const kplDate = clean(kpl?.evidence_date || kpl?.data_date || parseJsonObject(kpl?.payload).fact_date || "");
+        const sameEvidenceDate = !factDate || !kplDate || factDate === kplDate;
+        const kplText = kplDedupText(kpl);
+        if (kplText.length < 12) return false;
+        if (sameEvidenceDate && kplText.includes(text.slice(0, Math.min(24, text.length)))) return true;
+        if (sameEvidenceDate && text.includes(kplText.slice(0, Math.min(24, kplText.length)))) return true;
+        const tokens = Array.from(new Set(text.match(/[\u4e00-\u9fa5]{2,}|[A-Za-z0-9]{3,}/g) || []));
+        if (!tokens.length) return false;
+        const hits = tokens.filter(token => kplText.includes(token)).length;
+        const ratio = hits / tokens.length;
+        return sameEvidenceDate ? (ratio >= 0.55 && hits >= 3) : (ratio >= 0.7 && hits >= 4);
+      });
+    }
+    function kplLimitUpReasonHtml(part) {
+      const payload = parseJsonObject(part.payload);
+      const title = clean(payload.reason_title || payload.fact_title || part.body || "开盘啦涨停归因");
+      const theme = clean(payload.boom_theme || "");
+      const role = clean(payload.role_label || "");
+      const date = clean(part.evidence_date || part.data_date || payload.fact_date || "");
+      const meta = [date, role, theme].filter(Boolean)
+        .map(item => `<span>${esc(item)}</span>`)
+        .join("");
+      const displayLines = Array.isArray(part.display_lines) ? part.display_lines.map(clean).filter(Boolean) : [];
+      const payloadLines = parseJsonArray(payload.display_lines).map(clean).filter(Boolean);
+      const bodyLines = String(part.body || "").split(/\n+/).map(clean).filter(Boolean);
+      const lines = [...displayLines, ...payloadLines, ...bodyLines]
+        .filter(line => line && line !== title)
+        .filter((line, index, arr) => arr.indexOf(line) === index)
+        .slice(0, 4);
+      return `<div class="kpl-reason">
+        <div class="kpl-reason-title">${esc(title)}</div>
+        ${meta ? `<div class="kpl-reason-meta">${meta}</div>` : ""}
+        ${lines.length ? `<div class="kpl-reason-lines">${lines.map(line => `<div class="kpl-reason-line">${esc(line)}</div>`).join("")}</div>` : ""}
+      </div>`;
+    }
     function detailVisibleSections(row) {
       const wanted = new Set([
         "带动性",
@@ -3007,13 +3124,14 @@ HTML = r"""<!doctype html>
           const status = clean(part.valid_status || "");
           const label = clean(part.label || "");
           const type = clean(part.type || "");
+          if (isKplLimitUpReason(part)) return true;
           if (!["model_summary", "current_effective", "post_close_confirm"].includes(group)) return false;
           if (["expired", "historical", "invalid"].includes(status)) return false;
           if (hiddenLabels.has(label)) return false;
           if (!wanted.has(label) && !["influence", "headline_theme_roles", "facts", "core", "impact"].includes(type)) return false;
           return true;
         })
-        .sort((a, b) => (order[a.label] ?? 100) - (order[b.label] ?? 100) || evidencePartPriority(a) - evidencePartPriority(b))
+        .sort((a, b) => (isKplLimitUpReason(a) ? 4 : (order[a.label] ?? 100)) - (isKplLimitUpReason(b) ? 4 : (order[b.label] ?? 100)) || evidencePartPriority(a) - evidencePartPriority(b))
         .filter(part => {
           const key = `${clean(part.label)}|${clean(part.body).slice(0, 80)}`;
           if (seen.has(key)) return false;
@@ -3023,6 +3141,17 @@ HTML = r"""<!doctype html>
         .slice(0, 8);
     }
     function detailCardHtml(part) {
+      if (isKplLimitUpReason(part)) {
+        const body = kplLimitUpReasonHtml(part);
+        if (!body) return "";
+        return `<section class="detail-card kpl">
+          <div class="detail-card-head">
+            <div class="detail-card-title">开盘啦涨停归因</div>
+            <div class="detail-card-source">涨停验证</div>
+          </div>
+          <div class="detail-card-body">${body}</div>
+        </section>`;
+      }
       const body = evidenceBodyHtml(part);
       if (!body) return "";
       const source = sourceCycleLabel(part) || clean(part.source || evidenceSource(part.label, part.body));
@@ -3039,13 +3168,20 @@ HTML = r"""<!doctype html>
       const themeCard = mergedThemeEvidenceHtml(row, sections);
       const isThemeSection = part => ["带动性", "头条题材角色"].includes(clean(part.label || "")) || ["influence", "headline_theme_roles"].includes(clean(part.type || ""));
       const isFactSummary = part => clean(part.label || "") === "有效事实总结";
+      const kplSections = sections.filter(isKplLimitUpReason);
+      const displaySections = kplSections.length
+        ? sections.filter(part => !duplicateImportantEventWithKpl(part, kplSections))
+        : sections;
       const cards = [
-        ...sections
+        ...displaySections
           .filter(isFactSummary)
           .map(detailCardHtml),
+        ...displaySections
+          .filter(isKplLimitUpReason)
+          .map(detailCardHtml),
         themeCard,
-        ...sections
-          .filter(part => !isFactSummary(part) && !isThemeSection(part))
+        ...displaySections
+          .filter(part => !isFactSummary(part) && !isKplLimitUpReason(part) && !isThemeSection(part))
           .map(detailCardHtml)
       ].filter(Boolean).join("");
       return `<div class="detail-shell">
@@ -3151,6 +3287,19 @@ HTML = r"""<!doctype html>
         $(id).innerHTML = groupedFeedHtml(rows);
       }
     }
+    function feedEmptyText(data) {
+      const runtime = data.feed_runtime || {};
+      const latestScan = clean(runtime.latest_scan_at || "");
+      const scanCount = Number(runtime.scan_count || 0);
+      const acceptedCount = Number(runtime.accepted_scan_count || 0);
+      const latestRows = Number(runtime.latest_scan_row_count || 0);
+      if (!scanCount) return "暂无情报：实时异动扫描尚未产生今日扫描记录";
+      if (!acceptedCount) {
+        const suffix = latestScan ? `，最近扫描 ${timeText(latestScan)}` : "";
+        return `暂无情报：今日已扫描 ${scanCount} 次，但未触发 speed>=1.5 的异动${suffix}，最近命中 ${latestRows} 只`;
+      }
+      return "暂无情报：扫描已有触发，但事件/判断层尚未生成";
+    }
     let availableDates = [];
     let latestTradeDate = "";
     function queryTradeDate() {
@@ -3248,7 +3397,7 @@ HTML = r"""<!doctype html>
           selectedKey = rowKey(currentFeed[0] || {});
         }
         loadDetail(currentFeed.find(row => rowKey(row) === selectedKey) || currentFeed[0]);
-        renderList("feed", feed, "暂无情报");
+        renderList("feed", feed, feedEmptyText(data));
         $("refreshText").textContent = `已刷新 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
       } catch (error) {
         $("feed").innerHTML = `<div class="error">${esc(error)}</div>`;
@@ -3372,6 +3521,24 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       color: var(--blue);
       border-color: #bfdbfe;
     }
+    .date-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .date-step {
+      width: 32px;
+      justify-content: center;
+      padding: 0;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .date-step:disabled {
+      color: #cbd5e1;
+      cursor: not-allowed;
+      border-color: var(--line);
+      background: #f8fafc;
+    }
     main {
       width: min(1460px, calc(100vw - 18px));
       margin: 0 auto;
@@ -3396,7 +3563,7 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
     }
     .kpis {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
       margin-bottom: 12px;
     }
@@ -3471,6 +3638,10 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       padding: 9px 10px;
       font-variant-numeric: tabular-nums;
     }
+    .sh-index-day.current {
+      border-color: #f4b6b6;
+      background: linear-gradient(180deg, #fff8f8 0%, #ffffff 100%);
+    }
     .sh-index-day .date {
       display: flex;
       justify-content: space-between;
@@ -3535,6 +3706,10 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       border: 1px solid #edf1f6;
       border-radius: 8px;
       background: #fff;
+    }
+    .cycle-row.current {
+      border-color: #f4b6b6;
+      background: linear-gradient(90deg, #fff8f8 0%, #ffffff 48%);
     }
     .cycle-date {
       font-weight: 800;
@@ -3949,8 +4124,8 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
     <section class="flow" id="flow"></section>
     <section class="panel cycle-panel">
       <div class="panel-title">
-        指数五日结构
-        <small id="cycleHint">看上涨家数、涨停数、&gt;5%、&lt;-5%、跌停数的变化</small>
+        五日结构
+        <small id="cycleHint">今日盘中当前 + 最近收盘确认，方便直接看变化</small>
       </div>
       <div class="cycle-body">
         <div class="cycle-summary" id="cycleSummary"></div>
@@ -3997,7 +4172,11 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
     const num = value => Number(value || 0);
     const fmt = value => Number(value || 0).toLocaleString("zh-CN");
     const fmtYi = value => `${Number(value || 0).toFixed(2)}亿`;
-    const stockUrl = code => `https://stockpage.10jqka.com.cn/${encodeURIComponent(String(code || ""))}/`;
+    const stockUrl = code => {
+      const value = clean(code);
+      const prefix = /^6/.test(value) ? "SH" : /^[489]/.test(value) ? "BJ" : "SZ";
+      return `https://xueqiu.com/S/${prefix}${encodeURIComponent(value)}`;
+    };
     function timeText(value) {
       if (!value) return "";
       const parts = String(value).split(" ");
@@ -4095,7 +4274,7 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       const steps = [
         ["1 数据采集", latest?.source || "akshare_stock_zh_a_spot", `快照 ${latest?.captured_at || "-"}`],
         ["2 样本拆分", "全市场 / 成交额Top50 / 研究池", `研究池 ${latest?.research_pool_trade_date || "-"}`],
-        ["3 统计入库", "涨跌家数、>5%、<-5%、涨跌停", `序列 ${series.length} 个时间点`],
+        ["3 统计入库", "涨跌家数、5%、涨跌停、预测量能", `序列 ${series.length} 个时间点`],
         ["4 趋势展示", "仅交易时段，从左到右", `${first} -> ${last}`]
       ];
       $("flow").innerHTML = steps.map(([label, title, sub]) => `
@@ -4118,20 +4297,41 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       return "";
     }
     function renderKpis(latest) {
-      $("kpis").innerHTML = sampleDefs.map(def => `
+      const sampleCards = sampleDefs.map(def => `
         <div class="kpi">
           <div class="sample-head">
             <strong>${esc(def.title)}</strong>
-            <small>${esc(sampleHint(def, latest))}<br>样本 ${fmt(latest?.[def.count])}</small>
+            <small>${esc(sampleHint(def, latest))}<br>\u6837\u672c ${fmt(latest?.[def.count])}</small>
           </div>
           <div class="sample-metrics">
-            <div class="sample-metric"><span>上涨</span><b class="red">${fmt(latest?.[def.up])}</b></div>
-            <div class="sample-metric"><span>下跌</span><b class="green">${fmt(latest?.[def.down])}</b></div>
+            <div class="sample-metric"><span>\u4e0a\u6da8</span><b class="red">${fmt(latest?.[def.up])}</b></div>
+            <div class="sample-metric"><span>\u4e0b\u8dcc</span><b class="green">${fmt(latest?.[def.down])}</b></div>
             <div class="sample-metric"><span>>5%</span><b class="amber">${fmt(latest?.[def.up5])}</b></div>
             <div class="sample-metric"><span><-5%</span><b class="blue">${fmt(latest?.[def.down5])}</b></div>
           </div>
         </div>
-      `).join("");
+      `);
+      const current = Number(latest?.kpl_capacity_current_yi || 0);
+      const forecast = Number(latest?.kpl_capacity_forecast_yi || 0);
+      const pct = Number(latest?.kpl_capacity_change_pct || 0);
+      const delta = Number(latest?.kpl_capacity_delta_yi || 0);
+      const marketTime = timeText(latest?.kpl_capacity_market_time || latest?.captured_at || "");
+      const deltaText = delta ? `${delta > 0 ? "+" : ""}${delta.toFixed(0)}\u4ebf` : "-";
+      const capacityCard = `
+        <div class="kpi">
+          <div class="sample-head">
+            <strong>\u9884\u6d4b\u91cf\u80fd</strong>
+            <small>\u5f00\u76d8\u5566 MarketCapacity<br>${esc(marketTime || "-")}</small>
+          </div>
+          <div class="sample-metrics">
+            <div class="sample-metric"><span>\u5f53\u524d</span><b>${current > 0 ? current.toFixed(0) : "-"}\u4ebf</b></div>
+            <div class="sample-metric"><span>\u9884\u6d4b\u5168\u5929</span><b>${forecast > 0 ? forecast.toFixed(0) : "-"}\u4ebf</b></div>
+            <div class="sample-metric"><span>\u53d8\u5316</span><b class="${trendClass(pct)}">${signedPct(pct)}</b></div>
+            <div class="sample-metric"><span>\u5dee\u989d</span><b class="${trendClass(delta)}">${deltaText}</b></div>
+          </div>
+        </div>
+      `;
+      $("kpis").innerHTML = [...sampleCards, capacityCard].join("");
     }
     function signed(value) {
       const n = Number(value || 0);
@@ -4206,8 +4406,26 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       }
       return ["结构过渡", "正负动能变化不够一致"];
     }
-    function renderShIndex5d(rows) {
-      const items = (Array.isArray(rows) ? rows : [])
+    function displayCycleRows(rows, current) {
+      const list = (Array.isArray(rows) ? rows : []).filter(Boolean);
+      const latest = current && current.trade_date ? current : null;
+      if (!latest) return list.slice(-5);
+      const latestDate = String(latest.trade_date || "");
+      const latestIsClose = String(latest.source || "") === "stock_daily_bars_close";
+      if (latestIsClose && list.some(row => String(row.trade_date || "") === latestDate)) {
+        return list.slice(-5);
+      }
+      const lastCloseDate = String(list[list.length - 1]?.trade_date || "");
+      if (latestDate <= lastCloseDate) return list.slice(-5);
+      const requiredFields = ["up_count", "down_count", "up5_count", "down5_count", "limit_up_count", "limit_down_count", "total_count"];
+      if (!requiredFields.every(key => latest[key] !== null && latest[key] !== undefined && latest[key] !== "")) {
+        return list.slice(-5);
+      }
+      const withoutSameDate = list.filter(row => String(row.trade_date || "") !== latestDate);
+      return [...withoutSameDate.slice(-4), { ...latest, is_current_snapshot: true }];
+    }
+    function renderShIndex5d(rows, current) {
+      const items = displayCycleRows(rows, current)
         .filter(row => row && row.sh_index_price !== null && row.sh_index_price !== undefined)
         .slice(-5);
       if (!items.length) {
@@ -4217,16 +4435,19 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       $("shIndex5d").innerHTML = items.map(row => {
         const pct = Number(row.sh_index_pct_change || 0);
         const cls = trendClass(pct);
-        const amount = Number(row.total_amount_yi || 0);
-        const liquidity = amount > 0 ? `全市场成交额 ${amount.toFixed(2)}亿` : "全市场成交额 -";
-        return `<div class="sh-index-day">
-          <div class="date"><span>${esc(row.trade_date || "")}</span><span>上证</span></div>
+        const totalAmount = Number(row.total_amount_yi || 0);
+        const liquidity = totalAmount > 0 ? `两市成交额 ${totalAmount.toFixed(2)}亿` : "两市成交额 -";
+        const isCurrent = !!row.is_current_snapshot;
+        const priceLabel = isCurrent ? "当前" : "收盘";
+        const sideLabel = isCurrent ? "盘中" : "上证";
+        return `<div class="sh-index-day ${isCurrent ? "current" : ""}">
+          <div class="date"><span>${esc(row.trade_date || "")}</span><span>${esc(sideLabel)}</span></div>
           <strong class="${cls}">${signedPct(pct)}</strong>
-          <small>收盘 ${Number(row.sh_index_price || 0).toFixed(2)} · ${esc(liquidity)}</small>
+          <small>${esc(priceLabel)} ${Number(row.sh_index_price || 0).toFixed(2)} · ${esc(liquidity)}</small>
         </div>`;
       }).join("");
     }
-    function renderCycle5d(rows) {
+    function renderCycle5d(rows, latest) {
       const list = (Array.isArray(rows) ? rows : [])
         .filter(Boolean)
         .sort((a, b) => String(a.trade_date || "").localeCompare(String(b.trade_date || "")));
@@ -4236,49 +4457,64 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
         $("cycleGrid").innerHTML = "";
         return;
       }
-      renderShIndex5d(list);
-      const last = list[list.length - 1];
-      const prev = list.length >= 2 ? list[list.length - 2] : null;
-      const [label, note] = cycleLabel(list);
-      const upDelta = prev ? num(last.up_count) - num(prev.up_count) : 0;
-      const up5Delta = prev ? num(last.up5_count) - num(prev.up5_count) : 0;
-      const down5Delta = prev ? num(last.down5_count) - num(prev.down5_count) : 0;
-      const limitDownDelta = prev ? num(last.limit_down_count) - num(prev.limit_down_count) : 0;
+      const lastClose = list[list.length - 1];
+      const latestRow = latest && latest.trade_date ? latest : null;
+      const current = latestRow || lastClose;
+      const displayRows = displayCycleRows(list, current);
+      renderShIndex5d(list, current);
+      const displayCurrent = displayRows[displayRows.length - 1] || current;
+      const currentIsDisplayedRealtime = !!displayCurrent.is_current_snapshot;
+      const compareCurrent = currentIsDisplayedRealtime ? displayCurrent : lastClose;
+      const sameAsLastClose = String(current.trade_date || "") === String(lastClose.trade_date || "");
+      const prev = currentIsDisplayedRealtime
+        ? lastClose
+        : (sameAsLastClose && list.length >= 2 ? list[list.length - 2] : lastClose);
+      const compareRows = prev ? [prev, compareCurrent] : list;
+      const [label, note] = cycleLabel(compareRows);
+      const upDelta = prev ? num(compareCurrent.up_count) - num(prev.up_count) : 0;
+      const up5Delta = prev ? num(compareCurrent.up5_count) - num(prev.up5_count) : 0;
+      const limitUpDelta = prev ? num(compareCurrent.limit_up_count) - num(prev.limit_up_count) : 0;
+      const down5Delta = prev ? num(compareCurrent.down5_count) - num(prev.down5_count) : 0;
+      const limitDownDelta = prev ? num(compareCurrent.limit_down_count) - num(prev.limit_down_count) : 0;
+      const currentTime = compareCurrent.captured_at ? String(compareCurrent.captured_at).slice(11, 19) : "";
+      const currentLabel = currentIsDisplayedRealtime ? "当前" : "收盘";
+      const compareLabel = prev ? `${esc(currentLabel)} vs ${esc(prev.trade_date || "上一日")}收盘` : "暂无比较基准";
       $("cycleSummary").innerHTML = `
         <div class="cycle-card">
-          <span>结构判断</span>
+          <span>${compareLabel}</span>
           <strong>${esc(label)}</strong>
-          <small>${esc(note)}</small>
+          <small>${esc(note)}${currentTime ? ` · ${esc(currentTime)}` : ""}</small>
         </div>
         <div class="cycle-card">
           <span>上涨家数变化</span>
           <strong class="${trendClass(upDelta)}">${signed(upDelta)}</strong>
-          <small>今日 ${fmt(last.up_count)} / 样本 ${fmt(last.total_count)}</small>
+          <small>${currentLabel} ${fmt(compareCurrent.up_count)} / 昨收 ${fmt(prev && prev.up_count)} / 样本 ${fmt(compareCurrent.total_count)}</small>
         </div>
         <div class="cycle-card">
           <span>>5% 强势变化</span>
           <strong class="${trendClass(up5Delta)}">${signed(up5Delta)}</strong>
-          <small>今日 ${fmt(last.up5_count)}，涨停 ${fmt(last.limit_up_count)}</small>
+          <small>${currentLabel} ${fmt(compareCurrent.up5_count)} / 昨收 ${fmt(prev && prev.up5_count)}，涨停 ${fmt(compareCurrent.limit_up_count)}(${signed(limitUpDelta)})</small>
         </div>
         <div class="cycle-card">
           <span><-5% 风险变化</span>
           <strong class="${trendClass(-down5Delta)}">${signed(down5Delta)}</strong>
-          <small>今日 ${fmt(last.down5_count)}，跌停 ${fmt(last.limit_down_count)}</small>
+          <small>${currentLabel} ${fmt(compareCurrent.down5_count)} / 昨收 ${fmt(prev && prev.down5_count)}，跌停 ${fmt(compareCurrent.limit_down_count)}</small>
         </div>
         <div class="cycle-card">
           <span>跌停变化</span>
           <strong class="${trendClass(-limitDownDelta)}">${signed(limitDownDelta)}</strong>
-          <small>数据日 ${esc(last.trade_date || "")}</small>
+          <small>${currentLabel} ${fmt(compareCurrent.limit_down_count)} / 昨收 ${fmt(prev && prev.limit_down_count)}</small>
         </div>
       `;
-      const maxPower = Math.max(10, ...list.flatMap(row => [dayPower(row, "positive"), dayPower(row, "negative")]));
-      $("cycleGrid").innerHTML = list.map(row => {
+      const maxPower = Math.max(10, ...displayRows.flatMap(row => [dayPower(row, "positive"), dayPower(row, "negative")]));
+      $("cycleGrid").innerHTML = displayRows.map(row => {
         const positive = dayPower(row, "positive");
         const negative = dayPower(row, "negative");
         const positiveParts = powerParts(row, "positive");
         const negativeParts = powerParts(row, "negative");
-        const dataNote = row.has_5pct_data ? "" : `<span class="data-missing">5%历史缺失</span>`;
-        return `<div class="cycle-row">
+        const currentNote = row.is_current_snapshot ? `<span class="data-missing">盘中当前</span>` : "";
+        const dataNote = currentNote || (row.has_5pct_data ? "" : `<span class="data-missing">5%历史缺失</span>`);
+        return `<div class="cycle-row ${row.is_current_snapshot ? "current" : ""}">
           <div class="cycle-date">${esc(row.trade_date)}${dataNote}</div>
           <div class="power-bar">
             <div class="power-head"><span>正向：上涨 + &gt;5% + 涨停</span><b class="red">${fmt(positive)}</b></div>
@@ -4356,29 +4592,107 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
         <svg data-width-chart="1" data-chart-key="${esc(def.key)}" viewBox="0 0 ${width} ${height}" width="100%" height="210" role="img" aria-label="${esc(def.title)}宽度折线图">${grid}${lines}${endLabels}${labels}${hits}</svg>
       </div>`;
     }
+    function capacityRows(rows) {
+      return (Array.isArray(rows) ? rows : [])
+        .filter(row => Number(row.kpl_capacity_forecast_yi || 0) > 0)
+        .map(row => ({ ...row }));
+    }
+    function renderCapacityChart(rows) {
+      const chartRows = capacityRows(rows);
+      if (!chartRows.length) return "";
+      const width = 980;
+      const height = 210;
+      const pad = { left: 50, right: 104, top: 18, bottom: 30 };
+      const plotW = width - pad.left - pad.right;
+      const plotH = height - pad.top - pad.bottom;
+      const values = chartRows.map(row => Number(row.kpl_capacity_forecast_yi || 0)).filter(Number.isFinite);
+      const minY = Math.floor(Math.min(...values) * 0.995);
+      const maxY = Math.ceil(Math.max(...values) * 1.005);
+      const span = Math.max(1, maxY - minY);
+      const x = index => pad.left + (chartRows.length === 1 ? plotW / 2 : index * plotW / (chartRows.length - 1));
+      const y = value => pad.top + plotH - (Number(value || 0) - minY) / span * plotH;
+      const grid = [0, 0.5, 1].map(rate => {
+        const gy = pad.top + plotH - rate * plotH;
+        const val = Math.round(minY + span * rate);
+        return `<line x1="${pad.left}" y1="${gy}" x2="${width - pad.right}" y2="${gy}" stroke="#edf1f6"/><text x="8" y="${gy + 4}" fill="#94a3b8" font-size="11">${val}\u4ebf</text>`;
+      }).join("");
+      const points = chartRows.map((row, index) => `${x(index).toFixed(1)},${y(row.kpl_capacity_forecast_yi).toFixed(1)}`).join(" ");
+      const dots = chartRows.map((row, index) => `<circle cx="${x(index).toFixed(1)}" cy="${y(row.kpl_capacity_forecast_yi).toFixed(1)}" r="2.4" fill="#b7791f"><title>${row.time}: ${Number(row.kpl_capacity_forecast_yi || 0).toFixed(0)}\u4ebf</title></circle>`).join("");
+      const labels = [...new Set([0, Math.floor((chartRows.length - 1) / 2), chartRows.length - 1])]
+        .filter(index => index >= 0)
+        .map(index => `<text x="${x(index).toFixed(1)}" y="${height - 10}" text-anchor="middle" fill="#64748b" font-size="11">${esc(chartRows[index].time)}</text>`)
+        .join("");
+      const last = chartRows[chartRows.length - 1];
+      const labelY = Math.min(height - pad.bottom - 34, Math.max(pad.top + 2, y(last.kpl_capacity_forecast_yi) - 17));
+      const labelX = width - pad.right + 10;
+      const endLabel = `<g class="line-end-label">
+        <line x1="${x(chartRows.length - 1).toFixed(1)}" y1="${y(last.kpl_capacity_forecast_yi).toFixed(1)}" x2="${(labelX - 5).toFixed(1)}" y2="${(labelY + 17).toFixed(1)}" stroke="#b7791f" stroke-width="1" stroke-opacity="0.35"/>
+        <rect x="${labelX}" y="${labelY.toFixed(1)}" width="94" height="32" rx="7" fill="#fff" stroke="#b7791f" stroke-opacity="0.38"/>
+        <text x="${labelX + 8}" y="${(labelY + 12).toFixed(1)}" fill="#64748b" font-size="10" font-weight="700">\u9884\u6d4b\u5168\u5929</text>
+        <text x="${labelX + 8}" y="${(labelY + 26).toFixed(1)}" fill="#b7791f" font-size="14" font-weight="850">${Number(last.kpl_capacity_forecast_yi || 0).toFixed(0)}\u4ebf</text>
+      </g>`;
+      const hitWidth = chartRows.length <= 1 ? plotW : plotW / Math.max(1, chartRows.length - 1);
+      const hits = chartRows.map((row, index) => {
+        const cx = x(index);
+        const left = Math.max(pad.left, cx - hitWidth / 2);
+        const right = Math.min(width - pad.right, cx + hitWidth / 2);
+        return `<g>
+          <line class="chart-hover-line" data-chart-key="capacity" data-hover-index="${index}" x1="${cx.toFixed(1)}" y1="${pad.top}" x2="${cx.toFixed(1)}" y2="${pad.top + plotH}"></line>
+          <rect class="chart-hit" x="${left.toFixed(1)}" y="${pad.top}" width="${Math.max(8, right - left).toFixed(1)}" height="${plotH}" data-index="${index}"></rect>
+        </g>`;
+      }).join("");
+      const titleText = `${chartRows[0].time} -> ${last.time}`;
+      return `<div class="mini-chart">
+        <div class="mini-chart-title">\u9884\u6d4b\u91cf\u80fd<small>${esc(titleText)} · \u5f00\u76d8\u5566</small></div>
+        <svg data-width-chart="1" data-chart-key="capacity" viewBox="0 0 ${width} ${height}" width="100%" height="210" role="img" aria-label="capacity forecast chart">${grid}<polyline fill="none" stroke="#b7791f" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" points="${points}"/>${dots}${endLabel}${labels}${hits}</svg>
+      </div>`;
+    }
     function renderChart(rows) {
       if (!Array.isArray(rows) || rows.length === 0) {
-        $("chart").innerHTML = `<div class="empty">暂无概览快照，先运行市场概览任务。</div>`;
+        $("chart").innerHTML = `<div class="empty">\u6682\u65e0\u6982\u89c8\u5feb\u7167\uff0c\u5148\u8fd0\u884c\u5e02\u573a\u6982\u89c8\u4efb\u52a1\u3002</div>`;
         return;
       }
       currentChartRows = rows;
-      currentChartRowsByKey = Object.fromEntries(sampleDefs.map(def => [def.key, chartRowsForDef(rows, def)]));
-      $("chart").innerHTML = `<div class="mini-charts">${sampleDefs.map(def => renderOneChart(rows, def)).join("")}</div>`;
+      currentChartRowsByKey = Object.fromEntries([
+        ...sampleDefs.map(def => [def.key, chartRowsForDef(rows, def)]),
+        ["capacity", capacityRows(rows)]
+      ]);
+      const charts = [
+        ...sampleDefs.map(def => renderOneChart(rows, def)),
+        renderCapacityChart(rows)
+      ].filter(Boolean).join("");
+      $("chart").innerHTML = `<div class="mini-charts">${charts}</div>`;
     }
     function showChartTooltip(event, row) {
       const tooltip = $("chartTooltip");
       if (!row) return;
+      const forecast = Number(row.kpl_capacity_forecast_yi || 0);
+      const current = Number(row.kpl_capacity_current_yi || 0);
+      const pct = Number(row.kpl_capacity_change_pct || 0);
+      const delta = Number(row.kpl_capacity_delta_yi || 0);
+      const capacityHtml = forecast > 0 ? `
+          <div class="tooltip-group">
+            <b>\u9884\u6d4b\u91cf\u80fd</b>
+            <div class="tooltip-stat"><span>\u9884\u6d4b\u5168\u5929</span><strong>${forecast.toFixed(0)}\u4ebf</strong></div>
+            <div class="tooltip-stat"><span>\u53d8\u5316</span><strong class="${trendClass(pct)}">${signedPct(pct)}</strong></div>
+          </div>
+          <div class="tooltip-group">
+            <b>\u6210\u4ea4\u989d</b>
+            <div class="tooltip-stat"><span>\u5f53\u524d</span><strong>${current > 0 ? current.toFixed(0) : "-"}\u4ebf</strong></div>
+            <div class="tooltip-stat"><span>\u5dee\u989d</span><strong class="${trendClass(delta)}">${delta ? `${delta > 0 ? "+" : ""}${delta.toFixed(0)}\u4ebf` : "-"}</strong></div>
+          </div>` : "";
       tooltip.innerHTML = `
         <strong>${esc(row.captured_at || row.time || "")}</strong>
+        ${capacityHtml}
         ${sampleDefs.map(def => `
           <div class="tooltip-group">
             <b>${esc(def.title)}</b>
-            <div class="tooltip-stat"><span>上涨</span><strong class="red">${fmt(row[def.up])}</strong></div>
-            <div class="tooltip-stat"><span>下跌</span><strong class="green">${fmt(row[def.down])}</strong></div>
+            <div class="tooltip-stat"><span>\u4e0a\u6da8</span><strong class="red">${fmt(row[def.up])}</strong></div>
+            <div class="tooltip-stat"><span>\u4e0b\u8dcc</span><strong class="green">${fmt(row[def.down])}</strong></div>
           </div>
         `).join("")}`;
       const x = Math.min(window.innerWidth - 330, event.clientX + 14);
-      const y = Math.min(window.innerHeight - 170, event.clientY + 14);
+      const y = Math.min(window.innerHeight - 260, event.clientY + 14);
       tooltip.style.transform = `translate(${Math.max(8, x)}px, ${Math.max(8, y)}px)`;
       tooltip.classList.add("visible");
     }
@@ -4455,7 +4769,7 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
         if (!$("tradeDate").value && data.trade_date) $("tradeDate").value = data.trade_date;
         renderServiceContext(data);
         renderFlow(latest, series);
-        renderCycle5d((data.cycle_5d || []).map(normalizeWidthRow));
+        renderCycle5d((data.cycle_5d || []).map(normalizeWidthRow), latest);
         renderKpis(latest);
         renderLegend();
         renderChart(series);
@@ -4547,6 +4861,22 @@ LEADERS_HTML = r"""<!doctype html>
       justify-content: center;
       cursor: pointer;
       font-weight: 750;
+    }
+    .date-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .date-step {
+      width: 32px;
+      padding: 0;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .date-step:disabled {
+      color: #cbd5e1;
+      cursor: not-allowed;
+      background: #f8fafc;
     }
     main {
       max-width: 1380px;
@@ -4835,9 +5165,9 @@ LEADERS_HTML = r"""<!doctype html>
       background: #fff;
       padding: 10px 12px;
       display: grid;
-      grid-template-columns: 58px minmax(150px, 210px) minmax(230px, 0.85fr) minmax(280px, 1.15fr);
+      grid-template-columns: 54px minmax(140px, 190px) minmax(210px, 290px) minmax(420px, 1fr);
       gap: 12px;
-      align-items: center;
+      align-items: start;
       box-shadow: 0 1px 0 rgba(15, 23, 42, 0.03);
     }
     .leader + .leader {
@@ -4871,7 +5201,7 @@ LEADERS_HTML = r"""<!doctype html>
       height: 100%;
       display: grid;
       justify-items: center;
-      align-content: center;
+      align-content: start;
       gap: 6px;
       padding-right: 10px;
       border-right: 1px solid #eef2f7;
@@ -5096,6 +5426,14 @@ LEADERS_HTML = r"""<!doctype html>
       font-size: 12px;
       line-height: 1.45;
     }
+    .fact-timeline.reason {
+      border-color: #bfdbfe;
+      background: #f8fbff;
+      box-shadow: inset 3px 0 0 #4f8fdc;
+    }
+    .fact-timeline.reason strong {
+      color: #2563eb;
+    }
     .fact-timeline strong {
       color: #64748b;
       font-size: 11px;
@@ -5174,10 +5512,15 @@ LEADERS_HTML = r"""<!doctype html>
   <header class="topbar">
     <h1>领头羊</h1>
     <div class="actions">
-      <input id="tradeDate" class="date-input" type="date" />
+      <div class="date-nav">
+        <button id="prevDateBtn" class="btn date-step" type="button" title="Prev trading day" aria-label="Prev trading day">‹</button>
+        <input id="tradeDate" class="date-input" type="date" />
+        <button id="nextDateBtn" class="btn date-step" type="button" title="Next trading day" aria-label="Next trading day">›</button>
+      </div>
       <button id="refreshBtn" class="btn" type="button">刷新</button>
       <a class="btn" href="/">异动情报流</a>
       <a class="btn" href="/market-width">市场概览</a>
+      <a class="btn" href="/kpl-leaders">开盘啦领头羊</a>
       <span id="refreshText">等待数据</span>
     </div>
   </header>
@@ -5209,11 +5552,28 @@ LEADERS_HTML = r"""<!doctype html>
       const n = Number(value || 0);
       return `${n > 0 ? "+" : ""}${n.toFixed(2)}%`;
     };
-    const stockUrl = code => `https://stockpage.10jqka.com.cn/${encodeURIComponent(String(code || ""))}/`;
+    const stockUrl = code => {
+      const value = clean(code);
+      const prefix = /^6/.test(value) ? "SH" : /^[489]/.test(value) ? "BJ" : "SZ";
+      return `https://xueqiu.com/S/${prefix}${encodeURIComponent(value)}`;
+    };
     function timeText(value) {
       if (!value) return "";
       const parts = String(value).split(" ");
       return parts[1] || parts[0] || "";
+    }
+    function headlineThemeLabel(data) {
+      const day = clean(data.headline_theme_trade_date);
+      if (!day) return "";
+      const status = clean(data.headline_theme_status);
+      const statusText = status === "post_close_frozen"
+        ? "冻结"
+        : status === "frozen_fallback"
+        ? "沿用冻结"
+        : status === "live_fallback"
+        ? "临时快照"
+        : status;
+      return `同花顺题材 ${day}${statusText ? ` ${statusText}` : ""}`;
     }
     function renderServiceContext(data) {
       const ctx = data.service_context || {};
@@ -5221,6 +5581,7 @@ LEADERS_HTML = r"""<!doctype html>
         `${ctx.service_trade_date || data.trade_date || "最近交易日"} ${ctx.phase_label || "观察"}`,
         ctx.base_trade_date ? `底稿 ${ctx.base_trade_date} 收盘` : "",
         data.leader_data_trade_date ? `领头羊 ${data.leader_data_label || data.leader_data_trade_date}` : "",
+        headlineThemeLabel(data),
         ctx.root_cache_updated_at ? `证据缓存 ${timeText(ctx.root_cache_updated_at)}` : "",
         ctx.post_close_status_label ? `盘后 ${ctx.post_close_status_label}` : "",
         ctx.research_pool_count ? `研究池 ${fmt(ctx.research_pool_count)}只` : ""
@@ -5229,11 +5590,66 @@ LEADERS_HTML = r"""<!doctype html>
     }
     const dimOrder = { today_limit: 1, first_limit_10d: 2, limit_up_days: 3, trend_strength: 4, pool_rank: 5, first_limit: 6, "3d": 7, "5d": 8, "10d": 9 };
     const state = { scopes: [], activeKey: "", filter: "" };
+    const dateState = { dates: [], loaded: false };
     function queryTradeDate() {
       return clean(new URLSearchParams(window.location.search).get("trade_date"));
     }
     function queryDate() {
       return $("tradeDate").value || queryTradeDate();
+    }
+    function sortedTradeDates(dates) {
+      return Array.from(new Set((Array.isArray(dates) ? dates : []).map(clean).filter(Boolean))).sort();
+    }
+    function updateDateButtons() {
+      const dates = dateState.dates;
+      const current = queryDate();
+      const index = dates.indexOf(current);
+      const hasDates = dates.length > 0 && index >= 0;
+      $("prevDateBtn").disabled = !hasDates || index <= 0;
+      $("nextDateBtn").disabled = !hasDates || index >= dates.length - 1;
+    }
+    function syncTradeDateUrl(value, replace = false) {
+      const date = clean(value);
+      const url = new URL(window.location.href);
+      if (date) url.searchParams.set("trade_date", date);
+      else url.searchParams.delete("trade_date");
+      const method = replace ? "replaceState" : "pushState";
+      window.history[method]({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+    function setTradeDate(value, replace = false) {
+      const date = clean(value);
+      if (!date) return;
+      $("tradeDate").value = date;
+      syncTradeDateUrl(date, replace);
+      updateDateButtons();
+      load();
+    }
+    async function loadTradeDates() {
+      try {
+        const response = await fetch("/api/trade_dates", { cache: "no-store" });
+        const data = await response.json();
+        dateState.dates = sortedTradeDates(data.dates);
+        dateState.loaded = true;
+        if (!$("tradeDate").value && queryTradeDate()) $("tradeDate").value = queryTradeDate();
+        updateDateButtons();
+      } catch (error) {
+        dateState.loaded = true;
+        updateDateButtons();
+      }
+    }
+    function stepTradeDate(offset) {
+      const dates = dateState.dates;
+      if (!dates.length) return;
+      const current = queryDate();
+      let index = dates.indexOf(current);
+      if (index < 0) {
+        index = offset < 0
+          ? dates.findLastIndex(day => day < current)
+          : dates.findIndex(day => day > current);
+      } else {
+        index += offset;
+      }
+      if (index >= 0 && index < dates.length) setTradeDate(dates[index]);
     }
     function scoreCell(label, value) {
       const text = value === null || value === undefined || value === "" ? "-" : String(value);
@@ -5242,6 +5658,10 @@ LEADERS_HTML = r"""<!doctype html>
     function clip(value, limit = 72) {
       const text = String(value || "").replace(/\s+/g, " ").trim();
       return text.length > limit ? `${text.slice(0, limit)}...` : text;
+    }
+    function hoverTitle(value) {
+      const text = String(value || "").replace(/\s+/g, " ").trim();
+      return text ? ` title="${esc(text)}"` : "";
     }
     function splitTags(value) {
       return String(value || "")
@@ -5261,11 +5681,12 @@ LEADERS_HTML = r"""<!doctype html>
       }
     }
     function factLine(label, value, className = "") {
-      const text = clip(value, className === "theme" ? 110 : className === "active" ? 130 : 84);
-      return text ? `<div class="fact-line ${esc(className)}"><strong>${esc(label)}</strong>${esc(text)}</div>` : "";
+      const limit = className === "theme" ? 110 : className === "active" ? 130 : 84;
+      const text = clip(value, limit);
+      return text ? `<div class="fact-line ${esc(className)}"${hoverTitle(value)}><strong>${esc(label)}</strong>${esc(text)}</div>` : "";
     }
-    function renderActiveFacts(row) {
-      const facts = parseJsonArray(row.active_facts)
+    function activeFactItems(row) {
+      return parseJsonArray(row.active_facts)
         .map(item => ({
           date: String(item?.date || "").trim(),
           title: String(item?.title || "").trim(),
@@ -5274,24 +5695,40 @@ LEADERS_HTML = r"""<!doctype html>
         }))
         .filter(item => item.body || item.lines.length || item.title)
         .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")) || factPriority(a) - factPriority(b));
-      if (!facts.length) return factLine("有效事实总结", row.active_fact_summary, "active");
+    }
+    function uniqueFacts(facts, limit = 4) {
       const seen = new Set();
-      const items = facts.filter(item => {
+      return facts.filter(item => {
         const key = `${item.date}|${item.title}|${item.body.slice(0, 48)}`;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
-      }).slice(0, 4);
-      return `<div class="fact-timeline">
-        <strong>有效事实总结${Number(row.active_fact_count || 0) > items.length ? ` · ${fmt(row.active_fact_count)}条` : ""}</strong>
+      }).slice(0, limit);
+    }
+    function renderKplLimitReason(row) {
+      let items = uniqueFacts(activeFactItems(row).filter(item => /开盘啦涨停原因/.test(item.title)), 2);
+      if (!items.length && clean(row.kpl_limit_reason)) {
+        items = [{
+          date: clean(row.kpl_limit_reason_date),
+          title: "开盘啦涨停原因",
+          body: clean(row.kpl_limit_reason),
+          lines: [clean(row.kpl_limit_reason)]
+        }];
+      }
+      if (!items.length) return "";
+      return `<div class="fact-timeline reason">
+        <strong>开盘啦涨停原因</strong>
         ${items.map(item => {
           const lines = item.lines.length ? item.lines : [cleanFactBody(item)].filter(Boolean);
           return lines.slice(0, 3).map((line, index) => `<div class="fact-item">
             <span class="fact-date">${esc(item.date || "-")}</span>
-            <span class="fact-text">${index === 0 && item.title ? `<span class="fact-title">${esc(item.title)}</span> ` : ""}${esc(clip(line, 118))}</span>
+            <span class="fact-text"${hoverTitle(line)}>${esc(clip(line, 190))}</span>
           </div>`).join("");
         }).join("")}
       </div>`;
+    }
+    function renderTrendModelSummary(row) {
+      return factLine("模型总结", row.active_fact_summary, "active");
     }
     function cleanFactBody(item) {
       const title = String(item?.title || "").trim();
@@ -5354,7 +5791,7 @@ LEADERS_HTML = r"""<!doctype html>
         </div>
         <div class="leader-identity">
           <a class="stock" href="${stockUrl(row.code)}" target="_blank" rel="noopener noreferrer">
-            <strong>${esc(row.name)}</strong>
+            <strong${hoverTitle(`${row.name || ""} ${row.code || ""}`)}>${esc(row.name)}</strong>
             <small>${esc(row.code)}</small>
           </a>
           ${tags.length ? `<div class="fact-tags">${tags.map(tag => `<span>${esc(tag)}</span>`).join("")}</div>` : ""}
@@ -5369,15 +5806,17 @@ LEADERS_HTML = r"""<!doctype html>
               <div class="dim">
                 <span>${esc(dim.label)}</span>
                 <b>+${fmt(dim.score)}</b>
-                <small>#${esc(dim.rank_no)} ${esc(dimValue(dim))}</small>
+                <small${hoverTitle(`#${dim.rank_no} ${dimValue(dim)}`)}>#${esc(dim.rank_no)} ${esc(dimValue(dim))}</small>
               </div>
             `).join("") : ""}
           </div>
         </div>
         <div class="leader-facts">
           ${factLine("公司亮点", row.company_highlights, "highlight")}
-          ${renderActiveFacts(row)}
-          ${factLine("本概念解释", row.theme_concept_explain, "theme")}
+          ${isTrend ? `
+            ${factLine("本概念解释", row.theme_concept_explain, "theme")}
+            ${renderTrendModelSummary(row)}
+          ` : renderKplLimitReason(row)}
         </div>
       </article>`;
     }
@@ -5482,6 +5921,7 @@ LEADERS_HTML = r"""<!doctype html>
         const response = await fetch(`/api/leaders?${params.toString()}`, { cache: "no-store" });
         const data = await response.json();
         if (!$("tradeDate").value && data.trade_date) $("tradeDate").value = data.trade_date;
+        updateDateButtons();
         renderServiceContext(data);
         const scopes = Array.isArray(data.scopes) ? data.scopes : [];
         state.scopes = scopes;
@@ -5498,7 +5938,9 @@ LEADERS_HTML = r"""<!doctype html>
       }
     }
     $("refreshBtn").addEventListener("click", load);
-    $("tradeDate").addEventListener("change", load);
+    $("tradeDate").addEventListener("change", event => setTradeDate(event.target.value));
+    $("prevDateBtn").addEventListener("click", () => stepTradeDate(-1));
+    $("nextDateBtn").addEventListener("click", () => stepTradeDate(1));
     $("scopeSearch").addEventListener("input", event => {
       state.filter = event.target.value || "";
       const filtered = visibleScopes();
@@ -5511,10 +5953,31 @@ LEADERS_HTML = r"""<!doctype html>
       const button = event.target.closest(".theme-tab");
       if (button) selectScope(button.dataset.scopeKey || "");
     });
+    loadTradeDates();
     load();
   </script>
 </body>
 </html>"""
+
+
+KPL_LEADERS_HTML = (
+    LEADERS_HTML
+    .replace("<h1>领头羊</h1>", "<h1>开盘啦精选领头羊</h1>", 1)
+    .replace('<a class="btn" href="/kpl-leaders">开盘啦领头羊</a>\n      ', "", 1)
+    .replace(
+        '<a class="btn" href="/market-width">市场概览</a>',
+        '<a class="btn" href="/market-width">市场概览</a>\n      <a class="btn" href="/leaders">同花顺领头羊</a>',
+        1,
+    )
+    .replace("<strong>题材</strong>", "<strong>开盘啦精选</strong>", 1)
+    .replace('placeholder="搜索题材 / 股票"', 'placeholder="搜索板块 / 股票"', 1)
+    .replace("fetch(`/api/leaders?", "fetch(`/api/kpl-leaders?", 1)
+    .replace("leader_active_scope", "kpl_leader_active_scope")
+    .replace("主题均涨", "板块均涨")
+    .replace("完整成分", "池内成分")
+    .replace("头条题材", "开盘啦精选")
+)
+
 
 
 

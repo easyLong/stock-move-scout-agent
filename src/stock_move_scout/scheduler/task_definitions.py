@@ -9,7 +9,6 @@ DEPRECATED_TASK_IDS = (
     "import_latest_mysql",
     "warm_hard_evidence_auto",
     "ths_root_extended_items",
-    "research_pool_snapshot",
     "research_pool_theme_members",
     "headline_theme_role_evidence",
     "effective_facts",
@@ -36,7 +35,9 @@ TRADING_TIME_TASK_IDS = frozenset(
     {
         "anchor_realtime_roles",
         "event_engine",
+        "kpl_plate_strength",
         "market_width_snapshot",
+        "realtime_mover_scan",
         "stock_move_judgements",
     }
 )
@@ -194,7 +195,7 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
     {
         "task_id": "ths_homepage_headline_themes",
         "task_name": "THS Homepage Headline Themes",
-        "task_description": "交易日开盘前和午盘后刷新同花顺首页头条题材。",
+        "task_description": "盘后采集一次同花顺首页头条题材，作为冻结快照的数据源。",
         "task_kind": "ths_homepage_headline_themes",
         "task_type": "warm",
         "enabled": 1,
@@ -204,6 +205,20 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "timeout": 300,
         "payload": {"timeout": 15, "pause": 0.03, "max_pages": 80, "fail_on_empty": True},
         "dedupe": "ths_homepage_headline_themes:{minute_key}",
+    },
+    {
+        "task_id": "ths_homepage_headline_freeze",
+        "task_name": "THS Homepage Headline Freeze",
+        "task_description": "盘后冻结同花顺首页题材快照，作为下一交易日同花顺领头羊的题材口径。",
+        "task_kind": "ths_homepage_headline_freeze",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 44,
+        "timeout": 120,
+        "payload": {"fail_on_empty": True},
+        "dedupe": "ths_homepage_headline_freeze:{run_key}",
     },
     {
         "task_id": "eastmoney_limit_up_pool",
@@ -239,7 +254,7 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "task_description": "Materialize the daily research pool after close, once limit-up pool and daily bars are refreshed.",
         "task_kind": "research_pool_snapshot",
         "task_type": "warm",
-        "enabled": 0,
+        "enabled": 1,
         "schedule_type": "interval",
         "interval": 86400,
         "priority": 45,
@@ -250,16 +265,100 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
     {
         "task_id": "post_close_leaderboard_snapshot",
         "task_name": "Post-Close Leaderboard Snapshot",
-        "task_description": "After limit-up pool and daily bars are ready, rebuild the confirmed research pool and materialize leaderboard snapshot.",
+        "task_description": "After research pool, THS frozen themes and KPL limit-up reasons are ready, materialize the THS leaderboard snapshot.",
         "task_kind": "post_close_leaderboard_snapshot",
         "task_type": "warm",
         "enabled": 1,
         "schedule_type": "interval",
         "interval": 86400,
-        "priority": 46,
+        "priority": 51,
         "timeout": 300,
-        "payload": {"limit_up_days": 5, "gain_period_days": 5, "gain_top": 30, "force": True},
+        "payload": {"limit_up_days": 5, "gain_period_days": 5, "gain_top": 30, "force": True, "skip_research_pool": True},
         "dedupe": "post_close_leaderboard_snapshot:{run_key}",
+    },
+    {
+        "task_id": "kpl_limit_up_reasons",
+        "task_name": "KPL Limit-Up Reasons",
+        "task_description": "Collect KPL per-stock limit-up reasons for the confirmed research pool after the post-close pool is refreshed.",
+        "task_kind": "kpl_limit_up_reasons",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 47,
+        "timeout": 1200,
+        "payload": {"timeout": 8, "pause": 0.05},
+        "dedupe": "kpl_limit_up_reasons:{run_key}",
+    },
+    {
+        "task_id": "kpl_replay_limit_themes",
+        "task_name": "KPL ReplayLa Limit Themes",
+        "task_description": "Collect ReplayLa limit-up reason groups and materialize one primary theme for limit-up stocks.",
+        "task_kind": "kpl_replay_limit_themes",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 48,
+        "timeout": 1200,
+        "payload": {"timeout": 8, "pause": 0.05},
+        "dedupe": "kpl_replay_limit_themes:{run_key}",
+    },
+    {
+        "task_id": "kpl_stock_featured_sections",
+        "task_name": "KPL Stock Featured Sections",
+        "task_description": "Collect KPL featured sections for the daily research pool; used as the primary theme fallback for non-limit-up stocks.",
+        "task_kind": "kpl_stock_featured_sections",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 49,
+        "timeout": 1200,
+        "payload": {"timeout": 8, "pause": 0.08},
+        "dedupe": "kpl_stock_featured_sections:{run_key}",
+    },
+    {
+        "task_id": "kpl_leaderboard_snapshot",
+        "task_name": "KPL Leaderboard Snapshot",
+        "task_description": "Materialize the post-close KPL featured leaderboard cache after KPL reason and section sources are ready.",
+        "task_kind": "kpl_leaderboard_snapshot",
+        "task_type": "warm",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 86400,
+        "priority": 52,
+        "timeout": 300,
+        "payload": {},
+        "dedupe": "kpl_leaderboard_snapshot:{run_key}",
+    },
+    {
+        "task_id": "kpl_plate_strength",
+        "task_name": "KPL Featured Plate Strength",
+        "task_description": "Refresh KPL featured plate strength during trading time so non-limit-up primary themes follow the strongest current section.",
+        "task_kind": "kpl_plate_strength",
+        "task_type": "hot",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 60,
+        "priority": 37,
+        "timeout": 90,
+        "payload": {"limit": 100, "timeout": 8},
+        "dedupe": "kpl_plate_strength:{minute_key}",
+    },
+    {
+        "task_id": "kpl_market_capacity",
+        "task_name": "KPL Market Capacity Forecast",
+        "task_description": "Manual fallback only. Market overview now collects KPL predicted turnover inside market_width_snapshot for synchronized timestamps.",
+        "task_kind": "kpl_market_capacity",
+        "task_type": "hot",
+        "enabled": 0,
+        "schedule_type": "interval",
+        "interval": 60,
+        "priority": 36,
+        "timeout": 90,
+        "payload": {"timeout": 8, "market_type": 0},
+        "dedupe": "kpl_market_capacity:{minute_key}",
     },
     {
         "task_id": "research_pool_theme_members",
@@ -316,6 +415,33 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "timeout": 120,
         "payload": {"limit": 50, "research_pool_only": True},
         "dedupe": "root_evidence_cache_dirty:{minute_key}",
+    },
+    {
+        "task_id": "realtime_mover_scan",
+        "task_name": "Realtime Mover Scan",
+        "task_description": "Scan research-pool quotes during trading, persist scan_runs/windows, and provide inputs for event_engine.",
+        "task_kind": "realtime_mover_scan",
+        "task_type": "hot",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 60,
+        "priority": 34,
+        "timeout": 90,
+        "payload": {
+            "research_pool_only": True,
+            "scan_interval": 5,
+            "window_seconds": 15,
+            "scan_top": 20,
+            "aggregate_top": 5,
+            "min_speed_signal": 1.5,
+            "min_single_speed": 1.5,
+            "min_15s_speed": 1.5,
+            "min_accepted_scans": 1,
+            "scan_timeout": 90,
+            "no_evidence": True,
+            "no_file_output": True,
+        },
+        "dedupe": "realtime_mover_scan:{minute_key}",
     },
     {
         "task_id": "event_engine",
@@ -413,9 +539,9 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "priority": 44,
         "timeout": 1800,
         "payload": {
-            "min_rows": 4000,
-            "workers": 12,
-            "batch_size": 900,
+            "min_rows": 4800,
+            "workers": 4,
+            "batch_size": 300,
             "wait_minutes": 20,
             "retry_seconds": 120,
             "refresh_bars": True,
@@ -517,24 +643,55 @@ NEXT_RUN_SQL_BY_TASK = {
     "daily_market_themes": _today_or_next_trade_day_timestamp("08:32:00"),
     "morning_reference_post": _today_or_next_trade_day_timestamp("08:35:00"),
     "scheduled_task_health_check": _today_or_next_trade_day_timestamp("08:00:00"),
-    "ths_market_after_close_summary": _today_or_next_trade_day_timestamp("15:45:00"),
+    "ths_market_after_close_summary": _today_or_next_trade_day_timestamp("16:10:00"),
     "ths_hot_concepts": _today_or_next_trade_day_timestamp("15:30:00"),
     "ths_homepage_headline_themes": (
         "CASE "
-        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:10:00') "
-        "WHEN TIME(NOW()) < '09:10:00' THEN TIMESTAMP(CURDATE(), '09:10:00') "
-        "WHEN TIME(NOW()) < '11:45:00' THEN TIMESTAMP(CURDATE(), '11:45:00') "
-        f"ELSE {_next_trade_day_timestamp('09:10:00')} END"
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '15:55:00') "
+        "WHEN TIME(NOW()) < '15:55:00' THEN TIMESTAMP(CURDATE(), '15:55:00') "
+        f"ELSE {_next_trade_day_timestamp('15:55:00')} END"
     ),
+    "ths_homepage_headline_freeze": _today_or_next_trade_day_timestamp("16:05:00"),
     "eastmoney_limit_up_pool": _today_or_next_trade_day_timestamp("15:25:00"),
-    "research_pool_snapshot": _today_or_next_trade_day_timestamp("16:20:00"),
-    "post_close_leaderboard_snapshot": _today_or_next_trade_day_timestamp("16:20:00"),
+    "research_pool_snapshot": _today_or_next_trade_day_timestamp("16:25:00"),
+    "kpl_limit_up_reasons": _today_or_next_trade_day_timestamp("20:05:00"),
+    "kpl_replay_limit_themes": _today_or_next_trade_day_timestamp("20:15:00"),
+    "kpl_stock_featured_sections": _today_or_next_trade_day_timestamp("20:30:00"),
+    "post_close_leaderboard_snapshot": _today_or_next_trade_day_timestamp("20:45:00"),
+    "kpl_leaderboard_snapshot": _today_or_next_trade_day_timestamp("21:00:00"),
+    "kpl_plate_strength": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:30:00') "
+        "WHEN TIME(NOW()) < '09:30:00' THEN TIMESTAMP(CURDATE(), '09:30:00') "
+        "WHEN TIME(NOW()) < '11:29:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
+        "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        f"ELSE {_next_trade_day_timestamp('09:30:00')} END"
+    ),
+    "kpl_market_capacity": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:30:00') "
+        "WHEN TIME(NOW()) < '09:30:00' THEN TIMESTAMP(CURDATE(), '09:30:00') "
+        "WHEN TIME(NOW()) < '11:29:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
+        "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        f"ELSE {_next_trade_day_timestamp('09:30:00')} END"
+    ),
     "ths_stock_concepts": _today_or_next_trade_day_timestamp("16:30:00"),
     "research_pool_theme_members": _today_or_next_trade_day_timestamp("09:15:00"),
     "headline_theme_role_evidence": _today_or_next_trade_day_timestamp("09:16:00"),
     "effective_facts": _today_or_next_trade_day_timestamp("23:05:00"),
     "async_evidence_source_sync": "IF(TIME(NOW()) < '09:35:00', TIMESTAMP(CURDATE(), '09:35:00'), NOW(3))",
     "root_evidence_cache_dirty": "IF(TIME(NOW()) < '09:35:00', TIMESTAMP(CURDATE(), '09:35:00'), NOW(3))",
+    "realtime_mover_scan": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:30:00') "
+        "WHEN TIME(NOW()) < '09:30:00' THEN TIMESTAMP(CURDATE(), '09:30:00') "
+        "WHEN TIME(NOW()) < '11:29:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
+        "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
+        f"ELSE {_next_trade_day_timestamp('09:30:00')} END"
+    ),
     "event_engine": (
         "CASE "
         "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:35:00') "

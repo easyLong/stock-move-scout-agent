@@ -134,10 +134,7 @@ def in_headline_theme_checkpoint(value: datetime | None = None) -> bool:
     if not is_trade_weekday(now):
         return False
     current = now.time()
-    return (
-        clock_time(9, 10) <= current < clock_time(9, 20)
-        or clock_time(11, 45) <= current < clock_time(11, 55)
-    )
+    return clock_time(15, 55) <= current < clock_time(16, 5)
 
 
 def should_enqueue_now(task: dict[str, str], value: datetime | None = None) -> tuple[bool, str]:

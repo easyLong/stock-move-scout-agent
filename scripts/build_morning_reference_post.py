@@ -12,6 +12,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 from stock_scout_mysql import add_mysql_args, mysql_config_from_args, mysql_rows, run_mysql, sql_string
 from stock_move_scout.calendar import previous_trade_close_window
 from stock_move_scout.evidence.model_config import (

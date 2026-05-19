@@ -31,8 +31,8 @@ LIST_URLS = (
     "https://news.10jqka.com.cn/cjzx_list/",
 )
 
-TITLE_KEYWORDS = ("涨停复盘", "收评", "A股三大指数", "沪指", "创业板指")
-SUMMARY_KEYWORDS = ("全市场", "成交额", "涨幅居前", "跌幅居前", "板块题材", "下跌")
+TITLE_KEYWORDS = ("涨停复盘", "收评", "A股三大指数", "沪指", "创业板指", "市场全天")
+SUMMARY_KEYWORDS = ("全市场", "成交额", "涨幅居前", "跌幅居前", "板块题材", "下跌", "上涨", "指数")
 
 
 def project_root() -> Path:

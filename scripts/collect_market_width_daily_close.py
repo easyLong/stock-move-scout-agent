@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
+import math
 import os
 import sys
 import time
@@ -17,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 os.environ.setdefault("NO_PROXY", "*")
 os.environ.setdefault("no_proxy", "*")
 
-from backfill_market_width_daily_history import build_snapshot, insert_snapshot, load_daily_rows
+from backfill_market_width_daily_history import build_snapshot, insert_snapshot, load_daily_rows, validate_daily_close_snapshot
+from collect_market_width_snapshot import fetch_spot_frame, normalize_rows
 from stock_move_scout.sources.daily_bars import (
     fetch_daily_bars_from_ak_hist,
     fetch_daily_bars_from_ak_daily,
@@ -62,7 +64,9 @@ def close_row_count(config: Any, trade_date: str) -> int:
       AND b.code REGEXP {sql_string(MAIN_A_PREFIX_REGEXP)}
       AND COALESCE(s.is_st, 0)=0
       AND s.name NOT LIKE '%ST%'
-      AND s.name NOT LIKE '%退市%';
+      AND s.name NOT LIKE '%退市%'
+      AND COALESCE(b.stock_name, '') NOT LIKE '%ST%'
+      AND COALESCE(b.stock_name, '') NOT LIKE '%退市%';
     """
     rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
     try:
@@ -110,13 +114,13 @@ def enrich_pct_change(rows: list[dict[str, Any]], previous_close: dict[str, floa
 def fetch_one_daily_bar(item: tuple[str, str], trade_date: str) -> tuple[str, list[dict[str, Any]], str]:
     code, name = item
     try:
-        rows = fetch_daily_bars_from_ak_daily(code, name, trade_date, trade_date)
+        rows = fetch_daily_bars_from_ak_hist(code, name, trade_date, trade_date)
         if rows:
             return code, rows, ""
     except Exception as exc:
-        daily_error = f"daily:{type(exc).__name__}:{str(exc)[:160]}"
+        hist_error = f"hist:{type(exc).__name__}:{str(exc)[:160]}"
     else:
-        daily_error = "daily:empty"
+        hist_error = "hist:empty"
     try:
         rows = fetch_daily_bars_from_ak_tx(code, name, trade_date, trade_date)
         if rows:
@@ -125,11 +129,7 @@ def fetch_one_daily_bar(item: tuple[str, str], trade_date: str) -> tuple[str, li
         tx_error = f"tx:{type(exc).__name__}:{str(exc)[:160]}"
     else:
         tx_error = "tx:empty"
-    try:
-        rows = fetch_daily_bars_from_ak_hist(code, name, trade_date, trade_date)
-        return code, rows, daily_error + "; " + tx_error
-    except Exception as exc:
-        return code, [], daily_error + "; " + tx_error + f"; hist:{type(exc).__name__}:{str(exc)[:160]}"
+    return code, [], hist_error + "; " + tx_error + "; daily:skipped_no_timeout"
 
 
 def refresh_daily_bars(config: Any, trade_date: str, *, workers: int, batch_size: int) -> dict[str, Any]:
@@ -167,11 +167,59 @@ def refresh_daily_bars(config: Any, trade_date: str, *, workers: int, batch_size
     }
 
 
+def refresh_daily_bars_from_spot(config: Any, trade_date: str) -> dict[str, Any]:
+    source, df = fetch_spot_frame("auto")
+    rows: list[dict[str, Any]] = []
+    for row in normalize_rows(df, include_bj=False, include_st=False):
+        latest = row.get("latest_price")
+        try:
+            latest_value = float(latest or 0)
+        except Exception:
+            latest_value = 0.0
+        if latest_value <= 0 or not math.isfinite(latest_value):
+            continue
+        rows.append(
+            {
+                "code": row["code"],
+                "trade_date": trade_date,
+                "stock_name": row.get("name") or "",
+                "open_price": latest_value,
+                "high_price": latest_value,
+                "low_price": latest_value,
+                "close_price": latest_value,
+                "pct_change": row.get("pct_change"),
+                "volume": row.get("volume"),
+                "amount": row.get("amount"),
+                "source": "akshare_stock_zh_a_spot_em_close",
+                "raw_json": {"source": source, "snapshot_kind": "daily_close_spot", "raw_row": row.get("raw_row")},
+            }
+        )
+    written = upsert_daily_bars(config, rows)
+    return {"source": source, "stocks": len(rows), "written_rows": written}
+
+
+def try_refresh_daily_bars_from_spot(config: Any, trade_date: str) -> dict[str, Any]:
+    try:
+        return refresh_daily_bars_from_spot(config, trade_date)
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+
+
 def build_daily_close_snapshot(config: Any, trade_date: str, *, min_rows: int) -> dict[str, Any]:
     rows = load_daily_rows(config, trade_date)
     if len(rows) < int(min_rows):
         return {"ok": False, "reason": "insufficient_daily_bars", "trade_date": trade_date, "rows": len(rows)}
     snapshot, top50 = build_snapshot(config, trade_date, rows)
+    missing_index_fields = validate_daily_close_snapshot(snapshot)
+    if missing_index_fields:
+        return {
+            "ok": False,
+            "reason": "missing_shanghai_index_fields",
+            "trade_date": trade_date,
+            "rows": len(rows),
+            "missing_fields": missing_index_fields,
+            "shanghai_index_source": (snapshot.get("raw_meta") or {}).get("shanghai_index", {}).get("source"),
+        }
     insert_snapshot(config, snapshot, top50)
     return {
         "ok": True,
@@ -184,6 +232,7 @@ def build_daily_close_snapshot(config: Any, trade_date: str, *, min_rows: int) -
         "down5_count": snapshot["down5_count"],
         "limit_up_count": snapshot["limit_up_count"],
         "limit_down_count": snapshot["limit_down_count"],
+        "shanghai_index_source": (snapshot.get("raw_meta") or {}).get("shanghai_index", {}).get("source"),
     }
 
 
@@ -191,7 +240,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect daily bars and build confirmed daily-close market width snapshot.")
     add_mysql_args(parser)
     parser.add_argument("--trade-date", default=date.today().isoformat())
-    parser.add_argument("--min-rows", type=int, default=4000)
+    parser.add_argument("--min-rows", type=int, default=4800)
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=900)
     parser.add_argument("--wait-minutes", type=int, default=20)
@@ -219,7 +268,13 @@ def main() -> int:
         before_rows = close_row_count(config, args.trade_date)
         fetch_result: dict[str, Any] = {"skipped": True, "reason": "refresh_disabled_or_already_complete"}
         if not args.no_refresh_bars and before_rows < int(args.min_rows):
-            fetch_result = refresh_daily_bars(config, args.trade_date, workers=args.workers, batch_size=args.batch_size)
+            spot_result = try_refresh_daily_bars_from_spot(config, args.trade_date)
+            after_spot_rows = close_row_count(config, args.trade_date)
+            if after_spot_rows < int(args.min_rows):
+                per_stock_result = refresh_daily_bars(config, args.trade_date, workers=args.workers, batch_size=args.batch_size)
+            else:
+                per_stock_result = {"skipped": True, "reason": "spot_rows_sufficient"}
+            fetch_result = {"spot": spot_result, "per_stock": per_stock_result}
         after_rows = close_row_count(config, args.trade_date)
         result = build_daily_close_snapshot(
             config,

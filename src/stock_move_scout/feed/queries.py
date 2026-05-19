@@ -289,11 +289,27 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
         AND rp.gain_top=30
     ),
     headline_snapshot AS (
-      SELECT snapshot_id
+      SELECT
+        snapshot_id,
+        trade_date,
+        source,
+        CASE
+          WHEN source='ths_homepage_headline_frozen' AND trade_date=CAST({day} AS DATE) THEN 'post_close_frozen'
+          WHEN source='ths_homepage_headline_frozen' THEN 'frozen_fallback'
+          ELSE 'live_fallback'
+        END AS snapshot_status
       FROM ths_homepage_headline_themes
       WHERE trade_date <= {day}
-        AND source='ths_homepage_headline'
-      ORDER BY trade_date DESC, collected_at DESC
+        AND source IN ('ths_homepage_headline_frozen', 'ths_homepage_headline')
+      ORDER BY
+        CASE
+          WHEN source='ths_homepage_headline_frozen' AND trade_date=CAST({day} AS DATE) THEN 0
+          WHEN source='ths_homepage_headline_frozen' THEN 1
+          WHEN source='ths_homepage_headline' AND trade_date=CAST({day} AS DATE) THEN 2
+          ELSE 3
+        END ASC,
+        trade_date DESC,
+        collected_at DESC
       LIMIT 1
     ),
     headline_themes AS (
@@ -439,13 +455,21 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
         LIMIT 9
       ) d
     ),
+    limit_days_score_day AS (
+      SELECT MAX(trade_date) AS trade_date
+      FROM limit_up_pool_items
+      WHERE trade_date <= {day}
+        AND source='eastmoney_akshare_stock_zt_pool_em'
+        AND pool_type='limit_up'
+        AND COALESCE(status, '') IN ('limit_up', '涨停', '')
+    ),
     limit_events_raw AS (
       SELECT
         i.trade_date,
         i.code,
         COALESCE(
-          STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time), '')), '%Y-%m-%d %H:%i:%s'),
-          STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time), '')), '%Y-%m-%d %H:%i')
+          STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(i.last_limit_time, '')), '%Y-%m-%d %H:%i:%s'),
+          STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(i.last_limit_time, '')), '%Y-%m-%d %H:%i')
         ) AS first_limit_at,
         COALESCE(i.turnover_amount, i.seal_amount, 0) AS limit_amount,
         '东方财富涨停池' AS source_name,
@@ -456,21 +480,7 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
       WHERE i.source='eastmoney_akshare_stock_zt_pool_em'
         AND i.pool_type='limit_up'
         AND COALESCE(i.status, '') IN ('limit_up', '涨停', '')
-        AND COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time, '') <> ''
-      UNION ALL
-      SELECT
-        DATE(sm.captured_at) AS trade_date,
-        sm.code,
-        MIN(sm.captured_at) AS first_limit_at,
-        MAX(COALESCE(sm.amount, 0)) AS limit_amount,
-        '实时扫描' AS source_name,
-        3 AS source_priority
-      FROM scan_movers sm
-      JOIN scan_runs sr ON sr.id=sm.scan_run_id AND sr.accepted=1
-      JOIN recent_trade_days td ON td.trade_date=DATE(sm.captured_at)
-      JOIN (SELECT DISTINCT code FROM scope_codes) p ON p.code=sm.code
-      WHERE COALESCE(sm.pct_change, 0) >= 9.8
-      GROUP BY DATE(sm.captured_at), sm.code
+        AND COALESCE(NULLIF(i.last_limit_time, ''), '') <> ''
     ),
     limit_events_daily AS (
       SELECT
@@ -494,65 +504,100 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
           CAST({day} AS DATE) AS trade_date,
           e.first_limit_at,
           e.limit_amount,
-          IF(e.code IS NOT NULL, 'limit_up', 'pct_rank') AS today_rank_kind,
-          COALESCE(e.source_name, '同花顺题材成分涨幅') AS source_name,
+          'limit_up' AS today_rank_kind,
+          e.source_name,
           sc.today_pct,
           ROW_NUMBER() OVER (
             PARTITION BY sc.scope_key
             ORDER BY
-              IF(e.code IS NOT NULL, 1, 0) DESC,
               e.first_limit_at ASC,
               e.limit_amount DESC,
-              COALESCE(sc.today_pct, -999) DESC,
               sc.code ASC
           ) AS rank_no
         FROM scope_codes sc
-        LEFT JOIN limit_events_daily e
+        JOIN limit_events_daily e
           ON e.code=sc.code
          AND e.trade_date=CAST({day} AS DATE)
       ) ranked
       WHERE rank_no <= 5
     ),
+    limit_days_raw AS (
+      SELECT
+        sc.scope_key,
+        sc.scope_name,
+        sc.code,
+        sc.name,
+        i.trade_date,
+        GREATEST(
+          COALESCE(CAST(NULLIF(SUBSTRING_INDEX(i.limit_up_stat, '/', -1), '') AS UNSIGNED), 0),
+          COALESCE(i.limit_up_days, 0),
+          1
+        ) AS limit_up_days,
+        COALESCE(NULLIF(i.limit_up_stat, ''), CONCAT(COALESCE(i.limit_up_days, 1), '连板')) AS limit_up_stat,
+        COALESCE(i.turnover_amount, i.seal_amount, 0) AS limit_amount,
+        COALESCE(
+          STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(i.last_limit_time, '')), '%Y-%m-%d %H:%i:%s'),
+          STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(i.last_limit_time, '')), '%Y-%m-%d %H:%i')
+        ) AS limit_time,
+        '东方财富涨停池' AS source_name,
+        1 AS source_priority
+      FROM scope_codes sc
+      JOIN limit_days_score_day sd ON sd.trade_date IS NOT NULL
+      JOIN limit_up_pool_items i
+        ON i.code=sc.code
+       AND i.trade_date=sd.trade_date
+       AND i.source='eastmoney_akshare_stock_zt_pool_em'
+       AND i.pool_type='limit_up'
+       AND COALESCE(i.status, '') IN ('limit_up', '涨停', '')
+       AND COALESCE(NULLIF(i.last_limit_time, ''), '') <> ''
+    ),
+    limit_days_per_code AS (
+      SELECT
+        scope_key,
+        MAX(scope_name) AS scope_name,
+        code,
+        MAX(name) AS name,
+        MAX(trade_date) AS trade_date,
+        MAX(limit_up_days) AS limit_up_days,
+        SUBSTRING_INDEX(
+          GROUP_CONCAT(limit_up_stat ORDER BY limit_up_days DESC, source_priority ASC, COALESCE(limit_time, '2099-12-31') ASC SEPARATOR '||'),
+          '||',
+          1
+        ) AS limit_up_stat,
+        MAX(limit_amount) AS limit_amount,
+        MIN(limit_time) AS limit_time,
+        SUBSTRING_INDEX(
+          GROUP_CONCAT(source_name ORDER BY limit_up_days DESC, source_priority ASC, COALESCE(limit_time, '2099-12-31') ASC SEPARATOR '||'),
+          '||',
+          1
+        ) AS source_name
+      FROM limit_days_raw
+      WHERE limit_up_days > 0
+      GROUP BY scope_key, code
+    ),
     today_limit_days_ranked AS (
       SELECT *
       FROM (
         SELECT
-          sc.scope_key,
-          sc.scope_name,
-          sc.code,
-          sc.name,
-          i.trade_date,
-          GREATEST(
-            COALESCE(CAST(NULLIF(SUBSTRING_INDEX(i.limit_up_stat, '/', -1), '') AS UNSIGNED), 0),
-            COALESCE(i.limit_up_days, 0)
-          ) AS limit_up_days,
-          COALESCE(NULLIF(i.limit_up_stat, ''), CONCAT(COALESCE(i.limit_up_days, 0), '连板')) AS limit_up_stat,
-          COALESCE(i.turnover_amount, i.seal_amount, 0) AS limit_amount,
+          scope_key,
+          scope_name,
+          code,
+          name,
+          trade_date,
+          limit_up_days,
+          limit_up_stat,
+          limit_amount,
+          limit_time,
+          source_name,
           ROW_NUMBER() OVER (
-            PARTITION BY sc.scope_key
+            PARTITION BY scope_key
             ORDER BY
-              GREATEST(
-                COALESCE(CAST(NULLIF(SUBSTRING_INDEX(i.limit_up_stat, '/', -1), '') AS UNSIGNED), 0),
-                COALESCE(i.limit_up_days, 0)
-              ) DESC,
-              COALESCE(
-                STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time), '')), '%Y-%m-%d %H:%i:%s'),
-                STR_TO_DATE(CONCAT(DATE_FORMAT(i.trade_date, '%Y-%m-%d'), ' ', NULLIF(COALESCE(NULLIF(i.last_limit_time, ''), i.first_limit_time), '')), '%Y-%m-%d %H:%i')
-              ) ASC,
-              COALESCE(i.turnover_amount, i.seal_amount, 0) DESC,
-              sc.code ASC
+              limit_up_days DESC,
+              COALESCE(limit_time, '2099-12-31') ASC,
+              limit_amount DESC,
+              code ASC
           ) AS rank_no
-        FROM scope_codes sc
-        JOIN limit_up_pool_items i
-          ON i.code=sc.code
-         AND i.trade_date=CAST({day} AS DATE)
-         AND i.source='eastmoney_akshare_stock_zt_pool_em'
-         AND i.pool_type='limit_up'
-         AND COALESCE(i.status, '') IN ('limit_up', '涨停', '')
-        WHERE GREATEST(
-          COALESCE(CAST(NULLIF(SUBSTRING_INDEX(i.limit_up_stat, '/', -1), '') AS UNSIGNED), 0),
-          COALESCE(i.limit_up_days, 0)
-        ) > 0
+        FROM limit_days_per_code
       ) ranked
       WHERE rank_no <= 5
     ),
@@ -620,8 +665,8 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
         rank_no,
         6 - rank_no AS score,
         limit_up_days AS value_num,
-        CONCAT(limit_up_days, '天 / ', limit_up_stat) AS value_text,
-        '东方财富涨停池' AS source_name,
+        CONCAT(DATE_FORMAT(trade_date, '%m-%d'), ' ', limit_up_days, '板 / ', limit_up_stat) AS value_text,
+        source_name,
         DATE_FORMAT(trade_date, '%Y-%m-%d') AS data_date
       FROM today_limit_days_ranked
       UNION ALL
@@ -742,6 +787,10 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
       'trade_date', DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d'),
       'rule', '研究池拆为情绪票和趋势票：情绪票=近5日涨停，展示Top3；趋势票=近5日无涨停且5日涨幅Top30，展示Top1。情绪票按连板辨识度、日内主动性、阶段先手性排序；趋势票按5日涨幅排名和涨幅强度排序。',
       'theme_rule', '全市场榜=研究池全集；主题榜=同花顺首页头条题材成分 ∩ 研究池，主题内部单独重排',
+      'headline_theme_snapshot_id', COALESCE((SELECT snapshot_id FROM headline_snapshot LIMIT 1), ''),
+      'headline_theme_trade_date', COALESCE((SELECT DATE_FORMAT(trade_date, '%Y-%m-%d') FROM headline_snapshot LIMIT 1), ''),
+      'headline_theme_source', COALESCE((SELECT source FROM headline_snapshot LIMIT 1), ''),
+      'headline_theme_status', COALESCE((SELECT snapshot_status FROM headline_snapshot LIMIT 1), ''),
       'scopes', COALESCE((
         SELECT JSON_ARRAYAGG(scope_item)
         FROM (
@@ -795,6 +844,46 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
                     AND ef.valid_status='active'
                     AND ef.display_level <> 'hidden'
                 ), '[]'),
+                'kpl_limit_reason', COALESCE((
+                  SELECT r.reason_text
+                  FROM kpl_replay_limit_theme_stocks r
+                  WHERE r.code=l.code
+                    AND r.trade_date <= CAST({day} AS DATE)
+                    AND r.reason_date <= CAST({day} AS DATE)
+                    AND r.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+                    AND COALESCE(r.reason_text, '') <> ''
+                  ORDER BY r.reason_date DESC, r.captured_at DESC, r.theme_rank ASC
+                  LIMIT 1
+                ), (
+                  SELECT r.reason_text
+                  FROM kpl_stock_limit_up_reasons r
+                  WHERE r.code=l.code
+                    AND r.reason_date <= CAST({day} AS DATE)
+                    AND r.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+                    AND COALESCE(r.reason_text, '') <> ''
+                  ORDER BY r.reason_date DESC, r.captured_at DESC
+                  LIMIT 1
+                ), ''),
+                'kpl_limit_reason_date', COALESCE((
+                  SELECT DATE_FORMAT(r.reason_date, '%Y-%m-%d')
+                  FROM kpl_replay_limit_theme_stocks r
+                  WHERE r.code=l.code
+                    AND r.trade_date <= CAST({day} AS DATE)
+                    AND r.reason_date <= CAST({day} AS DATE)
+                    AND r.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+                    AND COALESCE(r.reason_text, '') <> ''
+                  ORDER BY r.reason_date DESC, r.captured_at DESC, r.theme_rank ASC
+                  LIMIT 1
+                ), (
+                  SELECT DATE_FORMAT(r.reason_date, '%Y-%m-%d')
+                  FROM kpl_stock_limit_up_reasons r
+                  WHERE r.code=l.code
+                    AND r.reason_date <= CAST({day} AS DATE)
+                    AND r.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+                    AND COALESCE(r.reason_text, '') <> ''
+                  ORDER BY r.reason_date DESC, r.captured_at DESC
+                  LIMIT 1
+                ), ''),
                 'active_fact_count', COALESCE((
                   SELECT COUNT(*)
                   FROM stock_effective_facts ef WHERE ef.trade_date=CAST({day} AS DATE) AND ef.code=l.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
@@ -886,6 +975,406 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
     """
 
 
+def _replace_sql_block(sql: str, start_marker: str, end_marker: str, replacement: str) -> str:
+    start = sql.find(start_marker)
+    end = sql.find(end_marker, start)
+    if start < 0 or end < 0:
+        raise ValueError(f"SQL block markers not found: {start_marker!r} -> {end_marker!r}")
+    return sql[:start] + replacement + sql[end:]
+
+
+def kpl_leaderboard_sql(trade_date: str | None = "") -> str:
+    day = sql_string(trade_date or date.today().strftime("%Y-%m-%d"))
+    sql = leaderboard_sql(trade_date)
+    kpl_theme_block = f"""
+    kpl_plate_snapshot AS (
+      SELECT trade_date, captured_at, source_table
+      FROM (
+        SELECT
+          trade_date,
+          captured_at,
+          'kpl_plate_featured_strengths' AS source_table,
+          0 AS source_priority,
+          COUNT(*) AS row_count,
+          SUM(IF(COALESCE(plate_name, '') NOT REGEXP '(^|[^A-Za-z])ST([^A-Za-z]|$)|ST板块|退市', 1, 0)) AS non_st_count
+        FROM kpl_plate_featured_strengths
+        WHERE trade_date = {day}
+        GROUP BY trade_date, captured_at
+        UNION ALL
+        SELECT
+          trade_date,
+          MAX(captured_at) AS captured_at,
+          'kpl_replay_limit_theme_groups' AS source_table,
+          1 AS source_priority,
+          COUNT(*) AS row_count,
+          COUNT(*) AS non_st_count
+        FROM kpl_replay_limit_theme_groups
+        WHERE trade_date = {day}
+          AND COALESCE(theme_name, '') <> ''
+        GROUP BY trade_date
+      ) snapshots
+      WHERE trade_date = {day}
+      ORDER BY source_priority ASC, IF(non_st_count >= 5, 0, 1), trade_date DESC, captured_at DESC
+      LIMIT 1
+    ),
+    kpl_plate_latest AS (
+      SELECT
+        p.row_rank AS theme_rank,
+        p.plate_code AS theme_id,
+        p.plate_name AS theme_name,
+        p.plate_code AS index_code,
+        p.strength AS plate_strength,
+        p.change_pct AS plate_change_pct,
+        p.speed AS plate_speed
+      FROM kpl_plate_featured_strengths p
+      JOIN kpl_plate_snapshot s
+        ON s.source_table='kpl_plate_featured_strengths'
+       AND s.trade_date=p.trade_date
+       AND s.captured_at=p.captured_at
+      WHERE p.trade_date = {day}
+        AND COALESCE(p.plate_name, '') <> ''
+      UNION ALL
+      SELECT
+        g.theme_rank AS theme_rank,
+        g.theme_code AS theme_id,
+        g.theme_name AS theme_name,
+        g.theme_code AS index_code,
+        g.limit_up_count AS plate_strength,
+        NULL AS plate_change_pct,
+        NULL AS plate_speed
+      FROM kpl_replay_limit_theme_groups g
+      JOIN kpl_plate_snapshot s
+        ON s.source_table='kpl_replay_limit_theme_groups'
+       AND s.trade_date=g.trade_date
+       AND s.captured_at=g.captured_at
+      WHERE g.trade_date = {day}
+        AND COALESCE(g.theme_name, '') <> ''
+    ),
+    kpl_stock_sections_day AS (
+      SELECT MAX(trade_date) AS trade_date
+      FROM kpl_stock_featured_sections
+      WHERE trade_date <= {day}
+    ),
+    kpl_primary_trade_days AS (
+      SELECT trade_date
+      FROM (
+        SELECT CAST({day} AS DATE) AS trade_date
+        UNION
+        SELECT trade_date
+        FROM (
+          SELECT DISTINCT trade_date
+          FROM stock_daily_bars
+          WHERE trade_date < {day}
+          ORDER BY trade_date DESC
+          LIMIT 4
+        ) prev_days
+      ) days
+    ),
+    kpl_limit_primary_candidates AS (
+      SELECT *
+      FROM (
+        SELECT
+          r.trade_date,
+          r.theme_code,
+          r.theme_name,
+          r.theme_rank,
+          r.code,
+          r.stock_name,
+          r.limit_time,
+          r.limit_amount,
+          r.pct_change,
+          r.reason_text,
+          r.concept_explain,
+          r.boom_theme,
+          ROW_NUMBER() OVER (
+            PARTITION BY r.code
+            ORDER BY r.trade_date DESC, COALESCE(r.limit_time, r.captured_at) DESC, r.theme_rank ASC
+          ) AS rn
+        FROM kpl_replay_limit_theme_stocks r
+        JOIN kpl_primary_trade_days td ON td.trade_date=r.trade_date
+        WHERE COALESCE(r.theme_name, '') <> ''
+      ) ranked
+      WHERE rn=1
+    ),
+    kpl_stock_reason_candidates AS (
+      SELECT *
+      FROM (
+        SELECT
+          r.reason_date,
+          r.code,
+          r.stock_name,
+          r.reason_text,
+          r.concept_explain,
+          r.boom_theme,
+          ROW_NUMBER() OVER (
+            PARTITION BY r.code
+            ORDER BY r.reason_date DESC, r.captured_at DESC
+          ) AS rn
+        FROM kpl_stock_limit_up_reasons r
+        JOIN kpl_primary_trade_days td ON td.trade_date=r.reason_date
+        WHERE COALESCE(r.reason_text, '') <> ''
+      ) ranked
+      WHERE rn=1
+    ),
+    kpl_featured_primary_candidates AS (
+      SELECT *
+      FROM (
+        SELECT
+          k.code,
+          k.stock_name,
+          k.section_code,
+          k.section_name,
+          k.section_rank,
+          k.section_score,
+          COALESCE(pl.theme_rank, 9999) AS plate_rank,
+          pl.plate_strength,
+          pl.plate_change_pct,
+          pl.plate_speed,
+          ROW_NUMBER() OVER (
+            PARTITION BY k.code
+            ORDER BY
+              IF(pl.theme_id IS NULL, 1, 0) ASC,
+              COALESCE(pl.theme_rank, 9999) ASC,
+              COALESCE(k.section_rank, 9999) ASC,
+              COALESCE(k.section_score, -999999) DESC,
+              k.section_name ASC
+          ) AS rn
+        FROM kpl_stock_sections_day sd
+        JOIN kpl_stock_featured_sections k ON k.trade_date=sd.trade_date
+        JOIN leader_research_pool rp ON rp.code=k.code
+        LEFT JOIN kpl_plate_latest pl ON pl.theme_id=k.section_code
+        WHERE COALESCE(k.section_name, '') <> ''
+      ) ranked
+      WHERE rn=1
+    ),
+    kpl_primary_theme AS (
+      SELECT
+        rp.code,
+        COALESCE(
+          CASE WHEN lp.code IS NOT NULL THEN NULLIF(lp.theme_name, '') END,
+          NULLIF(fp.section_name, ''),
+          '未归类'
+        ) AS theme_name,
+        COALESCE(lp.theme_code, fp.section_code, '') AS theme_id,
+        COALESCE(lp.theme_rank, fp.plate_rank, 9999) AS theme_rank,
+        COALESCE(lp.theme_code, fp.section_code, '') AS index_code,
+        CASE
+          WHEN lp.code IS NOT NULL THEN 'replay_limit_theme'
+          WHEN kr.code IS NOT NULL THEN 'stock_limit_reason'
+          ELSE 'featured_strength'
+        END AS primary_theme_source,
+        COALESCE(lp.reason_text, kr.reason_text, fp.section_name, '') AS primary_theme_reason,
+        fp.plate_strength,
+        fp.plate_change_pct,
+        fp.plate_speed,
+        fp.section_score,
+        COALESCE(fp.section_rank, 0) AS stock_rank
+      FROM leader_research_pool rp
+      LEFT JOIN kpl_limit_primary_candidates lp ON lp.code=rp.code
+      LEFT JOIN kpl_stock_reason_candidates kr ON kr.code=rp.code
+      LEFT JOIN kpl_featured_primary_candidates fp ON fp.code=rp.code
+    ),
+    headline_theme_member_candidates AS (
+      SELECT
+        pt.theme_rank,
+        pt.theme_name,
+        pt.index_code,
+        u.code,
+        p.name,
+        p.today_pct AS rise_percent,
+        pt.stock_rank,
+        1 AS in_research_pool,
+        p.rank_3d,
+        p.rank_5d,
+        p.rank_10d,
+        p.pct_3d,
+        p.pct_5d,
+        p.pct_10d,
+        COALESCE(p.today_pct, 0) AS today_pct,
+        p.source_kind,
+        p.source_label,
+        p.limit_up_day_count,
+        p.pool_rank,
+        pt.primary_theme_source,
+        pt.primary_theme_reason,
+        pt.plate_strength,
+        pt.plate_change_pct,
+        pt.plate_speed,
+        pt.section_score
+      FROM leader_research_pool p
+      JOIN kpl_primary_theme pt ON pt.code=p.code
+      JOIN market_universe u ON u.code=p.code
+    ),
+    theme_top3 AS (
+      SELECT *
+      FROM (
+      SELECT
+        pl.theme_name,
+        pl.theme_rank,
+        COALESCE((
+          SELECT COUNT(DISTINCT h.code)
+          FROM headline_theme_member_candidates h
+          WHERE h.theme_name=pl.theme_name
+        ), 0) AS member_count,
+        COALESCE((
+          SELECT COUNT(DISTINCT h.code)
+          FROM headline_theme_member_candidates h
+          WHERE h.theme_name=pl.theme_name
+            AND h.in_research_pool=1
+        ), 0) AS research_pool_member_count,
+        COALESCE((
+          SELECT ROUND(AVG(COALESCE(h.rise_percent, 0)), 2)
+          FROM headline_theme_member_candidates h
+          WHERE h.theme_name=pl.theme_name
+        ), ROUND(COALESCE(pl.plate_change_pct, 0), 2)) AS avg_rise,
+        COALESCE((
+          SELECT ROUND(MAX(COALESCE(h.rise_percent, 0)), 2)
+          FROM headline_theme_member_candidates h
+          WHERE h.theme_name=pl.theme_name
+        ), ROUND(COALESCE(pl.plate_change_pct, 0), 2)) AS max_rise,
+        ROW_NUMBER() OVER (ORDER BY pl.theme_rank ASC, pl.theme_name ASC) AS top_theme_rank
+      FROM kpl_plate_latest pl
+      WHERE COALESCE(pl.theme_name, '') NOT REGEXP '(^|[^A-Za-z])ST([^A-Za-z]|$)|ST板块|退市'
+      ) ranked_kpl_themes
+      WHERE top_theme_rank <= 8
+    ),
+"""
+    sql = _replace_sql_block(sql, "    headline_snapshot AS (", "    scope_codes AS (", kpl_theme_block)
+    sql = sql.replace(
+        """      'theme_rule', '全市场榜=研究池全集；主题榜=同花顺首页头条题材成分 ∩ 研究池，主题内部单独重排',
+      'headline_theme_snapshot_id', COALESCE((SELECT snapshot_id FROM headline_snapshot LIMIT 1), ''),
+      'headline_theme_trade_date', COALESCE((SELECT DATE_FORMAT(trade_date, '%Y-%m-%d') FROM headline_snapshot LIMIT 1), ''),
+      'headline_theme_source', COALESCE((SELECT source FROM headline_snapshot LIMIT 1), ''),
+      'headline_theme_status', COALESCE((SELECT snapshot_status FROM headline_snapshot LIMIT 1), ''),""",
+        """      'theme_rule', '全市场榜=研究池全集；主题榜=开盘啦精选板块Top8，涨停票按复盘啦涨停原因归组，非涨停票按精选板块强度归组',
+      'headline_theme_snapshot_id', COALESCE((SELECT DATE_FORMAT(captured_at, '%Y%m%d%H%i%s') FROM kpl_plate_snapshot LIMIT 1), ''),
+      'headline_theme_trade_date', COALESCE((SELECT DATE_FORMAT(trade_date, '%Y-%m-%d') FROM kpl_plate_snapshot LIMIT 1), ''),
+      'headline_theme_source', COALESCE((SELECT source_table FROM kpl_plate_snapshot LIMIT 1), 'kpl_plate_featured_strengths'),
+      'headline_theme_status', 'post_close_confirm',""",
+    )
+    sql = sql.replace(
+        """        p.pool_rank
+      FROM leader_research_pool p
+      UNION ALL""",
+        """        p.pool_rank,
+        COALESCE((SELECT pt.primary_theme_source FROM kpl_primary_theme pt WHERE pt.code=p.code LIMIT 1), '') AS primary_theme_source,
+        COALESCE((SELECT pt.primary_theme_reason FROM kpl_primary_theme pt WHERE pt.code=p.code LIMIT 1), '') AS primary_theme_reason
+      FROM leader_research_pool p
+      UNION ALL""",
+    )
+    sql = sql.replace(
+        """        MAX(p.pool_rank) AS pool_rank
+      FROM theme_top3 t""",
+        """        MAX(p.pool_rank) AS pool_rank,
+        MAX(p.primary_theme_source) AS primary_theme_source,
+        MAX(p.primary_theme_reason) AS primary_theme_reason
+      FROM theme_top3 t""",
+    )
+    sql = sql.replace(
+        """        MAX(sc.pool_rank) AS pool_rank
+      FROM scope_codes sc""",
+        """        MAX(sc.pool_rank) AS pool_rank,
+        MAX(sc.primary_theme_source) AS primary_theme_source,
+        MAX(sc.primary_theme_reason) AS primary_theme_reason
+      FROM scope_codes sc""",
+    )
+    sql = sql.replace(
+        """                'active_fact_summary', COALESCE((
+                  SELECT COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, ''))
+                  FROM async_evidence_summaries aes
+                  WHERE aes.trade_date=CAST({day} AS DATE)
+                    AND aes.code=l.code
+                    AND EXISTS (
+                      SELECT 1
+                      FROM stock_effective_facts ef WHERE ef.trade_date=CAST({day} AS DATE) AND ef.code=l.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+                    )
+                  LIMIT 1
+                ), ''),""".replace("{day}", day),
+        f"""                'active_fact_summary', IF(
+                  l.primary_theme_source='replay_limit_theme' AND COALESCE(l.primary_theme_reason, '') <> '',
+                  l.primary_theme_reason,
+                  COALESCE((
+                    SELECT COALESCE(NULLIF(aes.impact_summary_text, ''), NULLIF(aes.summary_text, ''), NULLIF(aes.final_view, ''), NULLIF(aes.move_reason, ''))
+                    FROM async_evidence_summaries aes
+                    WHERE aes.trade_date=CAST({day} AS DATE)
+                      AND aes.code=l.code
+                      AND EXISTS (
+                        SELECT 1
+                        FROM stock_effective_facts ef WHERE ef.trade_date=CAST({day} AS DATE) AND ef.code=l.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+                      )
+                    LIMIT 1
+                  ), '')
+                ),""",
+    )
+    sql = sql.replace(
+        "l.primary_theme_source='replay_limit_theme'",
+        "l.primary_theme_source IN ('replay_limit_theme', 'stock_limit_reason')",
+    )
+    sql = sql.replace(
+        """                'active_facts', COALESCE((
+                  SELECT JSON_ARRAYAGG(JSON_OBJECT(
+                    'date', COALESCE(DATE_FORMAT(ef.fact_date, '%Y-%m-%d'), ''),
+                    'title', COALESCE(NULLIF(ef.fact_subtype, ''), NULLIF(ef.fact_title, ''), '有效事实'),
+                    'body', LEFT(COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(ef.payload, '$.display_body')), ''), NULLIF(ef.fact_body, ''), ef.fact_title, ''), 220),
+                    'lines', COALESCE(JSON_EXTRACT(ef.payload, '$.display_lines'), JSON_ARRAY())
+                  ))
+                  FROM stock_effective_facts ef
+                  WHERE ef.trade_date=CAST({day} AS DATE)
+                    AND ef.code=l.code
+                    AND ef.evidence_group='current_effective'
+                    AND ef.valid_status='active'
+                    AND ef.display_level <> 'hidden'
+                ), '[]'),""".replace("{day}", day),
+        f"""                'active_facts', IF(
+                  l.primary_theme_source='replay_limit_theme' AND COALESCE(l.primary_theme_reason, '') <> '',
+                  JSON_ARRAY(JSON_OBJECT(
+                    'date', DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d'),
+                    'title', '开盘啦涨停原因',
+                    'body', LEFT(l.primary_theme_reason, 220),
+                    'lines', JSON_ARRAY(l.primary_theme_reason)
+                  )),
+                  COALESCE((
+                    SELECT JSON_ARRAYAGG(JSON_OBJECT(
+                      'date', COALESCE(DATE_FORMAT(ef.fact_date, '%Y-%m-%d'), ''),
+                      'title', COALESCE(NULLIF(ef.fact_subtype, ''), NULLIF(ef.fact_title, ''), '有效事实'),
+                      'body', LEFT(COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(ef.payload, '$.display_body')), ''), NULLIF(ef.fact_body, ''), ef.fact_title, ''), 220),
+                      'lines', COALESCE(JSON_EXTRACT(ef.payload, '$.display_lines'), JSON_ARRAY())
+                    ))
+                    FROM stock_effective_facts ef
+                    WHERE ef.trade_date=CAST({day} AS DATE)
+                      AND ef.code=l.code
+                      AND ef.evidence_group='current_effective'
+                      AND ef.valid_status='active'
+                      AND ef.display_level <> 'hidden'
+                  ), '[]')
+                ),""",
+    )
+    sql = sql.replace(
+        """                'active_fact_count', COALESCE((
+                  SELECT COUNT(*)
+                  FROM stock_effective_facts ef WHERE ef.trade_date=CAST({day} AS DATE) AND ef.code=l.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+                ), 0),""".replace("{day}", day),
+        f"""                'active_fact_count', IF(
+                  l.primary_theme_source='replay_limit_theme' AND COALESCE(l.primary_theme_reason, '') <> '',
+                  1,
+                  COALESCE((
+                    SELECT COUNT(*)
+                    FROM stock_effective_facts ef WHERE ef.trade_date=CAST({day} AS DATE) AND ef.code=l.code AND ef.evidence_group='current_effective' AND ef.valid_status='active'
+                  ), 0)
+                ),""",
+    )
+    sql = sql.replace(
+        "l.primary_theme_source='replay_limit_theme'",
+        "l.primary_theme_source IN ('replay_limit_theme', 'stock_limit_reason')",
+    )
+    sql = sql.replace(
+        "'theme_rule', '全市场榜=研究池全集；主题榜=同花顺首页头条题材成分 ∩ 研究池，主题内部单独重排'",
+        "'theme_rule', '全市场榜=研究池全集；板块榜=强度最高8个 primary_theme，涨停票取复盘啦涨停原因分组，非涨停票取当前强度最高的开盘啦精选板块'",
+    )
+    sql = sql.replace("'同花顺题材成分涨幅'", "'开盘啦精选板块成分涨幅'")
+    return sql
+
+
 def latest_scan_sql() -> str:
     return """
     SELECT COALESCE(JSON_OBJECT(
@@ -966,7 +1455,7 @@ def status_sql(trade_date: str | None = "") -> str:
 
 def market_width_latest_sql(trade_date: str | None = "") -> str:
     filters = [
-        "(source='stock_daily_bars_close' OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999') OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999')))"
+        "((source='stock_daily_bars_close' AND total_count >= 4800) OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999') OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999')))"
     ]
     if trade_date:
         filters.append(f"trade_date={sql_string(trade_date)}")
@@ -1014,7 +1503,49 @@ def market_width_latest_sql(trade_date: str | None = "") -> str:
       'total_volume', total_volume,
       'total_volume_yi', ROUND(total_volume / 100000000, 2),
       'total_amount_yi', ROUND(total_amount / 100000000, 2),
-      'top50_amount_yi', ROUND(top50_amount / 100000000, 2)
+      'top50_amount_yi', ROUND(top50_amount / 100000000, 2),
+      'kpl_capacity_market_time', COALESCE((
+        SELECT DATE_FORMAT(k.market_time, '%Y-%m-%d %H:%i:%s')
+        FROM kpl_market_capacity_snapshots k
+        WHERE k.trade_date=market_width_snapshots.trade_date
+        ORDER BY IF(k.captured_at=market_width_snapshots.captured_at, 0, 1), k.captured_at DESC
+        LIMIT 1
+      ), ''),
+      'kpl_capacity_forecast_yi', (
+        SELECT k.forecast_amount_yi
+        FROM kpl_market_capacity_snapshots k
+        WHERE k.trade_date=market_width_snapshots.trade_date
+        ORDER BY IF(k.captured_at=market_width_snapshots.captured_at, 0, 1), k.captured_at DESC
+        LIMIT 1
+      ),
+      'kpl_capacity_current_yi', (
+        SELECT ROUND(k.latest_amount_wan / 10000, 2)
+        FROM kpl_market_capacity_snapshots k
+        WHERE k.trade_date=market_width_snapshots.trade_date
+        ORDER BY IF(k.captured_at=market_width_snapshots.captured_at, 0, 1), k.captured_at DESC
+        LIMIT 1
+      ),
+      'kpl_capacity_change_pct', (
+        SELECT k.forecast_change_pct
+        FROM kpl_market_capacity_snapshots k
+        WHERE k.trade_date=market_width_snapshots.trade_date
+        ORDER BY IF(k.captured_at=market_width_snapshots.captured_at, 0, 1), k.captured_at DESC
+        LIMIT 1
+      ),
+      'kpl_capacity_delta_yi', (
+        SELECT k.forecast_delta_yi
+        FROM kpl_market_capacity_snapshots k
+        WHERE k.trade_date=market_width_snapshots.trade_date
+        ORDER BY IF(k.captured_at=market_width_snapshots.captured_at, 0, 1), k.captured_at DESC
+        LIMIT 1
+      ),
+      'kpl_capacity_text', COALESCE((
+        SELECT k.forecast_text
+        FROM kpl_market_capacity_snapshots k
+        WHERE k.trade_date=market_width_snapshots.trade_date
+        ORDER BY IF(k.captured_at=market_width_snapshots.captured_at, 0, 1), k.captured_at DESC
+        LIMIT 1
+      ), '')
     ), JSON_OBJECT())
     FROM market_width_snapshots
     {where_day}
@@ -1072,7 +1603,47 @@ def market_width_series_sql(trade_date: str | None = "", limit: int = 240) -> st
         'total_volume', total_volume,
         'total_volume_yi', ROUND(total_volume / 100000000, 2),
         'total_amount_yi', ROUND(total_amount / 100000000, 2),
-        'top50_amount_yi', ROUND(top50_amount / 100000000, 2)
+        'top50_amount_yi', ROUND(top50_amount / 100000000, 2),
+        'kpl_capacity_forecast_yi', (
+          SELECT k.forecast_amount_yi
+          FROM kpl_market_capacity_trends k
+          WHERE k.trade_date=latest_rows.trade_date
+            AND k.trend_time<=DATE_FORMAT(latest_rows.captured_at, '%H:%i')
+          ORDER BY k.trend_time DESC
+          LIMIT 1
+        ),
+        'kpl_capacity_current_yi', (
+          SELECT ROUND(k.latest_amount_wan / 10000, 2)
+          FROM kpl_market_capacity_trends k
+          WHERE k.trade_date=latest_rows.trade_date
+            AND k.trend_time<=DATE_FORMAT(latest_rows.captured_at, '%H:%i')
+          ORDER BY k.trend_time DESC
+          LIMIT 1
+        ),
+        'kpl_capacity_change_pct', (
+          SELECT k.forecast_change_pct
+          FROM kpl_market_capacity_trends k
+          WHERE k.trade_date=latest_rows.trade_date
+            AND k.trend_time<=DATE_FORMAT(latest_rows.captured_at, '%H:%i')
+          ORDER BY k.trend_time DESC
+          LIMIT 1
+        ),
+        'kpl_capacity_delta_yi', (
+          SELECT k.forecast_delta_yi
+          FROM kpl_market_capacity_trends k
+          WHERE k.trade_date=latest_rows.trade_date
+            AND k.trend_time<=DATE_FORMAT(latest_rows.captured_at, '%H:%i')
+          ORDER BY k.trend_time DESC
+          LIMIT 1
+        ),
+        'kpl_capacity_text', COALESCE((
+          SELECT k.forecast_text
+          FROM kpl_market_capacity_trends k
+          WHERE k.trade_date=latest_rows.trade_date
+            AND k.trend_time<=DATE_FORMAT(latest_rows.captured_at, '%H:%i')
+          ORDER BY k.trend_time DESC
+          LIMIT 1
+        ), '')
       ) AS item
       FROM (
         SELECT *
@@ -1129,9 +1700,8 @@ def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5) -> st
         JOIN (
           SELECT trade_date, MAX(captured_at) AS captured_at
           FROM market_width_snapshots
-          WHERE ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
-            OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))
-            AND (source='stock_daily_bars_close' OR up5_count > 0 OR down5_count > 0)
+          WHERE source='stock_daily_bars_close'
+            AND total_count >= 4800
             {day_filter}
           GROUP BY trade_date
           ORDER BY trade_date DESC

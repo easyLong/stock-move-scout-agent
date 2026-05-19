@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dirty-only", action="store_true", help="Only analyze pending rows from evidence_analysis_dirty_queue.")
     parser.add_argument("--preserve-trade-date", action="store_true", help="Use the requested date as the service trade date even before intraday data exists.")
     parser.add_argument("--research-pool-only", dest="research_pool_only", action="store_true", help="Only process active research pool stocks.")
+    parser.add_argument("--research-pool-source-kind", default="", help="When --research-pool-only is used, limit candidates to one research_pool_items.source_kind.")
     add_mysql_args(parser)
     return parser.parse_args()
 
@@ -267,6 +268,44 @@ def include_research_pool_codes(candidates: list[dict[str, str]], research_codes
     return out
 
 
+def research_pool_codes(config, trade_date: str, source_kind: str = "") -> list[str]:
+    if not source_kind:
+        return ResearchPoolProvider(config).latest_codes(trade_date)
+    sql = f"""
+    SELECT code
+    FROM research_pool_items
+    WHERE trade_date={sql_string(trade_date)}
+      AND rule='recent_limit_up_or_5d_gain_top'
+      AND limit_up_days=5
+      AND gain_period_days=5
+      AND gain_top=30
+      AND source_kind={sql_string(source_kind)}
+    ORDER BY pool_rank, code;
+    """
+    return [row[0] for row in mysql_rows(run_mysql(config, sql, batch=True, raw=True)) if row]
+
+
+def delete_other_research_pool_summaries(config, trade_date: str, source_kind: str) -> int:
+    if not source_kind:
+        return 0
+    sql = f"""
+    DELETE s
+    FROM async_evidence_summaries s
+    JOIN research_pool_items rp
+      ON rp.trade_date=s.trade_date
+     AND rp.code=s.code
+     AND rp.rule='recent_limit_up_or_5d_gain_top'
+     AND rp.limit_up_days=5
+     AND rp.gain_period_days=5
+     AND rp.gain_top=30
+    WHERE s.trade_date={sql_string(trade_date)}
+      AND rp.source_kind <> {sql_string(source_kind)};
+    SELECT ROW_COUNT();
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    return int(float(rows[-1][0] or 0)) if rows and rows[-1] else 0
+
+
 def main() -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -281,10 +320,16 @@ def main() -> int:
     ensure_model_config_table(config)
     research_codes = None
     bulk_empty_deleted = 0
+    deleted_other_pool_summaries = 0
     if args.research_pool_only and not args.code.strip():
-        research_codes = ResearchPoolProvider(config).latest_codes(args.trade_date)
+        research_codes = research_pool_codes(config, args.trade_date, args.research_pool_source_kind.strip())
         if not args.dirty_only:
             bulk_empty_deleted = delete_summaries_without_current_facts(config, args.trade_date, research_codes)
+            deleted_other_pool_summaries = delete_other_research_pool_summaries(
+                config,
+                args.trade_date,
+                args.research_pool_source_kind.strip(),
+            )
     if args.import_model_config_file:
         env_values = read_openai_env_file(args.import_model_config_file)
         if not env_values.get("OPENAI_API_KEY"):
@@ -300,6 +345,7 @@ def main() -> int:
             args.code.strip(),
             args.limit,
             research_pool_only=args.research_pool_only and not args.code.strip(),
+            research_pool_source_kind=args.research_pool_source_kind.strip(),
         )
         payloads = fetch_payloads(config, args.trade_date, candidates, args.per_kind_limit)
         changed = 0
@@ -330,7 +376,7 @@ def main() -> int:
                 changed += 1
             else:
                 unchanged += 1
-        print(json.dumps({"trade_date": args.trade_date, "candidates": len(candidates), "changed": changed, "unchanged": unchanged, "skipped_no_current_facts": skipped_no_current_facts}, ensure_ascii=False))
+        print(json.dumps({"trade_date": args.trade_date, "candidates": len(candidates), "changed": changed, "unchanged": unchanged, "skipped_no_current_facts": skipped_no_current_facts, "deleted_other_pool_summaries": deleted_other_pool_summaries}, ensure_ascii=False))
         return 0
 
     candidates = (
@@ -342,6 +388,7 @@ def main() -> int:
             args.code.strip(),
             args.limit,
             research_pool_only=args.research_pool_only and not args.code.strip(),
+            research_pool_source_kind=args.research_pool_source_kind.strip(),
         )
     )
     payloads = fetch_payloads(config, args.trade_date, candidates, args.per_kind_limit)
@@ -424,7 +471,7 @@ def main() -> int:
             if args.dirty_only:
                 mark_dirty(config, item.get("dirty_id", ""), "done")
             written += 1
-    print(json.dumps({"trade_date": args.trade_date, "candidates": len(candidates), "written": written, "reused": reused, "trimmed_reused": trimmed_reused, "failed": failed, "skipped": skipped, "skipped_no_current_facts": skipped_no_current_facts}, ensure_ascii=False))
+    print(json.dumps({"trade_date": args.trade_date, "candidates": len(candidates), "written": written, "reused": reused, "trimmed_reused": trimmed_reused, "failed": failed, "skipped": skipped, "skipped_no_current_facts": skipped_no_current_facts, "deleted_other_pool_summaries": deleted_other_pool_summaries}, ensure_ascii=False))
     return 0
 
 

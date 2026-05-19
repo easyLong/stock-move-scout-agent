@@ -1449,6 +1449,181 @@ CREATE TABLE IF NOT EXISTS research_pool_theme_members (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   COMMENT='Research-pool stocks mapped to THS concept explanations and headline theme dimensions.';
 
+CREATE TABLE IF NOT EXISTS kpl_stock_featured_sections (
+  trade_date DATE NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  code CHAR(6) NOT NULL,
+  stock_name VARCHAR(64) NOT NULL DEFAULT '',
+  pool_rank INT NOT NULL DEFAULT 0,
+  pool_source_kind VARCHAR(32) NOT NULL DEFAULT '',
+  section_code VARCHAR(32) NOT NULL,
+  section_name VARCHAR(128) NOT NULL DEFAULT '',
+  section_rank INT NOT NULL DEFAULT 0,
+  section_score DECIMAL(12,4) NULL,
+  leader_code CHAR(6) NOT NULL DEFAULT '',
+  leader_name VARCHAR(64) NOT NULL DEFAULT '',
+  leader_pct DECIMAL(10,4) NULL,
+  leader_flag INT NOT NULL DEFAULT 0,
+  source VARCHAR(64) NOT NULL DEFAULT 'kpl_get_featured_section',
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, code, section_code),
+  KEY idx_kpl_featured_day_section (trade_date, section_name, section_rank),
+  KEY idx_kpl_featured_day_code (trade_date, code, section_rank),
+  KEY idx_kpl_featured_leader (trade_date, leader_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='KPL featured sections returned by GetFeaturedSection for research-pool stocks.';
+
+CREATE TABLE IF NOT EXISTS kpl_plate_featured_strengths (
+  trade_date DATE NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  market_day DATE NULL,
+  market_min VARCHAR(8) NOT NULL DEFAULT '',
+  market_max VARCHAR(8) NOT NULL DEFAULT '',
+  row_rank INT NOT NULL DEFAULT 0,
+  plate_code VARCHAR(32) NOT NULL,
+  plate_name VARCHAR(128) NOT NULL DEFAULT '',
+  strength DECIMAL(18,4) NULL,
+  change_pct DECIMAL(12,4) NULL,
+  speed DECIMAL(12,4) NULL,
+  amount DECIMAL(24,4) NULL,
+  main_net_amount DECIMAL(24,4) NULL,
+  big_order_net_amount DECIMAL(24,4) NULL,
+  source VARCHAR(64) NOT NULL DEFAULT 'kpl_real_ranking_info',
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, captured_at, plate_code),
+  KEY idx_kpl_plate_strength_latest (trade_date, captured_at, row_rank),
+  KEY idx_kpl_plate_strength_plate (plate_code, trade_date, captured_at),
+  KEY idx_kpl_plate_strength_rank (trade_date, row_rank)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='KPL featured plate strength snapshots from ZhiShuRanking.RealRankingInfo.';
+
+CREATE TABLE IF NOT EXISTS kpl_market_capacity_snapshots (
+  trade_date DATE NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  market_time DATETIME NULL,
+  latest_amount_wan DECIMAL(24,4) NULL,
+  yesterday_same_time_amount_wan DECIMAL(24,4) NULL,
+  yesterday_total_amount_wan DECIMAL(24,4) NULL,
+  three_day_avg_total_amount_wan DECIMAL(24,4) NULL,
+  forecast_amount_yuan DECIMAL(24,4) NULL,
+  forecast_amount_yi DECIMAL(18,4) NULL,
+  forecast_change_pct DECIMAL(12,4) NULL,
+  forecast_delta_yi DECIMAL(18,4) NULL,
+  forecast_text VARCHAR(255) NOT NULL DEFAULT '',
+  color VARCHAR(16) NOT NULL DEFAULT '',
+  source VARCHAR(64) NOT NULL DEFAULT 'kpl_market_capacity',
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, captured_at),
+  KEY idx_kpl_market_capacity_latest (trade_date, captured_at),
+  KEY idx_kpl_market_capacity_time (market_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='KPL market capacity forecast snapshots from HomeDingPan.MarketCapacity.';
+
+CREATE TABLE IF NOT EXISTS kpl_market_capacity_trends (
+  trade_date DATE NOT NULL,
+  trend_time CHAR(5) NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  latest_amount_wan DECIMAL(24,4) NULL,
+  yesterday_same_time_amount_wan DECIMAL(24,4) NULL,
+  three_day_same_time_amount_wan DECIMAL(24,4) NULL,
+  forecast_change_pct DECIMAL(12,4) NULL,
+  forecast_amount_yi DECIMAL(18,4) NULL,
+  forecast_delta_yi DECIMAL(18,4) NULL,
+  forecast_text VARCHAR(255) NOT NULL DEFAULT '',
+  color VARCHAR(16) NOT NULL DEFAULT '',
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, trend_time),
+  KEY idx_kpl_market_capacity_trend_latest (trade_date, captured_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='Minute-level KPL market capacity forecast trend points.';
+
+CREATE TABLE IF NOT EXISTS kpl_replay_limit_theme_groups (
+  trade_date DATE NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  theme_code VARCHAR(32) NOT NULL,
+  theme_name VARCHAR(128) NOT NULL DEFAULT '',
+  theme_rank INT NOT NULL DEFAULT 0,
+  limit_up_count INT NOT NULL DEFAULT 0,
+  sample_stock_count INT NOT NULL DEFAULT 0,
+  source VARCHAR(64) NOT NULL DEFAULT 'kpl_replay_limit_reason',
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, theme_code),
+  KEY idx_kpl_replay_group_rank (trade_date, theme_rank),
+  KEY idx_kpl_replay_group_name (trade_date, theme_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='KPL ReplayLa limit-up reason groups from FuPanLa.GetYTFP_BKHX.';
+
+CREATE TABLE IF NOT EXISTS kpl_replay_limit_theme_stocks (
+  trade_date DATE NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  theme_code VARCHAR(32) NOT NULL,
+  theme_name VARCHAR(128) NOT NULL DEFAULT '',
+  theme_rank INT NOT NULL DEFAULT 0,
+  code CHAR(6) NOT NULL,
+  stock_name VARCHAR(64) NOT NULL DEFAULT '',
+  limit_time DATETIME NULL,
+  limit_amount DECIMAL(24,4) NULL,
+  pct_change DECIMAL(12,4) NULL,
+  tags VARCHAR(255) NOT NULL DEFAULT '',
+  streak_text VARCHAR(64) NOT NULL DEFAULT '',
+  replay_td_type VARCHAR(16) NOT NULL DEFAULT '',
+  replay_sample_rank INT NOT NULL DEFAULT 0,
+  reason_date DATE NULL,
+  reason_text TEXT NULL,
+  concept_explain TEXT NULL,
+  boom_theme TEXT NULL,
+  role_label VARCHAR(64) NOT NULL DEFAULT '',
+  reason_zscode JSON NULL,
+  reason_pzscode VARCHAR(32) NOT NULL DEFAULT '',
+  primary_source VARCHAR(64) NOT NULL DEFAULT 'kpl_replay_limit_reason',
+  source VARCHAR(64) NOT NULL DEFAULT 'kpl_replay_limit_reason',
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, theme_code, code),
+  KEY idx_kpl_replay_stock_day_code (trade_date, code),
+  KEY idx_kpl_replay_stock_theme (trade_date, theme_name, theme_rank),
+  KEY idx_kpl_replay_stock_reason_day (reason_date, code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='KPL ReplayLa one-primary-theme stock rows for limit-up reason display.';
+
+CREATE TABLE IF NOT EXISTS kpl_stock_limit_up_reasons (
+  trade_date DATE NOT NULL,
+  captured_at DATETIME(3) NOT NULL,
+  code CHAR(6) NOT NULL,
+  stock_name VARCHAR(64) NOT NULL DEFAULT '',
+  pool_rank INT NOT NULL DEFAULT 0,
+  pool_source_kind VARCHAR(32) NOT NULL DEFAULT '',
+  reason_date DATE NOT NULL,
+  reason_title VARCHAR(255) NOT NULL DEFAULT '',
+  reason_text TEXT NULL,
+  concept_explain TEXT NULL,
+  boom_theme TEXT NULL,
+  role_label VARCHAR(64) NOT NULL DEFAULT '',
+  source_position VARCHAR(64) NOT NULL DEFAULT '',
+  reason_type VARCHAR(32) NOT NULL DEFAULT '',
+  zscode JSON NULL,
+  pzscode VARCHAR(32) NOT NULL DEFAULT '',
+  group_text VARCHAR(255) NOT NULL DEFAULT '',
+  source VARCHAR(64) NOT NULL DEFAULT 'kpl_get_kline_zhangting',
+  raw_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (trade_date, code, reason_date, source),
+  KEY idx_kpl_lu_reason_day (reason_date, code),
+  KEY idx_kpl_lu_reason_trade_day (trade_date, pool_rank),
+  KEY idx_kpl_lu_reason_role (reason_date, role_label)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='KPL per-stock limit-up reasons from StockLineData.GetKLineZhangTing.';
+
 CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
   trade_date DATE NOT NULL,
   rule VARCHAR(64) NOT NULL DEFAULT 'recent_limit_up_or_5d_gain_top',

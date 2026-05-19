@@ -249,6 +249,8 @@ def main() -> int:
             trade_date,
             "--preserve-trade-date",
             "--research-pool-only",
+            "--research-pool-source-kind",
+            "five_day_gain_top",
             "--limit",
             "1000",
             "--per-kind-limit",

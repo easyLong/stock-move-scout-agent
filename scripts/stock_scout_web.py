@@ -17,6 +17,7 @@ from stock_move_scout.feed import (
     build_evidence_view,
     intel_feed_list_sql,
     intel_feed_sql,
+    kpl_leaderboard_sql,
     leaderboard_sql,
     latest_scan_sql,
     latest_window_sql,
@@ -30,15 +31,23 @@ from stock_move_scout.feed import (
 )
 from stock_move_scout.feed import root_cache
 from stock_move_scout.feed.leaderboard_snapshot import (
+    KPL_SNAPSHOT_SOURCE,
+    SNAPSHOT_SOURCE,
     ensure_leaderboard_snapshot_table,
     latest_leaderboard_snapshot_payload,
+    latest_leaderboard_snapshot_payload_by_source,
+    materialize_kpl_leaderboard_snapshot,
 )
 from stock_move_scout.market_width import ensure_market_width_tables
 from stock_move_scout.research_pool import ResearchPoolProvider, ensure_headline_theme_role_evidence_table
+from stock_move_scout.sources.kpl_featured_sections import ensure_kpl_featured_section_table
+from stock_move_scout.sources.kpl_market_capacity import ensure_kpl_market_capacity_tables
+from stock_move_scout.sources.kpl_plate_strength import ensure_kpl_plate_strength_table
+from stock_move_scout.sources.kpl_replay_limit_themes import ensure_kpl_replay_limit_theme_tables
 from stock_move_scout.web import json_query, latest_data_date, resolve_trade_date
 from stock_move_scout.web.service_context import build_service_context
 
-from stock_scout_mysql import MySqlConfig, add_mysql_args, mysql_config_from_args, run_mysql, sql_string
+from stock_scout_mysql import MySqlConfig, add_mysql_args, mysql_config_from_args, mysql_rows, run_mysql, sql_string
 
 
 APP_TITLE = "异动情报引擎"
@@ -119,6 +128,47 @@ def ensure_async_evidence_summary_table(config: MySqlConfig) -> None:
     ensure_async_evidence_summary_column(config, "final_view", "TEXT NULL")
     ensure_async_evidence_summary_column(config, "impact_factors", "JSON NULL")
     ensure_async_evidence_summary_column(config, "impact_summary_text", "TEXT NULL")
+
+
+def resolve_leader_data_date(config: MySqlConfig, service_trade_date: str) -> str:
+    """Leaderboards are post-close conclusions for the next trading day."""
+    sql = f"""
+    SELECT DATE_FORMAT(MAX(trade_date), '%Y-%m-%d')
+    FROM (
+      SELECT trade_date FROM leaderboard_snapshots WHERE trade_date < {sql_string(service_trade_date)}
+      UNION
+      SELECT trade_date FROM limit_up_pool_items WHERE trade_date < {sql_string(service_trade_date)}
+      UNION
+      SELECT trade_date FROM research_pool_items WHERE trade_date < {sql_string(service_trade_date)}
+      UNION
+      SELECT trade_date FROM stock_daily_bars WHERE trade_date < {sql_string(service_trade_date)}
+    ) leader_days;
+    """
+    try:
+        rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    except Exception:
+        rows = []
+    leader_day = str(rows[0][0] or "").strip() if rows and rows[0] else ""
+    return leader_day or service_trade_date
+
+
+def explicit_leader_data_date(config: MySqlConfig, requested_trade_date: str, target_date: str, source: str) -> str:
+    """Historical page selections should show that date's post-close snapshot directly."""
+    requested = str(requested_trade_date or "").strip()
+    if not requested or requested.lower() == "latest":
+        return resolve_leader_data_date(config, target_date)
+    sql = f"""
+    SELECT 1
+    FROM leaderboard_snapshots
+    WHERE trade_date={sql_string(target_date)}
+      AND source={sql_string(source)}
+    LIMIT 1;
+    """
+    try:
+        rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    except Exception:
+        rows = []
+    return target_date if rows else resolve_leader_data_date(config, target_date)
 
 
 def ensure_async_evidence_summary_column(config: MySqlConfig, column_name: str, column_sql: str) -> None:
@@ -225,6 +275,59 @@ def sort_market_width_cycle(rows: object) -> list[object]:
     return sorted(rows, key=lambda item: str(item.get("trade_date") or "") if isinstance(item, dict) else "")
 
 
+def feed_runtime_sql(trade_date: str) -> str:
+    day = sql_string(trade_date)
+    return f"""
+    SELECT COALESCE(JSON_OBJECT(
+      'latest_scan_at', (
+        SELECT DATE_FORMAT(MAX(scanned_at), '%Y-%m-%d %H:%i:%s')
+        FROM scan_runs
+        WHERE DATE(scanned_at)=CAST({day} AS DATE)
+      ),
+      'scan_count', (
+        SELECT COUNT(*)
+        FROM scan_runs
+        WHERE DATE(scanned_at)=CAST({day} AS DATE)
+      ),
+      'accepted_scan_count', (
+        SELECT COUNT(*)
+        FROM scan_runs
+        WHERE DATE(scanned_at)=CAST({day} AS DATE)
+          AND accepted=1
+      ),
+      'latest_scan_row_count', (
+        SELECT row_count
+        FROM scan_runs
+        WHERE DATE(scanned_at)=CAST({day} AS DATE)
+        ORDER BY scanned_at DESC
+        LIMIT 1
+      ),
+      'latest_scan_phase', COALESCE((
+        SELECT market_phase
+        FROM scan_runs
+        WHERE DATE(scanned_at)=CAST({day} AS DATE)
+        ORDER BY scanned_at DESC
+        LIMIT 1
+      ), ''),
+      'latest_event_at', (
+        SELECT DATE_FORMAT(MAX(event_time), '%Y-%m-%d %H:%i:%s')
+        FROM stock_move_events
+        WHERE trade_date=CAST({day} AS DATE)
+      ),
+      'event_count', (
+        SELECT COUNT(*)
+        FROM stock_move_events
+        WHERE trade_date=CAST({day} AS DATE)
+      ),
+      'judgement_count', (
+        SELECT COUNT(*)
+        FROM stock_move_judgements
+        WHERE trade_date=CAST({day} AS DATE)
+      )
+    ), JSON_OBJECT());
+    """
+
+
 
 
 
@@ -234,6 +337,10 @@ def create_app(config: MySqlConfig) -> FastAPI:
     ensure_market_width_tables(config)
     ensure_headline_theme_role_evidence_table(config)
     ensure_leaderboard_snapshot_table(config)
+    ensure_kpl_featured_section_table(config)
+    ensure_kpl_market_capacity_tables(config)
+    ensure_kpl_plate_strength_table(config)
+    ensure_kpl_replay_limit_theme_tables(config)
     app = FastAPI(title=APP_TITLE)
 
     @app.get("/", response_class=HTMLResponse)
@@ -251,6 +358,10 @@ def create_app(config: MySqlConfig) -> FastAPI:
     @app.get("/leaders", response_class=HTMLResponse)
     def leaders_page() -> str:
         return LEADERS_HTML
+
+    @app.get("/kpl-leaders", response_class=HTMLResponse)
+    def kpl_leaders_page() -> str:
+        return KPL_LEADERS_HTML
 
     @app.get("/api/top10")
     def api_top10() -> JSONResponse:
@@ -285,6 +396,7 @@ def create_app(config: MySqlConfig) -> FastAPI:
             },
             "status": attach_data_source_health(status, config),
             "window": json_query(config, latest_window_sql(target_date), {}),
+            "feed_runtime": json_query(config, feed_runtime_sql(target_date), {}),
         }
         return JSONResponse(payload)
 
@@ -335,20 +447,50 @@ def create_app(config: MySqlConfig) -> FastAPI:
     @app.get("/api/leaders")
     def api_leaders(trade_date: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
-        snapshot_payload = latest_leaderboard_snapshot_payload(config, target_date)
+        leader_data_date = explicit_leader_data_date(config, trade_date, target_date, SNAPSHOT_SOURCE)
+        snapshot_payload = latest_leaderboard_snapshot_payload(config, leader_data_date)
         if snapshot_payload is not None:
             payload = snapshot_payload
         else:
-            ResearchPoolProvider(config).latest_snapshot(target_date)
-            payload = json_query(config, leaderboard_sql(target_date), {})
+            ResearchPoolProvider(config).latest_snapshot(leader_data_date)
+            payload = json_query(config, leaderboard_sql(leader_data_date), {})
         if not isinstance(payload, dict):
             payload = {}
         payload["service_trade_date"] = target_date
-        payload["leader_data_trade_date"] = payload.get("leader_data_trade_date") or payload.get("trade_date") or target_date
+        payload["leader_data_trade_date"] = payload.get("leader_data_trade_date") or payload.get("trade_date") or leader_data_date
         payload["leader_data_source"] = payload.get("leader_data_source") or ("dynamic_sql" if snapshot_payload is None else "post_close_confirm")
-        payload["leader_data_label"] = payload.get("leader_data_label") or (
-            f"{payload['leader_data_trade_date']} 动态计算" if snapshot_payload is None else f"{payload['leader_data_trade_date']} 收盘确认"
+        payload["leader_data_label"] = f"{payload['leader_data_trade_date']} 收盘确认，服务 {target_date}"
+        payload["trade_date"] = target_date
+        payload["service_context"] = build_service_context(config, target_date)
+        return JSONResponse(payload)
+
+    @app.get("/api/kpl-leaders")
+    def api_kpl_leaders(trade_date: str = "") -> JSONResponse:
+        target_date = resolve_trade_date(config, trade_date)
+        leader_data_date = explicit_leader_data_date(config, trade_date, target_date, KPL_SNAPSHOT_SOURCE)
+        snapshot_payload = latest_leaderboard_snapshot_payload_by_source(
+            config,
+            leader_data_date,
+            source=KPL_SNAPSHOT_SOURCE,
+            exact=True,
         )
+        if snapshot_payload is not None:
+            payload = snapshot_payload
+        else:
+            ResearchPoolProvider(config).latest_snapshot(leader_data_date)
+            materialize_kpl_leaderboard_snapshot(config, leader_data_date)
+            payload = latest_leaderboard_snapshot_payload_by_source(
+                config,
+                leader_data_date,
+                source=KPL_SNAPSHOT_SOURCE,
+                exact=True,
+            ) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["service_trade_date"] = target_date
+        payload["leader_data_trade_date"] = payload.get("trade_date") or leader_data_date
+        payload["leader_data_source"] = KPL_SNAPSHOT_SOURCE
+        payload["leader_data_label"] = f"{payload['leader_data_trade_date']} 收盘确认，服务 {target_date}"
         payload["trade_date"] = target_date
         payload["service_context"] = build_service_context(config, target_date)
         return JSONResponse(payload)
@@ -356,7 +498,7 @@ def create_app(config: MySqlConfig) -> FastAPI:
     return app
 
 
-from stock_scout_web_templates import HTML, MARKET_WIDTH_HTML, LEADERS_HTML
+from stock_scout_web_templates import HTML, MARKET_WIDTH_HTML, LEADERS_HTML, KPL_LEADERS_HTML
 
 
 def parse_args() -> argparse.Namespace:

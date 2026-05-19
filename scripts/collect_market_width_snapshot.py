@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import akshare as ak
 import pandas as pd
+import requests
 
 from stock_move_scout.market_width import ensure_market_width_tables
 from stock_move_scout.research_pool import ResearchPoolProvider
@@ -25,6 +26,13 @@ from stock_move_scout.sources import (
     QuoteProviderConfig,
     TdxQuoteProvider,
     parse_tdx_server,
+)
+from stock_move_scout.sources.kpl_market_capacity import (
+    KplMarketCapacityConfig,
+    ensure_kpl_market_capacity_tables,
+    fetch_market_capacity,
+    normalize_market_capacity,
+    save_market_capacity,
 )
 
 from stock_scout_mysql import (
@@ -86,6 +94,31 @@ def is_main_a_code(code: str) -> bool:
     return code.startswith(MAIN_A_PREFIXES)
 
 
+def is_excluded_stock_name(name: Any) -> bool:
+    text = clean_name(name)
+    upper = text.upper()
+    return "ST" in upper or "退" in text
+
+
+def limit_threshold(code: Any) -> float:
+    text = normalize_code(code)
+    if text.startswith(("300", "301", "688", "689")):
+        return 19.5
+    return 9.8
+
+
+def is_limit_up_row(row: dict[str, Any]) -> bool:
+    if is_excluded_stock_name(row.get("name")):
+        return False
+    return finite_float(row.get("pct_change")) >= limit_threshold(row.get("code"))
+
+
+def is_limit_down_row(row: dict[str, Any]) -> bool:
+    if is_excluded_stock_name(row.get("name")):
+        return False
+    return finite_float(row.get("pct_change")) <= -limit_threshold(row.get("code"))
+
+
 def clean_name(value: Any) -> str:
     return str(value or "").strip()
 
@@ -137,7 +170,7 @@ def normalize_tdx_quote_rows(quotes: dict[str, dict[str, Any]], *, include_st: b
             continue
         if str(item.get("is_index") or "") == "1":
             continue
-        if not include_st and ("ST" in name.upper() or "退" in name):
+        if not include_st and is_excluded_stock_name(name):
             continue
         latest_price = finite_float(item.get("price"))
         last_close = finite_float(item.get("last_close"))
@@ -190,6 +223,20 @@ def fetch_tdx_rows(args: argparse.Namespace) -> tuple[str, list[dict[str, Any]],
     )
     rows = normalize_tdx_quote_rows(snapshot.quotes, include_st=args.include_st)
     shanghai_index = normalize_shanghai_index_quote(snapshot.quotes)
+    if not shanghai_index:
+        # Some TDX servers silently omit index quotes when they are mixed into
+        # a large stock batch. Fetch the Shanghai index separately so the
+        # market overview keeps its intraday index strip populated.
+        try:
+            index_snapshot = provider.shanghai_index_snapshot()
+            shanghai_index = normalize_shanghai_index_quote(index_snapshot.quotes)
+        except Exception as exc:
+            shanghai_index = None
+            index_error = f"{type(exc).__name__}: {exc}"
+        else:
+            index_error = ""
+    else:
+        index_error = ""
     return (
         snapshot.source,
         rows,
@@ -200,6 +247,7 @@ def fetch_tdx_rows(args: argparse.Namespace) -> tuple[str, list[dict[str, Any]],
             "batch_size": int(args.batch_size),
             "tdx_timeout": int(args.tdx_timeout),
             "shanghai_index": shanghai_index,
+            "shanghai_index_fallback_error": index_error,
         },
     )
 
@@ -237,7 +285,7 @@ def normalize_rows(df: pd.DataFrame, *, include_bj: bool, include_st: bool) -> l
             continue
         if not include_bj and not is_main_a_code(code):
             continue
-        if not include_st and ("ST" in name.upper() or "退" in name):
+        if not include_st and is_excluded_stock_name(name):
             continue
         amount = finite_float(column_value(row, "成交额", "amount", "成交金额"))
         pct_change = finite_float(column_value(row, "涨跌幅", "pct_change", "涨幅"))
@@ -315,8 +363,8 @@ def build_snapshot(
         "down3_count": market["down3_count"],
         "up5_count": market["up5_count"],
         "down5_count": market["down5_count"],
-        "limit_up_count": sum(1 for row in rows if finite_float(row.get("pct_change")) >= 9.8),
-        "limit_down_count": sum(1 for row in rows if finite_float(row.get("pct_change")) <= -9.8),
+        "limit_up_count": sum(1 for row in rows if is_limit_up_row(row)),
+        "limit_down_count": sum(1 for row in rows if is_limit_down_row(row)),
         "amount_top50_count": amount_top50["count"],
         "amount_top50_up_count": amount_top50["up_count"],
         "amount_top50_down_count": amount_top50["down_count"],
@@ -495,6 +543,38 @@ def insert_snapshot(config: Any, snapshot: dict[str, Any], top50: list[dict[str,
     run_mysql(config, top_sql)
 
 
+def collect_synced_kpl_market_capacity(
+    config: Any,
+    *,
+    trade_date: str,
+    captured_at: str,
+    timeout: int,
+) -> dict[str, Any]:
+    ensure_kpl_market_capacity_tables(config)
+    cfg = KplMarketCapacityConfig(trade_date=trade_date, timeout=max(1, int(timeout)))
+    payload = fetch_market_capacity(requests.Session(), cfg)
+    if str(payload.get("errcode", "0")) != "0":
+        raise RuntimeError(f"errcode={payload.get('errcode')} errmsg={payload.get('errmsg', '')}")
+    normalized = normalize_market_capacity(payload, trade_date, captured_at)
+    trend_count = save_market_capacity(
+        config,
+        snapshot=normalized["snapshot"],
+        trends=normalized["trends"],
+    )
+    snapshot = normalized["snapshot"]
+    return {
+        "ok": True,
+        "source": "kpl_market_capacity",
+        "market_time": snapshot.get("market_time"),
+        "forecast_text": snapshot.get("forecast_text"),
+        "forecast_amount_yi": snapshot.get("forecast_amount_yi"),
+        "forecast_change_pct": snapshot.get("forecast_change_pct"),
+        "forecast_delta_yi": snapshot.get("forecast_delta_yi"),
+        "current_amount_yi": round(finite_float(snapshot.get("latest_amount_wan")) / 10000, 2),
+        "trend_count": trend_count,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect market width snapshot and amount Top50.")
     add_mysql_args(parser)
@@ -510,6 +590,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tdx-dir", type=Path, default=DEFAULT_TDX_DIR)
     parser.add_argument("--universe-csv", type=Path, default=root / "data" / "stock" / "tdx_a_stock_universe.csv")
     parser.add_argument("--output-json", type=Path, default=root / "runs" / "data_tasks" / "market_width_latest.json")
+    parser.add_argument("--skip-kpl-market-capacity", action="store_true", help="Do not collect KPL market capacity in the same snapshot batch.")
+    parser.add_argument("--kpl-timeout", type=int, default=8)
     return parser.parse_args()
 
 
@@ -554,6 +636,20 @@ def main() -> int:
         shanghai_index=source_meta.get("shanghai_index") if isinstance(source_meta, dict) else None,
     )
     insert_snapshot(config, snapshot, top50)
+    kpl_capacity: dict[str, Any] = {"ok": False, "skipped": True}
+    if not args.skip_kpl_market_capacity:
+        try:
+            kpl_capacity = collect_synced_kpl_market_capacity(
+                config,
+                trade_date=snapshot["trade_date"],
+                captured_at=snapshot["captured_at"],
+                timeout=args.kpl_timeout,
+            )
+        except Exception as exc:
+            kpl_capacity = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            }
 
     payload = {
         "ok": True,
@@ -563,6 +659,7 @@ def main() -> int:
             "top50_amount_yi": round(snapshot["top50_amount"] / 100000000, 2),
             "total_volume_yi": round(snapshot["total_volume"] / 100000000, 2) if snapshot.get("total_volume") is not None else None,
         },
+        "kpl_capacity": kpl_capacity,
         "top50": [
             {
                 "rank_no": row.get("rank_no"),
@@ -576,7 +673,7 @@ def main() -> int:
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"ok": True, "snapshot_id": snapshot_id, "trade_date": date.today().isoformat(), "rows": len(rows), "top50": len(top50), "source": source}, ensure_ascii=False))
+    print(json.dumps({"ok": True, "snapshot_id": snapshot_id, "trade_date": date.today().isoformat(), "rows": len(rows), "top50": len(top50), "source": source, "kpl_capacity": kpl_capacity}, ensure_ascii=False))
     return 0
 
 

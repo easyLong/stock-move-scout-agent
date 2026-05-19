@@ -13,6 +13,8 @@ from typing import Any
 
 import requests
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 from stock_move_scout.calendar import previous_trade_close_window
 from stock_move_scout.db import add_mysql_args, mysql_config_from_args, mysql_rows, run_mysql
 from stock_move_scout.sources.market_news_storage import import_market_news_rows

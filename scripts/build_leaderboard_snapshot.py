@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from stock_move_scout.db import add_mysql_args, mysql_config_from_args
-from stock_move_scout.feed.leaderboard_snapshot import materialize_leaderboard_snapshot
+from stock_move_scout.feed.leaderboard_snapshot import materialize_kpl_leaderboard_snapshot, materialize_leaderboard_snapshot
 from stock_move_scout.research_pool import (
     DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     DEFAULT_RESEARCH_POOL_GAIN_TOP,
@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-research-pool", action="store_true", help="Use existing research_pool_items without rebuilding it.")
     parser.add_argument("--skip-dependency-check", action="store_true", help="Allow snapshot generation before post-close source tables are complete.")
+    parser.add_argument("--include-kpl", action="store_true", help="Also materialize the KPL featured-plate leaderboard cache.")
+    parser.add_argument("--kpl-only", action="store_true", help="Only materialize the KPL featured-plate leaderboard cache.")
     return parser.parse_args()
 
 
@@ -39,16 +41,22 @@ def main() -> int:
     args = parse_args()
     if not args.mysql_enabled:
         raise SystemExit("--mysql-enabled is required")
-    result = materialize_leaderboard_snapshot(
-        mysql_config_from_args(args),
-        str(args.trade_date),
-        limit_up_days=max(1, int(args.limit_up_days)),
-        gain_period_days=max(1, int(args.gain_period_days)),
-        gain_top=max(1, int(args.gain_top)),
-        force=bool(args.force),
-        rebuild_research_pool=not bool(args.skip_research_pool),
-        check_dependencies=not bool(args.skip_dependency_check),
-    )
+    config = mysql_config_from_args(args)
+    if args.kpl_only:
+        result = {"kpl": materialize_kpl_leaderboard_snapshot(config, str(args.trade_date))}
+    else:
+        result = materialize_leaderboard_snapshot(
+            config,
+            str(args.trade_date),
+            limit_up_days=max(1, int(args.limit_up_days)),
+            gain_period_days=max(1, int(args.gain_period_days)),
+            gain_top=max(1, int(args.gain_top)),
+            force=bool(args.force),
+            rebuild_research_pool=not bool(args.skip_research_pool),
+            check_dependencies=not bool(args.skip_dependency_check),
+        )
+        if args.include_kpl:
+            result["kpl"] = materialize_kpl_leaderboard_snapshot(config, str(args.trade_date))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

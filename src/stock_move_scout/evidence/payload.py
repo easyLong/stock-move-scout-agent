@@ -13,10 +13,16 @@ def fetch_candidates(
     code: str = "",
     limit: int = 50,
     research_pool_only: bool = False,
+    research_pool_source_kind: str = "",
 ) -> list[dict[str, str]]:
     code_filter = f"AND ef.code={sql_string(code)}" if code else ""
     pool_cte = f"{research_pool_cte(trade_date)}," if research_pool_only else ""
     pool_join = "JOIN research_pool rp ON rp.code=ef.code" if research_pool_only else ""
+    pool_source_filter = (
+        f"AND rp.source_kind={sql_string(research_pool_source_kind)}"
+        if research_pool_only and research_pool_source_kind
+        else ""
+    )
     sql = f"""
     WITH {pool_cte}
     candidates AS (
@@ -37,6 +43,7 @@ def fetch_candidates(
         AND ef.valid_status='active'
         AND ef.display_level IN ('primary','secondary')
         {code_filter}
+        {pool_source_filter}
       GROUP BY ef.code
     )
     SELECT code, stock_name

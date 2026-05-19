@@ -26,6 +26,7 @@ from stock_move_scout.research_pool import ResearchPoolProvider
 
 
 MAIN_A_PREFIX_REGEXP = "^(000|001|002|003|300|301|600|601|603|605|688|689)"
+REQUIRED_SH_INDEX_FIELDS = ("price", "pct_change", "amount", "volume")
 
 
 def now_text() -> str:
@@ -51,8 +52,89 @@ def to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def is_excluded_stock_name(name: Any) -> bool:
+    text = str(name or "").strip()
+    upper = text.upper()
+    return "ST" in upper or "退" in text
+
+
+def limit_threshold(code: Any) -> float:
+    text = str(code or "").strip()
+    if text.startswith(("300", "301", "688", "689")):
+        return 19.5
+    return 9.8
+
+
+def is_limit_up_row(row: dict[str, Any]) -> bool:
+    if is_excluded_stock_name(row.get("name")):
+        return False
+    return to_float(row.get("pct_change")) >= limit_threshold(row.get("code"))
+
+
+def is_limit_down_row(row: dict[str, Any]) -> bool:
+    if is_excluded_stock_name(row.get("name")):
+        return False
+    return to_float(row.get("pct_change")) <= -limit_threshold(row.get("code"))
+
+
+def first_existing(columns: Any, candidates: list[str]) -> str | None:
+    names = {str(name).strip(): name for name in columns}
+    for candidate in candidates:
+        if candidate in names:
+            return names[candidate]
+    return None
+
+
+def missing_shanghai_index_fields(sh_index: dict[str, Any] | None) -> list[str]:
+    if not sh_index:
+        return list(REQUIRED_SH_INDEX_FIELDS)
+    missing: list[str] = []
+    for field in REQUIRED_SH_INDEX_FIELDS:
+        value = sh_index.get(field)
+        if value is None or value == "":
+            missing.append(field)
+            continue
+        try:
+            numeric = float(value)
+        except Exception:
+            missing.append(field)
+            continue
+        if field != "pct_change" and numeric <= 0:
+            missing.append(field)
+    return missing
+
+
 @lru_cache(maxsize=1)
 def load_shanghai_index_daily() -> dict[str, dict[str, Any]]:
+    today = date.today().strftime("%Y%m%d")
+    try:
+        df = ak.index_zh_a_hist(symbol="000001", period="daily", start_date="19900101", end_date=today)
+    except Exception:
+        df = None
+    if df is not None and not df.empty:
+        date_col = first_existing(df.columns, ["日期", "date"])
+        close_col = first_existing(df.columns, ["收盘", "close"])
+        pct_col = first_existing(df.columns, ["涨跌幅", "pct_change", "涨跌幅%"])
+        amount_col = first_existing(df.columns, ["成交额", "amount"])
+        volume_col = first_existing(df.columns, ["成交量", "volume"])
+    else:
+        date_col = close_col = pct_col = amount_col = volume_col = None
+    if df is not None and not df.empty and date_col and close_col:
+        result: dict[str, dict[str, Any]] = {}
+        for _, row in df.iterrows():
+            trade_day = str(row.get(date_col) or "").strip()
+            if not trade_day:
+                continue
+            result[trade_day] = {
+                "price": to_float(row.get(close_col)),
+                "pct_change": to_float(row.get(pct_col), None) if pct_col else None,
+                "amount": to_float(row.get(amount_col), None) if amount_col else None,
+                "volume": to_int(row.get(volume_col)) * 100 if volume_col else None,
+                "source": "ak.index_zh_a_hist",
+            }
+        if result and any(not missing_shanghai_index_fields(item) for item in result.values()):
+            return result
+
     try:
         df = ak.stock_zh_index_daily(symbol="sh000001")
     except Exception:
@@ -73,6 +155,7 @@ def load_shanghai_index_daily() -> dict[str, dict[str, Any]]:
             "pct_change": pct_change,
             "amount": None,
             "volume": to_int(row.get("volume")),
+            "source": "ak.stock_zh_index_daily",
         }
         if close:
             prev_close = close
@@ -81,6 +164,34 @@ def load_shanghai_index_daily() -> dict[str, dict[str, Any]]:
 
 def shanghai_index_for_day(trade_day: str) -> dict[str, Any] | None:
     return load_shanghai_index_daily().get(trade_day)
+
+
+def cached_shanghai_index_for_day(config: Any, trade_day: str) -> dict[str, Any] | None:
+    sql = f"""
+    SELECT sh_index_price, sh_index_pct_change, sh_index_amount, sh_index_volume, source, snapshot_id
+    FROM market_width_snapshots
+    WHERE trade_date={sql_string(trade_day)}
+      AND sh_index_price IS NOT NULL
+      AND sh_index_pct_change IS NOT NULL
+      AND sh_index_amount IS NOT NULL
+      AND sh_index_volume IS NOT NULL
+    ORDER BY IF(snapshot_id={sql_string("daily_close_" + trade_day.replace("-", ""))}, 0, 1),
+             captured_at DESC
+    LIMIT 1;
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    if not rows:
+        return None
+    row = rows[0]
+    if len(row) < 4:
+        return None
+    return {
+        "price": to_float(row[0], None),
+        "pct_change": to_float(row[1], None),
+        "amount": to_float(row[2], None),
+        "volume": to_int(row[3]),
+        "source": f"market_width_snapshots:{row[4] if len(row) > 4 else ''}:{row[5] if len(row) > 5 else ''}",
+    }
 
 
 def trade_dates(config: Any, start_date: str, end_date: str, limit: int) -> list[str]:
@@ -144,6 +255,8 @@ def load_daily_rows(config: Any, trade_day: str) -> list[dict[str, Any]]:
       AND COALESCE(s.is_st, 0)=0
       AND s.name NOT LIKE '%ST%'
       AND s.name NOT LIKE '%退市%'
+      AND COALESCE(b.stock_name, '') NOT LIKE '%ST%'
+      AND COALESCE(b.stock_name, '') NOT LIKE '%退市%'
     ORDER BY b.code ASC;
     """
     rows: list[dict[str, Any]] = []
@@ -190,6 +303,11 @@ def build_snapshot(config: Any, trade_day: str, rows: list[dict[str, Any]]) -> t
     research_pool_rows = [by_code[code] for code in research_pool_codes if code in by_code]
     research_pool_stats = width_stats(research_pool_rows)
     sh_index = shanghai_index_for_day(trade_day) or {}
+    if missing_shanghai_index_fields(sh_index):
+        cached_sh_index = cached_shanghai_index_for_day(config, trade_day) or {}
+        if len(missing_shanghai_index_fields(cached_sh_index)) < len(missing_shanghai_index_fields(sh_index)):
+            sh_index = cached_sh_index
+    sh_index_missing = missing_shanghai_index_fields(sh_index)
     return (
         {
             "snapshot_id": "daily_close_" + trade_day.replace("-", ""),
@@ -205,8 +323,8 @@ def build_snapshot(config: Any, trade_day: str, rows: list[dict[str, Any]]) -> t
             "down3_count": market["down3_count"],
             "up5_count": market["up5_count"],
             "down5_count": market["down5_count"],
-            "limit_up_count": sum(1 for row in rows if to_float(row.get("pct_change")) >= 9.8),
-            "limit_down_count": sum(1 for row in rows if to_float(row.get("pct_change")) <= -9.8),
+            "limit_up_count": sum(1 for row in rows if is_limit_up_row(row)),
+            "limit_down_count": sum(1 for row in rows if is_limit_down_row(row)),
             "amount_top50_count": amount_top50["count"],
             "amount_top50_up_count": amount_top50["up_count"],
             "amount_top50_down_count": amount_top50["down_count"],
@@ -241,10 +359,23 @@ def build_snapshot(config: Any, trade_day: str, rows: list[dict[str, Any]]) -> t
                 "research_pool_quote_count": research_pool_stats["count"],
                 "research_pool_meta": research_pool_meta,
                 "shanghai_index": sh_index,
+                "shanghai_index_missing_fields": sh_index_missing,
             },
         },
         top50,
     )
+
+
+def validate_daily_close_snapshot(snapshot: dict[str, Any]) -> list[str]:
+    missing = missing_shanghai_index_fields(
+        {
+            "price": snapshot.get("sh_index_price"),
+            "pct_change": snapshot.get("sh_index_pct_change"),
+            "amount": snapshot.get("sh_index_amount"),
+            "volume": snapshot.get("sh_index_volume"),
+        }
+    )
+    return [f"sh_index_{field}" for field in missing]
 
 
 def insert_snapshot(config: Any, snapshot: dict[str, Any], top50: list[dict[str, Any]]) -> None:
@@ -371,8 +502,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", default="")
     parser.add_argument("--end-date", default=date.today().isoformat())
     parser.add_argument("--days", type=int, default=20)
-    parser.add_argument("--min-rows", type=int, default=4000)
+    parser.add_argument("--min-rows", type=int, default=4800)
     parser.add_argument("--allow-partial", action="store_true")
+    parser.add_argument("--allow-missing-index", action="store_true")
     parser.add_argument("--output-json", type=Path, default=project_root() / "runs" / "data_tasks" / "market_width_daily_backfill.json")
     return parser.parse_args()
 
@@ -394,6 +526,18 @@ def main() -> int:
             results.append({"trade_date": trade_day, "ok": False, "reason": "insufficient_daily_bars", "rows": len(rows)})
             continue
         snapshot, top50 = build_snapshot(config, trade_day, rows)
+        missing_index_fields = validate_daily_close_snapshot(snapshot)
+        if missing_index_fields and not args.allow_missing_index:
+            results.append(
+                {
+                    "trade_date": trade_day,
+                    "ok": False,
+                    "reason": "missing_shanghai_index_fields",
+                    "missing_fields": missing_index_fields,
+                    "shanghai_index_source": (snapshot.get("raw_meta") or {}).get("shanghai_index", {}).get("source"),
+                }
+            )
+            continue
         insert_snapshot(config, snapshot, top50)
         results.append(
             {
@@ -406,13 +550,15 @@ def main() -> int:
                 "down5_count": snapshot["down5_count"],
                 "limit_up_count": snapshot["limit_up_count"],
                 "limit_down_count": snapshot["limit_down_count"],
+                "shanghai_index_source": (snapshot.get("raw_meta") or {}).get("shanghai_index", {}).get("source"),
             }
         )
-    payload = {"ok": True, "generated_at": now_text(), "results": results}
+    ok = all(bool(item.get("ok")) for item in results)
+    payload = {"ok": ok, "generated_at": now_text(), "results": results}
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"ok": True, "processed": len(results), "written": sum(1 for item in results if item.get("ok")), "output_json": str(args.output_json)}, ensure_ascii=False))
-    return 0
+    print(json.dumps({"ok": ok, "processed": len(results), "written": sum(1 for item in results if item.get("ok")), "output_json": str(args.output_json)}, ensure_ascii=False))
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

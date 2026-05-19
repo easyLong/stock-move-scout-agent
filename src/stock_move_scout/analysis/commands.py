@@ -16,6 +16,41 @@ def build_analysis_command(
     python_executable: str,
     mysql_args: list[str],
 ) -> list[str] | None:
+    if kind == "realtime_mover_scan":
+        command = [
+            python_executable,
+            str(root / "scripts" / "windowed_stock_scout_agent.py"),
+            "--once",
+            "--scan-interval",
+            str(int(payload.get("scan_interval", 5))),
+            "--window-seconds",
+            str(int(payload.get("window_seconds", 15))),
+            "--scan-top",
+            str(int(payload.get("scan_top", 20))),
+            "--aggregate-top",
+            str(int(payload.get("aggregate_top", 5))),
+            "--min-speed-signal",
+            str(float(payload.get("min_speed_signal", 1.5))),
+            "--min-single-speed",
+            str(float(payload.get("min_single_speed", 1.5))),
+            "--min-15s-speed",
+            str(float(payload.get("min_15s_speed", 1.5))),
+            "--min-accepted-scans",
+            str(int(payload.get("min_accepted_scans", 1))),
+            "--scan-timeout",
+            str(int(payload.get("scan_timeout", 90))),
+            "--mysql-primary",
+        ]
+        if payload.get("research_pool_only", True):
+            command.append("--research-pool-only")
+        if payload.get("no_evidence", True):
+            command.append("--no-evidence")
+        if payload.get("no_file_output", True):
+            command.append("--no-file-output")
+        if payload.get("include_non_trading"):
+            command.append("--include-non-trading")
+        return command + mysql_args
+
     if kind == "anchor_realtime_roles":
         command = [
             python_executable,

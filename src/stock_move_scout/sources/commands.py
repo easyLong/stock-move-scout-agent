@@ -250,6 +250,21 @@ def build_source_command(
         command.append("--replace-date" if payload.get("replace_date", True) else "--no-replace-date")
         return command + mysql_args
 
+    if kind == "ths_homepage_headline_freeze":
+        command = [
+            python_executable,
+            str(root / "scripts" / "freeze_ths_homepage_headline_snapshot.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+        ]
+        if payload.get("source_trade_date"):
+            command.extend(["--source-trade-date", str(payload.get("source_trade_date"))])
+        if payload.get("allow_carry_forward"):
+            command.append("--allow-carry-forward")
+        if payload.get("fail_on_empty"):
+            command.append("--fail-on-empty")
+        return command + mysql_args
+
     if kind == "eastmoney_limit_up_pool":
         command = [
             python_executable,
@@ -270,6 +285,79 @@ def build_source_command(
         command.append("--replace-dates" if payload.get("replace_dates", True) else "--no-replace-dates")
         return command + mysql_args
 
+    if kind == "kpl_limit_up_reasons":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_kpl_limit_up_reasons.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--timeout",
+            str(int(payload.get("timeout", 8))),
+            "--pause",
+            str(float(payload.get("pause", 0.08))),
+        ]
+        if payload.get("code"):
+            command.extend(["--code", str(payload.get("code"))])
+        if payload.get("limit"):
+            command.extend(["--limit", str(int(payload.get("limit", 0)))])
+        return command + mysql_args
+
+    if kind == "kpl_replay_limit_themes":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_kpl_replay_limit_themes.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--timeout",
+            str(int(payload.get("timeout", 8))),
+            "--pause",
+            str(float(payload.get("pause", 0.05))),
+        ]
+        return command + mysql_args
+
+    if kind == "kpl_plate_strength":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_kpl_plate_strength.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--limit",
+            str(int(payload.get("limit", 80))),
+            "--timeout",
+            str(int(payload.get("timeout", 8))),
+        ]
+        return command + mysql_args
+
+    if kind == "kpl_market_capacity":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_kpl_market_capacity.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--timeout",
+            str(int(payload.get("timeout", 8))),
+            "--market-type",
+            str(int(payload.get("market_type", 0))),
+        ]
+        return command + mysql_args
+
+    if kind == "kpl_stock_featured_sections":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_kpl_stock_featured_sections.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--timeout",
+            str(int(payload.get("timeout", 8))),
+            "--pause",
+            str(float(payload.get("pause", 0.08))),
+        ]
+        if payload.get("code"):
+            command.extend(["--code", str(payload.get("code"))])
+        if payload.get("limit"):
+            command.extend(["--limit", str(int(payload.get("limit", 0)))])
+        return command + mysql_args
+
     if kind == "post_close_leaderboard_snapshot":
         command = [
             python_executable,
@@ -287,6 +375,16 @@ def build_source_command(
             command.append("--force")
         if payload.get("skip_research_pool"):
             command.append("--skip-research-pool")
+        return command + mysql_args
+
+    if kind == "kpl_leaderboard_snapshot":
+        command = [
+            python_executable,
+            str(root / "scripts" / "build_leaderboard_snapshot.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--kpl-only",
+        ]
         return command + mysql_args
 
     if kind == "ths_stock_concepts":
@@ -431,7 +529,7 @@ def build_source_command(
             "--trade-date",
             str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
             "--min-rows",
-            str(int(payload.get("min_rows", 4000))),
+            str(int(payload.get("min_rows", 4800))),
             "--workers",
             str(int(payload.get("workers", 12))),
             "--batch-size",

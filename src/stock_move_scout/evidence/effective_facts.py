@@ -376,6 +376,7 @@ def build_effective_facts(config: MySqlConfig, trade_date: str, code: str = "", 
     clear_effective_facts(config, trade_date, code, codes)
     statements = [
         _current_important_event_sql(trade_date, code, codes),
+        _kpl_limit_up_reason_sql(trade_date, code, codes),
     ]
     for sql in statements:
         run_mysql(config, sql)
@@ -806,6 +807,90 @@ def _current_important_event_sql(trade_date: str, code: str = "", codes: list[st
       valid_score=VALUES(valid_score),
       valid_reason=VALUES(valid_reason),
       invalid_reason=VALUES(invalid_reason),
+      evidence_group=VALUES(evidence_group),
+      display_level=VALUES(display_level),
+      valid_until=VALUES(valid_until),
+      payload=VALUES(payload),
+      updated_at=CURRENT_TIMESTAMP(3);
+    """
+
+
+def _kpl_limit_up_reason_sql(trade_date: str, code: str = "", codes: list[str] | None = None) -> str:
+    code_filter = _code_filter("r", code, codes)
+    day = sql_string(trade_date)
+    return f"""
+    INSERT INTO stock_effective_facts(
+      trade_date, code, stock_name, source_table, source_key, source_confidence,
+      fact_type, fact_subtype, fact_title, fact_body, fact_date,
+      valid_status, valid_score, valid_reason, invalid_reason,
+      evidence_role, evidence_group, display_level, valid_from, valid_until, payload
+    )
+    SELECT
+      CAST({day} AS DATE),
+      r.code,
+      r.stock_name,
+      'kpl_stock_limit_up_reasons',
+      CONCAT('kpl_stock_limit_up_reasons:', r.code, ':', DATE_FORMAT(r.reason_date, '%Y-%m-%d')),
+      'explicit',
+      'limit_up_reason',
+      COALESCE(NULLIF(r.role_label, ''), '开盘啦涨停归因'),
+      COALESCE(NULLIF(r.reason_title, ''), '开盘啦涨停归因'),
+      LEFT(CONCAT_WS('；',
+        NULLIF(r.role_label, ''),
+        NULLIF(r.reason_text, ''),
+        IF(COALESCE(r.boom_theme, '') <> '', CONCAT('题材背景：', r.boom_theme), NULL)
+      ), 900),
+      r.reason_date,
+      'active',
+      CASE
+        WHEN r.reason_date=CAST({day} AS DATE) THEN 92
+        WHEN r.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 3 DAY) THEN 86 - DATEDIFF(CAST({day} AS DATE), r.reason_date)
+        ELSE 70 - LEAST(DATEDIFF(CAST({day} AS DATE), r.reason_date), 10)
+      END,
+      'kpl_limit_up_reason_10d',
+      '',
+      'theme_confirmation',
+      'current_effective',
+      CASE WHEN r.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 3 DAY) THEN 'primary' ELSE 'secondary' END,
+      r.reason_date,
+      DATE_ADD(r.reason_date, INTERVAL 10 DAY),
+      JSON_OBJECT(
+        'display_body', LEFT(CONCAT_WS('；',
+          NULLIF(r.role_label, ''),
+          NULLIF(r.reason_text, ''),
+          IF(COALESCE(r.boom_theme, '') <> '', CONCAT('题材背景：', r.boom_theme), NULL)
+        ), 900),
+        'display_lines', JSON_ARRAY(
+          CONCAT('原因：', LEFT(COALESCE(NULLIF(r.reason_text, ''), r.reason_title), 320)),
+          IF(COALESCE(r.role_label, '') <> '', CONCAT('地位：', r.role_label), NULL),
+          IF(COALESCE(JSON_LENGTH(r.zscode), 0) > 0, CONCAT('题材代码：', JSON_UNQUOTE(JSON_EXTRACT(r.zscode, '$'))), NULL),
+          IF(COALESCE(r.boom_theme, '') <> '', CONCAT('题材背景：', LEFT(r.boom_theme, 260)), NULL)
+        ),
+        'reason_date', DATE_FORMAT(r.reason_date, '%Y-%m-%d'),
+        'reason_title', r.reason_title,
+        'role_label', r.role_label,
+        'source_position', r.source_position,
+        'reason_type', r.reason_type,
+        'zscode', COALESCE(r.zscode, JSON_ARRAY()),
+        'concept_explain', COALESCE(r.concept_explain, ''),
+        'boom_theme', COALESCE(r.boom_theme, ''),
+        'raw_json', COALESCE(r.raw_json, JSON_OBJECT()),
+        'rule', 'kpl_limit_up_reason_10d'
+      )
+    FROM kpl_stock_limit_up_reasons r
+    WHERE r.reason_date <= CAST({day} AS DATE)
+      AND r.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+      {code_filter}
+    ON DUPLICATE KEY UPDATE
+      stock_name=VALUES(stock_name),
+      fact_subtype=VALUES(fact_subtype),
+      fact_title=VALUES(fact_title),
+      fact_body=VALUES(fact_body),
+      valid_status=VALUES(valid_status),
+      valid_score=VALUES(valid_score),
+      valid_reason=VALUES(valid_reason),
+      invalid_reason=VALUES(invalid_reason),
+      evidence_role=VALUES(evidence_role),
       evidence_group=VALUES(evidence_group),
       display_level=VALUES(display_level),
       valid_until=VALUES(valid_until),
