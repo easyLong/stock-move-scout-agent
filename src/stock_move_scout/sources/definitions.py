@@ -114,6 +114,7 @@ DATA_SOURCES: dict[str, DataSource] = {
             "kpl_replay_limit_themes",
             "kpl_stock_featured_sections",
             "kpl_plate_strength",
+            "kpl_plate_details",
             "kpl_market_capacity",
         ),
         scripts=(
@@ -121,6 +122,7 @@ DATA_SOURCES: dict[str, DataSource] = {
             "collect_kpl_replay_limit_themes.py",
             "collect_kpl_stock_featured_sections.py",
             "collect_kpl_plate_strength.py",
+            "collect_kpl_plate_details.py",
             "collect_kpl_market_capacity.py",
         ),
         output_tables=(
@@ -129,11 +131,12 @@ DATA_SOURCES: dict[str, DataSource] = {
             "kpl_replay_limit_theme_stocks",
             "kpl_stock_featured_sections",
             "kpl_plate_featured_strengths",
+            "kpl_plate_featured_details",
             "kpl_market_capacity_snapshots",
             "kpl_market_capacity_trends",
         ),
         refresh="trading_time_and_post_close_after_20_00",
-        description="开盘啦精选板块、复盘啦涨停原因、个股精选板块和预测量能。",
+        description="开盘啦精选板块、点击详情、复盘啦涨停原因、个股精选板块和预测量能。",
     ),
     "research_pool_snapshot": DataSource(
         source_id="research_pool_snapshot",
@@ -152,7 +155,7 @@ DATA_SOURCES: dict[str, DataSource] = {
         task_kinds=("post_close_leaderboard_snapshot", "kpl_leaderboard_snapshot"),
         scripts=("build_leaderboard_snapshot.py",),
         output_tables=("leaderboard_snapshots",),
-        refresh="daily_after_close_20_45_21_00",
+        refresh="daily_after_close_20_35_20_45",
         description="收盘确认版领头羊快照。同花顺领头羊和开盘啦领头羊都从这里给页面读取。",
     ),
     "event_engine": DataSource(

@@ -642,14 +642,14 @@ def leaderboard_sql(trade_date: str | None = "") -> str:
         code,
         name,
         'today_limit' AS dimension,
-        '日内主动性' AS dimension_label,
+        '收盘日封板先后' AS dimension_label,
         rank_no,
         6 - rank_no AS score,
         IF(today_rank_kind='limit_up', ROUND(limit_amount / 100000000, 2), today_pct) AS value_num,
         IF(
           today_rank_kind='limit_up',
-          DATE_FORMAT(first_limit_at, '%H:%i:%s'),
-          CONCAT('今日', ROUND(today_pct, 2), '%')
+          CONCAT(DATE_FORMAT(trade_date, '%m-%d'), ' ', DATE_FORMAT(first_limit_at, '%H:%i:%s')),
+          CONCAT(DATE_FORMAT(trade_date, '%m-%d'), ' ', ROUND(today_pct, 2), '%')
         ) AS value_text,
         source_name,
         DATE_FORMAT(trade_date, '%Y-%m-%d') AS data_date
@@ -996,7 +996,14 @@ def kpl_leaderboard_sql(trade_date: str | None = "") -> str:
           'kpl_plate_featured_strengths' AS source_table,
           0 AS source_priority,
           COUNT(*) AS row_count,
-          SUM(IF(COALESCE(plate_name, '') NOT REGEXP '(^|[^A-Za-z])ST([^A-Za-z]|$)|ST板块|退市', 1, 0)) AS non_st_count
+          SUM(
+            IF(
+              COALESCE(plate_name, '') NOT LIKE '%ST%'
+              AND COALESCE(plate_name, '') NOT LIKE '%退市%',
+              1,
+              0
+            )
+          ) AS non_st_count
         FROM kpl_plate_featured_strengths
         WHERE trade_date = {day}
         GROUP BY trade_date, captured_at
@@ -1234,7 +1241,8 @@ def kpl_leaderboard_sql(trade_date: str | None = "") -> str:
         ), ROUND(COALESCE(pl.plate_change_pct, 0), 2)) AS max_rise,
         ROW_NUMBER() OVER (ORDER BY pl.theme_rank ASC, pl.theme_name ASC) AS top_theme_rank
       FROM kpl_plate_latest pl
-      WHERE COALESCE(pl.theme_name, '') NOT REGEXP '(^|[^A-Za-z])ST([^A-Za-z]|$)|ST板块|退市'
+      WHERE COALESCE(pl.theme_name, '') NOT LIKE '%ST%'
+        AND COALESCE(pl.theme_name, '') NOT LIKE '%退市%'
       ) ranked_kpl_themes
       WHERE top_theme_rank <= 8
     ),
@@ -1373,6 +1381,63 @@ def kpl_leaderboard_sql(trade_date: str | None = "") -> str:
     )
     sql = sql.replace("'同花顺题材成分涨幅'", "'开盘啦精选板块成分涨幅'")
     return sql
+
+
+def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
+    day = sql_string(trade_date or date.today().strftime("%Y-%m-%d"))
+    return f"""
+    SET SESSION group_concat_max_len=1048576;
+
+    WITH latest_snapshot AS (
+      SELECT trade_date, MAX(captured_at) AS captured_at
+      FROM kpl_plate_featured_details
+      WHERE trade_date=CAST({day} AS DATE)
+      GROUP BY trade_date
+    )
+    SELECT COALESCE(JSON_OBJECT(
+      'trade_date', DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d'),
+      'breakout_data_trade_date', COALESCE((SELECT DATE_FORMAT(trade_date, '%Y-%m-%d') FROM latest_snapshot LIMIT 1), DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d')),
+      'breakout_captured_at', COALESCE((SELECT DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s') FROM latest_snapshot LIMIT 1), ''),
+      'source', 'kpl_plate_featured_details',
+      'rule', '开盘啦精选强度Top5板块；必须有板块爆发原因；取最强两个子板块；每个子板块只保留研究池交集股票并按研究池排名各取Top5',
+      'plates', COALESCE((
+        SELECT CAST(CONCAT(
+          '[',
+          GROUP_CONCAT(CAST(plate_item AS CHAR) ORDER BY sort_strength DESC, sort_rank ASC, sort_name ASC SEPARATOR ','),
+          ']'
+        ) AS JSON)
+        FROM (
+          SELECT JSON_OBJECT(
+            'rank', p.row_rank,
+            'plate_code', p.plate_code,
+            'plate_name', p.plate_name,
+            'strength', p.strength,
+            'change_pct', p.change_pct,
+            'speed', p.speed,
+            'reason_text', COALESCE(p.reason_text, ''),
+            'sub_plates', COALESCE(p.sub_plates, JSON_ARRAY()),
+            'top_research_pool_stocks', COALESCE(p.top_research_pool_stocks, JSON_ARRAY()),
+            'top_research_pool_stocks_by_sub_plate', COALESCE(p.top_research_pool_stocks_by_sub_plate, JSON_ARRAY()),
+            'stock_count', COALESCE(JSON_LENGTH(p.top_research_pool_stocks), 0)
+          ) AS plate_item,
+          COALESCE(p.strength, 0) AS sort_strength,
+          p.row_rank AS sort_rank,
+          p.plate_name AS sort_name
+          FROM kpl_plate_featured_details p
+          JOIN latest_snapshot s
+            ON s.trade_date=p.trade_date
+           AND s.captured_at=p.captured_at
+          WHERE p.trade_date=CAST({day} AS DATE)
+            AND COALESCE(p.reason_text, '') <> ''
+            AND (
+              COALESCE(JSON_LENGTH(p.top_research_pool_stocks_by_sub_plate), 0) > 0
+              OR COALESCE(JSON_LENGTH(p.top_research_pool_stocks), 0) > 0
+            )
+        ) ordered_plates
+      ), JSON_ARRAY())
+    ), JSON_OBJECT('trade_date', DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d'), 'plates', JSON_ARRAY()))
+    ;
+    """
 
 
 def latest_scan_sql() -> str:
@@ -1695,19 +1760,41 @@ def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5) -> st
         'total_amount_yi', ROUND(total_amount / 100000000, 2)
       ) AS item
       FROM (
-        SELECT s.*
-        FROM market_width_snapshots s
-        JOIN (
-          SELECT trade_date, MAX(captured_at) AS captured_at
-          FROM market_width_snapshots
-          WHERE source='stock_daily_bars_close'
-            AND total_count >= 4800
-            {day_filter}
-          GROUP BY trade_date
-          ORDER BY trade_date DESC
+        SELECT chosen.*
+        FROM (
+          SELECT ranked.*
+          FROM (
+            SELECT
+              s.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY s.trade_date
+                ORDER BY
+                  CASE
+                    WHEN s.source='stock_daily_bars_close' THEN 0
+                    WHEN (
+                      (TIME(s.captured_at) >= '09:30:00' AND TIME(s.captured_at) <= '11:30:00.999')
+                      OR (TIME(s.captured_at) >= '13:00:00' AND TIME(s.captured_at) <= '15:00:00.999')
+                    ) THEN 1
+                    ELSE 2
+                  END,
+                  s.captured_at DESC
+              ) AS row_no
+            FROM market_width_snapshots s
+            WHERE s.total_count >= 4800
+              {day_filter}
+              AND (
+                s.source='stock_daily_bars_close'
+                OR (
+                  (TIME(s.captured_at) >= '09:30:00' AND TIME(s.captured_at) <= '11:30:00.999')
+                  OR (TIME(s.captured_at) >= '13:00:00' AND TIME(s.captured_at) <= '15:00:00.999')
+                )
+              )
+          ) ranked
+          WHERE ranked.row_no = 1
+          ORDER BY ranked.trade_date DESC
           LIMIT {max(2, int(limit))}
-        ) d ON d.trade_date=s.trade_date AND d.captured_at=s.captured_at
-        ORDER BY s.trade_date ASC
+        ) chosen
+        ORDER BY chosen.trade_date ASC
       ) daily_rows
     ) ordered_rows;
     """

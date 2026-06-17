@@ -177,6 +177,16 @@ def build_source_command(
             command.append("--fallback-without-model")
         else:
             command.append("--no-fallback-without-model")
+        command.append("--workflow" if payload.get("workflow", True) else "--no-workflow")
+        command.extend(["--review-max-rewrites", str(int(payload.get("review_max_rewrites", 1)))])
+        if payload.get("loop_until"):
+            command.extend(["--loop-until", str(payload.get("loop_until"))])
+        if payload.get("loop_interval_seconds"):
+            command.extend(["--loop-interval-seconds", str(int(payload.get("loop_interval_seconds", 60)))])
+        if payload.get("min_themes") is not None:
+            command.extend(["--min-themes", str(int(payload.get("min_themes", 1)))])
+        if payload.get("mirror_output_dir"):
+            command.extend(["--mirror-output-dir", str(payload.get("mirror_output_dir"))])
         if payload.get("trade_date"):
             command.extend(["--trade-date", str(payload.get("trade_date"))])
         if payload.get("since"):
@@ -326,6 +336,23 @@ def build_source_command(
             "--timeout",
             str(int(payload.get("timeout", 8))),
         ]
+        return command + mysql_args
+
+    if kind == "kpl_plate_details":
+        command = [
+            python_executable,
+            str(root / "scripts" / "collect_kpl_plate_details.py"),
+            "--trade-date",
+            str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
+            "--limit",
+            str(int(payload.get("limit", 20))),
+            "--timeout",
+            str(int(payload.get("timeout", 8))),
+            "--pause",
+            str(float(payload.get("pause", 0.05))),
+        ]
+        if payload.get("plate_code"):
+            command.extend(["--plate-code", str(payload.get("plate_code"))])
         return command + mysql_args
 
     if kind == "kpl_market_capacity":

@@ -394,11 +394,22 @@ def build_snapshot(
             "row_count": len(rows),
             "top50_count": len(top50),
             "research_pool_trade_date": research_pool_trade_date,
-            "research_pool_codes": research_pool_codes,
             "research_pool_quote_count": research_pool_stats["count"],
-            "research_pool_meta": research_pool_meta or {},
-            "source_meta": source_meta or {},
-            "shanghai_index": shanghai_index or {},
+            "research_pool_meta": {
+                "rule": (research_pool_meta or {}).get("rule"),
+                "code_count": (research_pool_meta or {}).get("code_count"),
+                "source_dates": (research_pool_meta or {}).get("source_dates"),
+                "codes_by_source_count": (research_pool_meta or {}).get("codes_by_source_count"),
+            },
+            "source_meta": {
+                "server": (source_meta or {}).get("server"),
+                "universe_count": (source_meta or {}).get("universe_count"),
+                "quote_count": (source_meta or {}).get("quote_count"),
+                "batch_size": (source_meta or {}).get("batch_size"),
+                "tdx_timeout": (source_meta or {}).get("tdx_timeout"),
+                "fallback_from_tdx_error": (source_meta or {}).get("fallback_from_tdx_error"),
+                "shanghai_index_fallback_error": (source_meta or {}).get("shanghai_index_fallback_error"),
+            },
             "generated_at": now_text(),
         },
     }
@@ -521,7 +532,7 @@ def insert_snapshot(config: Any, snapshot: dict[str, Any], top50: list[dict[str,
                     sql_number(row.get("pct_change")),
                     sql_number(row.get("amount")),
                     sql_int(row.get("volume")),
-                    sql_json(row.get("raw_row")),
+                    "NULL",
                 ]
             )
             + ")"
@@ -591,6 +602,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--universe-csv", type=Path, default=root / "data" / "stock" / "tdx_a_stock_universe.csv")
     parser.add_argument("--output-json", type=Path, default=root / "runs" / "data_tasks" / "market_width_latest.json")
     parser.add_argument("--skip-kpl-market-capacity", action="store_true", help="Do not collect KPL market capacity in the same snapshot batch.")
+    parser.add_argument("--skip-ensure-tables", action="store_true", help="Skip DDL checks when tables are already initialized.")
     parser.add_argument("--kpl-timeout", type=int, default=8)
     return parser.parse_args()
 
@@ -604,7 +616,8 @@ def main() -> int:
     if not args.mysql_enabled:
         raise SystemExit("--mysql-enabled is required")
     config = mysql_config_from_args(args)
-    ensure_market_width_tables(config)
+    if not args.skip_ensure_tables:
+        ensure_market_width_tables(config)
 
     captured_at = datetime.now()
     if not args.allow_outside_trading and not is_trading_time(captured_at):

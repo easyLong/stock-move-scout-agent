@@ -1705,6 +1705,7 @@ HTML = r"""<!doctype html>
       <a class="nav-link" href="/market-width">市场概览</a>
       <a class="nav-link" href="/leaders">领头羊</a>
       <a class="nav-link" href="/kpl-leaders">开盘啦领头羊</a>
+      <a class="nav-link" href="/plate-breakouts">板块爆发榜</a>
       <span><span class="dot"></span> 自动刷新</span>
       <span id="refreshText">等待数据</span>
     </div>
@@ -4111,7 +4112,11 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
   <header class="topbar">
     <h1>市场概览</h1>
     <div class="actions">
-      <input id="tradeDate" class="date-input" type="date" />
+      <div class="date-nav">
+        <button id="prevDateBtn" class="btn date-step" type="button" title="Prev trading day" aria-label="Prev trading day">‹</button>
+        <input id="tradeDate" class="date-input" type="date" />
+        <button id="nextDateBtn" class="btn date-step" type="button" title="Next trading day" aria-label="Next trading day">›</button>
+      </div>
       <button id="refreshBtn" class="btn" type="button">刷新</button>
       <a class="btn" href="/">异动情报流</a>
       <a class="btn" href="/leaders">领头羊</a>
@@ -4244,8 +4249,66 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
         limitDown: ""
       }
     ];
+    const dateState = { dates: [], loaded: false };
+    function queryTradeDate() {
+      return clean(new URLSearchParams(window.location.search).get("trade_date"));
+    }
     function queryDate() {
-      return $("tradeDate").value || "";
+      return $("tradeDate").value || queryTradeDate();
+    }
+    function sortedTradeDates(dates) {
+      return Array.from(new Set((Array.isArray(dates) ? dates : []).map(clean).filter(Boolean))).sort();
+    }
+    function updateDateButtons() {
+      const dates = dateState.dates;
+      const current = queryDate();
+      const index = dates.indexOf(current);
+      const hasDates = dates.length > 0 && index >= 0;
+      $("prevDateBtn").disabled = !hasDates || index <= 0;
+      $("nextDateBtn").disabled = !hasDates || index >= dates.length - 1;
+    }
+    function syncTradeDateUrl(value, replace = false) {
+      const date = clean(value);
+      const url = new URL(window.location.href);
+      if (date) url.searchParams.set("trade_date", date);
+      else url.searchParams.delete("trade_date");
+      const method = replace ? "replaceState" : "pushState";
+      window.history[method]({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+    function setTradeDate(value, replace = false) {
+      const date = clean(value);
+      if (!date) return;
+      $("tradeDate").value = date;
+      syncTradeDateUrl(date, replace);
+      updateDateButtons();
+      load();
+    }
+    async function loadTradeDates() {
+      try {
+        const response = await fetch("/api/trade_dates", { cache: "no-store" });
+        const data = await response.json();
+        dateState.dates = sortedTradeDates(data.dates);
+        dateState.loaded = true;
+        if (!$("tradeDate").value && queryTradeDate()) $("tradeDate").value = queryTradeDate();
+        updateDateButtons();
+      } catch (error) {
+        dateState.loaded = true;
+        updateDateButtons();
+      }
+    }
+    function stepTradeDate(offset) {
+      const dates = dateState.dates;
+      if (!dates.length) return;
+      const current = queryDate();
+      let index = dates.indexOf(current);
+      if (index < 0) {
+        index = offset < 0
+          ? dates.findLastIndex(day => day < current)
+          : dates.findIndex(day => day > current);
+      } else {
+        index += offset;
+      }
+      if (index >= 0 && index < dates.length) setTradeDate(dates[index]);
     }
     let currentChartRows = [];
     let currentChartRowsByKey = {};
@@ -4767,6 +4830,7 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
         const latest = normalizeWidthRow(data.latest || {});
         const series = normalizeSeries(data.series);
         if (!$("tradeDate").value && data.trade_date) $("tradeDate").value = data.trade_date;
+        updateDateButtons();
         renderServiceContext(data);
         renderFlow(latest, series);
         renderCycle5d((data.cycle_5d || []).map(normalizeWidthRow), latest);
@@ -4781,7 +4845,10 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       }
     }
     $("refreshBtn").addEventListener("click", load);
-    $("tradeDate").addEventListener("change", load);
+    $("tradeDate").addEventListener("change", event => setTradeDate(event.target.value));
+    $("prevDateBtn").addEventListener("click", () => stepTradeDate(-1));
+    $("nextDateBtn").addEventListener("click", () => stepTradeDate(1));
+    loadTradeDates();
     load();
     setInterval(load, 60000);
   </script>
@@ -5521,6 +5588,7 @@ LEADERS_HTML = r"""<!doctype html>
       <a class="btn" href="/">异动情报流</a>
       <a class="btn" href="/market-width">市场概览</a>
       <a class="btn" href="/kpl-leaders">开盘啦领头羊</a>
+      <a class="btn" href="/plate-breakouts">板块爆发榜</a>
       <span id="refreshText">等待数据</span>
     </div>
   </header>
@@ -5762,6 +5830,26 @@ LEADERS_HTML = r"""<!doctype html>
     function renderLeader(row) {
       const dimensions = (Array.isArray(row.dimensions) ? row.dimensions : [])
         .sort((a, b) => (dimOrder[a.dimension] || 9) - (dimOrder[b.dimension] || 9));
+      // NOTE: Leaderboards are post-close conclusions; "today_*" fields refer to the
+      // snapshot day (leader_data_trade_date), not the service day.
+      try {
+        const dataDate = String(window.__leaderDataTradeDate || "").trim();
+        const mmdd = dataDate && dataDate.length >= 10 ? dataDate.slice(5, 10) : "";
+        dimensions.forEach(dim => {
+          if (!dim || typeof dim !== "object") return;
+          if (dim.dimension !== "today_limit") return;
+          dim.label = "收盘日封板先后";
+          const vt = String(dim.value_text || "");
+          if (mmdd && /^\d{2}:\d{2}:\d{2}$/.test(vt)) {
+            dim.value_text = `${mmdd} ${vt}`;
+          } else if (mmdd && vt.startsWith("今日")) {
+            dim.value_text = vt.replace(/^今日/, `${mmdd} `);
+          }
+        });
+        if (row && typeof row === "object") {
+          row.__todayLimitLabel = mmdd ? `${mmdd} 封板先后分` : "收盘日封板先后分";
+        }
+      } catch (error) {}
       const isTrend = row.pool_type === "trend";
       const scoreLabel = isTrend ? "趋势分" : "情绪分";
       const trendDim = dimensions.find(dim => dim.dimension === "trend_strength") || {};
@@ -5773,7 +5861,7 @@ LEADERS_HTML = r"""<!doctype html>
           ${scoreCell("今日涨幅", row.today_pct == null ? "-" : pct(row.today_pct))}
         `
         : `
-          ${scoreCell("日内主动性", row.today_limit_score)}
+          ${scoreCell(row.__todayLimitLabel || "收盘日封板先后分", row.today_limit_score)}
           ${scoreCell("阶段先手性", row.first_limit_10d_score)}
           ${scoreCell("连板辨识度", row.limit_up_days_score)}
         `;
@@ -5920,6 +6008,7 @@ LEADERS_HTML = r"""<!doctype html>
         if (queryDate()) params.set("trade_date", queryDate());
         const response = await fetch(`/api/leaders?${params.toString()}`, { cache: "no-store" });
         const data = await response.json();
+        try { window.__leaderDataTradeDate = data.leader_data_trade_date || data.leader_data_trade_day || ""; } catch (error) {}
         if (!$("tradeDate").value && data.trade_date) $("tradeDate").value = data.trade_date;
         updateDateButtons();
         renderServiceContext(data);
@@ -5977,6 +6066,1019 @@ KPL_LEADERS_HTML = (
     .replace("完整成分", "池内成分")
     .replace("头条题材", "开盘啦精选")
 )
+
+
+PLATE_BREAKOUT_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>板块爆发榜</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f5f8;
+      --panel: #ffffff;
+      --line: #e5e7eb;
+      --text: #182033;
+      --muted: #64748b;
+      --red: #d14545;
+      --green: #15916f;
+      --blue: #2563eb;
+      --amber: #b7791f;
+      --soft: #f8fafc;
+      --shadow: 0 10px 24px rgba(15, 23, 42, 0.055);
+      font-family: "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 56px;
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(12px);
+    }
+    h1 {
+      margin: 0;
+      font-size: 19px;
+      line-height: 1.2;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .btn, .date-input {
+      height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: #334155;
+      padding: 0 10px;
+      font: inherit;
+      font-size: 13px;
+      text-decoration: none;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-weight: 750;
+    }
+    .date-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .date-step {
+      width: 32px;
+      padding: 0;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .date-step:disabled {
+      color: #cbd5e1;
+      cursor: not-allowed;
+      background: #f8fafc;
+    }
+    main {
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 12px 16px 18px;
+    }
+    .service-context {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .service-context span {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+    }
+    .workspace {
+      display: grid;
+      grid-template-columns: 310px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .plate-panel, .detail {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .plate-panel {
+      position: sticky;
+      top: 72px;
+      max-height: calc(100vh - 88px);
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 44px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+    .panel-head strong {
+      font-size: 15px;
+    }
+    .count {
+      color: var(--muted);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .search-wrap {
+      padding: 8px 8px 0;
+      background: #fff;
+    }
+    .search {
+      width: 100%;
+      height: 32px;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      background: #f8fafc;
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+      font-size: 13px;
+      outline: none;
+    }
+    .search:focus {
+      border-color: #93b7f4;
+      background: #fff;
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08);
+    }
+    .plate-tabs {
+      display: grid;
+      gap: 7px;
+      max-height: calc(100vh - 176px);
+      overflow: auto;
+      padding: 8px;
+    }
+    .plate-tab {
+      width: 100%;
+      min-height: 78px;
+      border: 1px solid #e8edf4;
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 9px 10px;
+      text-align: left;
+      cursor: pointer;
+      font: inherit;
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr);
+      gap: 9px;
+      align-items: start;
+    }
+    .plate-tab:hover {
+      border-color: #c7d7f4;
+      background: #f8fbff;
+    }
+    .plate-tab.active {
+      border-color: #8db8ef;
+      background: #f4f9ff;
+      box-shadow: inset 3px 0 0 var(--blue);
+    }
+    .plate-tab:first-child {
+      border-color: #f1d4ae;
+      background: #fffaf1;
+    }
+    .plate-tab:first-child.active {
+      border-color: #e3b86f;
+      background: #fff4da;
+      box-shadow: inset 3px 0 0 var(--amber);
+    }
+    .tab-rank {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      background: #f1f5f9;
+      color: #475569;
+      font-size: 15px;
+      font-weight: 900;
+      font-variant-numeric: tabular-nums;
+    }
+    .plate-tab:first-child .tab-rank {
+      background: #ffe8e8;
+      color: var(--red);
+    }
+    .tab-main {
+      display: block;
+      min-width: 0;
+    }
+    .tab-top {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    .tab-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 14px;
+      font-weight: 850;
+    }
+    .tab-score {
+      color: #475569;
+      border: 1px solid #e2e8f0;
+      border-radius: 999px;
+      background: #f8fafc;
+      padding: 1px 7px;
+      font-size: 12px;
+      font-weight: 900;
+      font-variant-numeric: tabular-nums;
+    }
+    .tab-sub {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .tab-reason {
+      margin-top: 6px;
+      color: #475569;
+      font-size: 12px;
+      line-height: 1.4;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .detail {
+      min-width: 0;
+      overflow: hidden;
+    }
+    .detail-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+      min-height: 58px;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+    .detail-title {
+      min-width: 0;
+    }
+    .detail-title strong {
+      display: block;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+    .detail-title small {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 6px;
+      color: #475569;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid #e2e8f0;
+      border-radius: 999px;
+      background: #fff;
+      padding: 0 8px;
+      font-weight: 750;
+    }
+    .overview {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0;
+      padding: 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .overview-cell {
+      min-width: 0;
+      border-right: 1px solid #edf1f6;
+      background: #fff;
+      padding: 11px 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    .overview-cell:last-child { border-right: 0; }
+    .overview-cell span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .overview-cell strong {
+      display: block;
+      margin-top: 5px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 16px;
+      line-height: 1.15;
+    }
+    .overview-cell.hot strong {
+      color: var(--red);
+      font-size: 20px;
+    }
+    .reason-box {
+      margin: 12px 14px 0;
+      border: 1px solid #dbe7f5;
+      border-left: 3px solid #4f8fdc;
+      border-radius: 8px;
+      background: #f8fbff;
+      padding: 10px 12px;
+      color: #1e3a5f;
+      display: grid;
+      gap: 6px;
+      line-height: 1.65;
+    }
+    .reason-box strong {
+      display: block;
+      margin-bottom: 4px;
+      color: #2563eb;
+      font-size: 12px;
+      font-weight: 850;
+    }
+    .reason-box span {
+      white-space: pre-wrap;
+    }
+    .subplates {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      padding: 12px 14px 0;
+    }
+    .subplate {
+      min-width: 0;
+      border: 1px solid #dfe6ef;
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 12px;
+      color: var(--text);
+      cursor: pointer;
+      font: inherit;
+      text-align: left;
+    }
+    .subplate:hover {
+      border-color: #c7d7f4;
+      background: #f8fbff;
+    }
+    .subplate.active {
+      border-color: #8db8ef;
+      background: #f4f9ff;
+      box-shadow: inset 3px 0 0 var(--blue);
+    }
+    .subplate strong {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 14px;
+    }
+    .subplate small {
+      display: block;
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .stock-section {
+      padding: 12px 14px 14px;
+    }
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 9px;
+      color: #334155;
+      font-size: 13px;
+      font-weight: 850;
+    }
+    .section-head small {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .stocks {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 9px;
+    }
+    .stock-row {
+      position: relative;
+      min-width: 0;
+      border: 1px solid #edf1f6;
+      border-left: 3px solid #d14545;
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 12px;
+      display: grid;
+      grid-template-columns: 42px minmax(150px, 210px) minmax(320px, 1fr);
+      gap: 10px 12px;
+      align-items: start;
+      box-shadow: 0 1px 0 rgba(15, 23, 42, 0.03);
+    }
+    .stock-row.rank-1 {
+      border-color: #f1c7c7;
+      border-left-color: var(--red);
+      background: linear-gradient(90deg, #fff8f8 0%, #ffffff 38%);
+    }
+    .rank {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: #ffe8e8;
+      color: var(--red);
+      font-size: 18px;
+      font-weight: 900;
+      font-variant-numeric: tabular-nums;
+    }
+    .stock {
+      min-width: 0;
+      color: inherit;
+      text-decoration: none;
+    }
+    .stock strong {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 15px;
+    }
+    .stock small {
+      display: block;
+      margin-top: 3px;
+      color: #94a3b8;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .score-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .score-cell {
+      min-width: 0;
+      border: 1px solid #eef2f7;
+      border-radius: 7px;
+      background: #fbfcfe;
+      padding: 7px 8px;
+      text-align: center;
+      font-variant-numeric: tabular-nums;
+    }
+    .score-cell span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .score-cell b {
+      display: block;
+      margin-top: 4px;
+      font-size: 16px;
+      line-height: 1;
+    }
+    .stock-facts {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(180px, 0.7fr) minmax(240px, 1fr) minmax(280px, 1.25fr);
+      gap: 6px;
+      grid-column: 2 / -1;
+    }
+    .stock-note {
+      border: 1px solid #eef2f7;
+      border-radius: 7px;
+      background: #fbfcfe;
+      padding: 7px 9px;
+      color: #334155;
+      font-size: 12px;
+      line-height: 1.45;
+      min-width: 0;
+    }
+    .stock-note.reason {
+      border-color: #bfdbfe;
+      background: #f8fbff;
+      box-shadow: inset 3px 0 0 #4f8fdc;
+    }
+    .stock-note.highlight {
+      border-color: #bdd7ff;
+      background: linear-gradient(90deg, #eff6ff 0%, #ffffff 100%);
+      color: #1e3a5f;
+    }
+    .stock-note strong {
+      display: block;
+      margin-bottom: 2px;
+      color: #64748b;
+      font-size: 11px;
+      font-weight: 850;
+    }
+    .empty, .error {
+      padding: 18px;
+      color: var(--muted);
+    }
+    .error { color: #b42318; }
+    @media (max-width: 980px) {
+      .topbar { align-items: stretch; flex-direction: column; }
+      .actions {
+        width: 100%;
+        justify-content: flex-start;
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        padding-bottom: 2px;
+      }
+      .actions > * {
+        flex: 0 0 auto;
+      }
+      .workspace { grid-template-columns: 1fr; }
+      .plate-panel { position: static; max-height: none; }
+      .search-wrap { padding: 8px; }
+      .plate-tabs {
+        display: flex;
+        overflow-x: auto;
+        max-height: none;
+        padding: 0 8px 8px;
+      }
+      .plate-tab {
+        flex: 0 0 240px;
+      }
+      .detail-head {
+        display: flex;
+        flex-direction: column;
+      }
+      .meta { justify-content: flex-start; }
+      .overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .overview-cell:nth-child(2) { border-right: 0; }
+      .subplates { grid-template-columns: 1fr; }
+      .stock-row {
+        grid-template-columns: 46px minmax(0, 1fr);
+      }
+      .score-grid, .stock-facts {
+        grid-column: 1 / -1;
+      }
+      .stock-facts { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>板块爆发榜</h1>
+    <div class="actions">
+      <div class="date-nav">
+        <button id="prevDateBtn" class="btn date-step" type="button" title="Prev trading day" aria-label="Prev trading day">‹</button>
+        <input id="tradeDate" class="date-input" type="date" />
+        <button id="nextDateBtn" class="btn date-step" type="button" title="Next trading day" aria-label="Next trading day">›</button>
+      </div>
+      <button id="refreshBtn" class="btn" type="button">刷新</button>
+      <a class="btn" href="/">异动情报流</a>
+      <a class="btn" href="/market-width">市场概览</a>
+      <a class="btn" href="/kpl-leaders">开盘啦领头羊</a>
+      <span id="refreshText">等待数据</span>
+    </div>
+  </header>
+  <main>
+    <section class="service-context" id="serviceContext"></section>
+    <section class="workspace">
+      <aside class="plate-panel">
+        <div class="panel-head">
+          <strong>爆发板块</strong>
+          <span class="count" id="plateCount">0</span>
+        </div>
+        <div class="search-wrap">
+          <input id="plateSearch" class="search" type="search" placeholder="搜索板块 / 原因 / 股票" />
+        </div>
+        <div class="plate-tabs" id="plateTabs"></div>
+      </aside>
+      <section class="detail-stage" id="detailStage"></section>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+    const clean = value => String(value ?? "").replace(/[ \t\r\f\v]+/g, " ").trim();
+    const fmt = value => Number(value || 0).toLocaleString("zh-CN");
+    const pct = value => {
+      const n = Number(String(value ?? 0).replace("%", ""));
+      if (!Number.isFinite(n)) return "-";
+      return `${n > 0 ? "+" : ""}${n.toFixed(2)}%`;
+    };
+    const stockUrl = code => {
+      const value = clean(code);
+      const prefix = /^6/.test(value) ? "SH" : /^[489]/.test(value) ? "BJ" : "SZ";
+      return `https://xueqiu.com/S/${prefix}${encodeURIComponent(value)}`;
+    };
+    const state = { plates: [], activeKey: "", filter: "" };
+    const dateState = { dates: [], loaded: false };
+    function timeText(value) {
+      if (!value) return "";
+      const parts = String(value).split(" ");
+      return parts[1] || parts[0] || "";
+    }
+    function parseJsonArray(value) {
+      if (Array.isArray(value)) return value;
+      if (!value || typeof value !== "string") return [];
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    function plateKey(plate) {
+      return clean(plate.plate_code) || clean(plate.plate_name) || String(plate.rank || "");
+    }
+    function clip(value, limit = 72) {
+      const text = String(value || "").replace(/\s+/g, " ").trim();
+      return text.length > limit ? `${text.slice(0, limit)}...` : text;
+    }
+    function hoverTitle(value) {
+      const text = String(value || "").replace(/\s+/g, " ").trim();
+      return text ? ` title="${esc(text)}"` : "";
+    }
+    function queryTradeDate() {
+      return clean(new URLSearchParams(window.location.search).get("trade_date"));
+    }
+    function queryDate() {
+      return $("tradeDate").value || queryTradeDate();
+    }
+    function sortedTradeDates(dates) {
+      return Array.from(new Set((Array.isArray(dates) ? dates : []).map(clean).filter(Boolean))).sort();
+    }
+    function updateDateButtons() {
+      const dates = dateState.dates;
+      const current = queryDate();
+      const index = dates.indexOf(current);
+      const hasDates = dates.length > 0 && index >= 0;
+      $("prevDateBtn").disabled = !hasDates || index <= 0;
+      $("nextDateBtn").disabled = !hasDates || index >= dates.length - 1;
+    }
+    function syncTradeDateUrl(value, replace = false) {
+      const date = clean(value);
+      const url = new URL(window.location.href);
+      if (date) url.searchParams.set("trade_date", date);
+      else url.searchParams.delete("trade_date");
+      const method = replace ? "replaceState" : "pushState";
+      window.history[method]({}, "", `${url.pathname}${url.search}${url.hash}`);
+    }
+    function setTradeDate(value, replace = false) {
+      const date = clean(value);
+      if (!date) return;
+      $("tradeDate").value = date;
+      syncTradeDateUrl(date, replace);
+      updateDateButtons();
+      load();
+    }
+    async function loadTradeDates() {
+      try {
+        const response = await fetch("/api/trade_dates", { cache: "no-store" });
+        const data = await response.json();
+        dateState.dates = sortedTradeDates(data.dates);
+        dateState.loaded = true;
+        if (!$("tradeDate").value && queryTradeDate()) $("tradeDate").value = queryTradeDate();
+        updateDateButtons();
+      } catch (error) {
+        dateState.loaded = true;
+        updateDateButtons();
+      }
+    }
+    function stepTradeDate(offset) {
+      const dates = dateState.dates;
+      if (!dates.length) return;
+      const current = queryDate();
+      let index = dates.indexOf(current);
+      if (index < 0) {
+        index = offset < 0
+          ? dates.findLastIndex(day => day < current)
+          : dates.findIndex(day => day > current);
+      } else {
+        index += offset;
+      }
+      if (index >= 0 && index < dates.length) setTradeDate(dates[index]);
+    }
+    function renderServiceContext(data) {
+      const ctx = data.service_context || {};
+      const chips = [
+        `${ctx.service_trade_date || data.trade_date || "最近交易日"} ${ctx.phase_label || "观察"}`,
+        ctx.base_trade_date ? `底稿 ${ctx.base_trade_date} 收盘` : "",
+        data.breakout_data_trade_date ? `爆发榜 ${data.breakout_data_trade_date}${data.breakout_captured_at ? ` ${timeText(data.breakout_captured_at)}` : ""}` : "",
+        ctx.post_close_status_label ? `盘后 ${ctx.post_close_status_label}` : "",
+        ctx.research_pool_count ? `研究池 ${fmt(ctx.research_pool_count)}只` : ""
+      ].filter(Boolean);
+      $("serviceContext").innerHTML = chips.map(item => `<span>${esc(item)}</span>`).join("");
+    }
+    function visiblePlates() {
+      const keyword = state.filter.trim().toLowerCase();
+      if (!keyword) return state.plates;
+      return state.plates.filter(plate => {
+        const stocks = topStockGroups(plate).flatMap(group => parseJsonArray(group.stocks))
+          .map(item => `${item.stock_name || item.name || ""} ${item.code || ""}`)
+          .join(" ");
+        return `${plate.plate_name || ""} ${plate.reason_text || ""} ${stocks}`.toLowerCase().includes(keyword);
+      });
+    }
+    function renderTabs() {
+      const filtered = visiblePlates();
+      $("plateCount").textContent = state.filter ? `${fmt(filtered.length)}/${fmt(state.plates.length)}组` : `${fmt(state.plates.length)}组`;
+      $("plateTabs").innerHTML = filtered.length ? filtered.map(plate => {
+        const active = plateKey(plate) === state.activeKey ? " active" : "";
+        const stockCount = topStockGroups(plate).reduce((sum, group) => sum + parseJsonArray(group.stocks).length, 0)
+          || parseJsonArray(plate.top_research_pool_stocks).length
+          || plate.stock_count
+          || 0;
+        return `<button class="plate-tab${active}" type="button" data-plate-key="${esc(plateKey(plate))}">
+          <span class="tab-rank">${esc(plate.rank || "")}</span>
+          <span class="tab-main">
+            <span class="tab-top">
+              <span class="tab-name"${hoverTitle(plate.plate_name)}>${esc(plate.plate_name)}</span>
+              <span class="tab-score">${esc(fmt(plate.strength || 0))}</span>
+            </span>
+            <span class="tab-sub">
+              <span>${plate.change_pct == null ? "涨幅 -" : `涨幅 ${pct(plate.change_pct)}`}</span>
+              <span>${fmt(stockCount)}只</span>
+            </span>
+            <span class="tab-reason"${hoverTitle(plate.reason_text)}>${esc(clip(plate.reason_text, 54))}</span>
+          </span>
+        </button>`;
+      }).join("") : `<div class="empty">没有匹配板块</div>`;
+    }
+    function overviewCell(label, value, hot = false) {
+      return `<div class="overview-cell${hot ? " hot" : ""}"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`;
+    }
+    function scoreCell(label, value) {
+      const text = value === null || value === undefined || value === "" ? "-" : String(value);
+      return `<div class="score-cell"><span>${esc(label)}</span><b>${esc(text)}</b></div>`;
+    }
+    function scoreText(value) {
+      const n = Number(value || 0);
+      return n > 0 ? String(n) : "-";
+    }
+    function subplateName(item) {
+      return clean(item.plate_name || item.sub_plate_name || item.name || item.Plate_Name || item.SonPlate_Name);
+    }
+    function subplateStrength(item) {
+      return item.strength ?? item.sub_plate_strength ?? item.Strength ?? item.plate_strength ?? "";
+    }
+    function groupKey(group) {
+      return clean(group.sub_plate_code) || clean(group.sub_plate_name) || String(group.sub_plate_rank || "");
+    }
+    function topStockGroups(plate) {
+      const groups = parseJsonArray(plate.top_research_pool_stocks_by_sub_plate)
+        .map(group => ({ ...group, stocks: parseJsonArray(group.stocks) }))
+        .filter(group => groupKey(group) && group.stocks.length);
+      if (groups.length) {
+        return groups.slice(0, 2);
+      }
+      const subplates = parseJsonArray(plate.sub_plates).slice(0, 2);
+      const stocks = parseJsonArray(plate.top_research_pool_stocks);
+      return subplates.map((subplate, index) => {
+        const key = clean(subplate.plate_code || subplate.sub_plate_code);
+        const name = subplateName(subplate);
+        const groupedStocks = stocks
+          .filter(stock => clean(stock.sub_plate_code) === key || stockSubplate(stock) === name)
+          .slice(0, 5);
+        return {
+          sub_plate_rank: subplate.rank || subplate.row_rank || index + 1,
+          sub_plate_code: key,
+          sub_plate_name: name,
+          sub_plate_strength: subplateStrength(subplate),
+          stocks: groupedStocks,
+          stock_count: groupedStocks.length
+        };
+      }).filter(group => group.stocks.length);
+    }
+    function activeSubPlateKey(plate, groups) {
+      const storageKey = `plate_breakout_active_subplate_${plateKey(plate)}`;
+      let saved = "";
+      try { saved = localStorage.getItem(storageKey) || ""; } catch (error) {}
+      return groups.some(group => groupKey(group) === saved) ? saved : (groups[0] ? groupKey(groups[0]) : "");
+    }
+    function renderSubplates(groups, activeKey) {
+      if (!groups.length) return "";
+      return `<div class="subplates">
+        ${groups.map((group, index) => {
+          const key = groupKey(group);
+          const active = key === activeKey ? " active" : "";
+          const stocks = parseJsonArray(group.stocks);
+          return `<button class="subplate${active}" type="button" data-sub-plate-key="${esc(key)}">
+            <strong${hoverTitle(group.sub_plate_name)}>${esc(group.sub_plate_name || `子板块${index + 1}`)}</strong>
+            <small>#${esc(group.sub_plate_rank || index + 1)} / 强度 ${esc(group.sub_plate_strength || "-")} / ${fmt(stocks.length)}只</small>
+          </button>`;
+        }).join("")}
+      </div>`;
+    }
+    function stockName(row) {
+      return clean(row.stock_name || row.name || row.StockName || row.stockName);
+    }
+    function stockCode(row) {
+      return clean(row.code || row.stock_code || row.StockCode);
+    }
+    function stockSubplate(row) {
+      return clean(row.sub_plate_name || row.plate_name || row.section_name || row.kpl_section_name);
+    }
+    function poolRank(row, fallback) {
+      return row.pool_rank || row.research_pool_rank || row.rank_no || fallback;
+    }
+    function renderStock(row, index) {
+      const code = stockCode(row);
+      const name = stockName(row) || code || "-";
+      const subplate = stockSubplate(row);
+      const rank = poolRank(row, index + 1);
+      const pctValue = row.today_pct ?? row.pct_change ?? row.change_pct ?? row.current_pct ?? "";
+      const subStrength = row.sub_plate_strength ?? row.section_strength ?? row.strength ?? "";
+      const totalScore = row.total_score ?? row.leader_score ?? row.score ?? 0;
+      const company = clean(row.company_highlights);
+      const reason = clean(row.kpl_limit_reason || row.reason_text);
+      const reasonDate = clean(row.kpl_limit_reason_date);
+      const meta = [
+        subplate ? `子板块：${subplate}` : "",
+        `研究池：#${rank}`,
+        pctValue === "" ? "" : `涨幅：${pct(pctValue)}`,
+        subStrength ? `子板块强度：${subStrength}` : ""
+      ].filter(Boolean).join("；");
+      return `<article class="stock-row${index === 0 ? " rank-1" : ""}">
+        <div class="rank">${esc(index + 1)}</div>
+        <a class="stock" href="${stockUrl(code)}" target="_blank" rel="noopener noreferrer">
+          <strong${hoverTitle(`${name} ${code}`)}>${esc(name)}</strong>
+          <small>${esc(code)}</small>
+        </a>
+        <div class="score-grid">
+          ${scoreCell("总分", scoreText(totalScore))}
+          ${scoreCell("封板先后", scoreText(row.today_limit_score))}
+          ${scoreCell("阶段先手", scoreText(row.first_limit_10d_score))}
+          ${scoreCell("连板辨识", scoreText(row.limit_up_days_score))}
+        </div>
+        <div class="stock-facts">
+          <div class="stock-note"${hoverTitle(meta)}>
+            <strong>排序依据</strong>
+            ${esc(meta || "研究池交集")}
+          </div>
+          ${company ? `<div class="stock-note highlight"${hoverTitle(company)}><strong>公司亮点</strong>${esc(clip(company, 150))}</div>` : ""}
+          ${reason ? `<div class="stock-note reason"${hoverTitle(reason)}><strong>开盘啦涨停原因${reasonDate ? ` ${esc(reasonDate)}` : ""}</strong>${esc(clip(reason, 170))}</div>` : ""}
+        </div>
+      </article>`;
+    }
+    function renderPlate(plate) {
+      const groups = topStockGroups(plate);
+      const activeGroupKey = activeSubPlateKey(plate, groups);
+      const activeGroup = groups.find(group => groupKey(group) === activeGroupKey) || groups[0] || {};
+      const stocks = parseJsonArray(activeGroup.stocks);
+      return `<section class="detail">
+        <div class="detail-head">
+          <div class="detail-title">
+            <strong>${esc(plate.plate_name || "-")}</strong>
+            <small>${esc(plate.plate_code || "")}</small>
+          </div>
+          <div class="meta">
+            <span class="pill">精选强度Top5</span>
+            <span class="pill">板块爆发原因</span>
+            <span class="pill">子板块各Top5</span>
+          </div>
+        </div>
+        <div class="overview">
+          ${overviewCell("榜单排名", `#${plate.rank || "-"}`, true)}
+          ${overviewCell("强度", plate.strength ?? "-")}
+          ${overviewCell("涨幅", plate.change_pct == null ? "-" : pct(plate.change_pct))}
+          ${overviewCell("加速", plate.speed ?? "-")}
+        </div>
+        <div class="reason-box"><strong>爆发原因</strong><span>${esc(plate.reason_text || "-")}</span></div>
+        ${renderSubplates(groups, activeGroupKey)}
+        <div class="stock-section">
+          <div class="section-head">
+            <strong>${esc(activeGroup.sub_plate_name || "研究池Top5")}</strong>
+            <small>当前子板块研究池交集 Top5</small>
+          </div>
+          <div class="stocks">
+            ${stocks.length ? stocks.slice(0, 5).map(renderStock).join("") : `<div class="empty">暂无研究池交集股票</div>`}
+          </div>
+        </div>
+      </section>`;
+    }
+    function renderActivePlate() {
+      const filtered = visiblePlates();
+      const plate = filtered.find(item => plateKey(item) === state.activeKey)
+        || state.plates.find(item => plateKey(item) === state.activeKey)
+        || filtered[0]
+        || state.plates[0];
+      if (!plate) {
+        $("detailStage").innerHTML = `<div class="empty">暂无板块爆发数据</div>`;
+        renderTabs();
+        return;
+      }
+      state.activeKey = plateKey(plate);
+      renderTabs();
+      $("detailStage").innerHTML = renderPlate(plate);
+    }
+    function selectPlate(key) {
+      state.activeKey = key;
+      try { localStorage.setItem("plate_breakout_active_plate", key); } catch (error) {}
+      renderActivePlate();
+    }
+    function selectSubPlate(key) {
+      const plate = state.plates.find(item => plateKey(item) === state.activeKey);
+      if (!plate || !key) return;
+      try { localStorage.setItem(`plate_breakout_active_subplate_${plateKey(plate)}`, key); } catch (error) {}
+      renderActivePlate();
+    }
+    async function load() {
+      try {
+        const params = new URLSearchParams();
+        if (queryDate()) params.set("trade_date", queryDate());
+        const response = await fetch(`/api/plate-breakouts?${params.toString()}`, { cache: "no-store" });
+        const data = await response.json();
+        if (!$("tradeDate").value && data.trade_date) $("tradeDate").value = data.trade_date;
+        updateDateButtons();
+        renderServiceContext(data);
+        state.plates = (Array.isArray(data.plates) ? data.plates : [])
+          .slice()
+          .sort((a, b) => Number(b.strength || 0) - Number(a.strength || 0) || Number(a.rank || 999999) - Number(b.rank || 999999));
+        let saved = "";
+        try { saved = localStorage.getItem("plate_breakout_active_plate") || ""; } catch (error) {}
+        state.activeKey = state.plates.some(item => plateKey(item) === state.activeKey)
+          ? state.activeKey
+          : (state.plates.some(item => plateKey(item) === saved) ? saved : (state.plates[0] ? plateKey(state.plates[0]) : ""));
+        renderActivePlate();
+        $("refreshText").textContent = `已刷新 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+      } catch (error) {
+        $("detailStage").innerHTML = `<div class="error">${esc(error)}</div>`;
+        $("refreshText").textContent = "刷新失败";
+      }
+    }
+    $("refreshBtn").addEventListener("click", load);
+    $("tradeDate").addEventListener("change", event => setTradeDate(event.target.value));
+    $("prevDateBtn").addEventListener("click", () => stepTradeDate(-1));
+    $("nextDateBtn").addEventListener("click", () => stepTradeDate(1));
+    $("plateSearch").addEventListener("input", event => {
+      state.filter = event.target.value || "";
+      const filtered = visiblePlates();
+      if (filtered.length && !filtered.some(item => plateKey(item) === state.activeKey)) {
+        state.activeKey = plateKey(filtered[0]);
+      }
+      renderActivePlate();
+    });
+    $("plateTabs").addEventListener("click", event => {
+      const button = event.target.closest(".plate-tab");
+      if (button) selectPlate(button.dataset.plateKey || "");
+    });
+    $("detailStage").addEventListener("click", event => {
+      const button = event.target.closest(".subplate");
+      if (button) selectSubPlate(button.dataset.subPlateKey || "");
+    });
+    loadTradeDates();
+    load();
+  </script>
+</body>
+</html>"""
 
 
 

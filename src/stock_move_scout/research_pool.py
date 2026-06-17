@@ -43,6 +43,20 @@ def _clean_periods(periods: Iterable[int] | None = None, period_days: int | None
 
 
 def ensure_research_pool_tables(config: MySqlConfig) -> None:
+    # Avoid taking metadata locks when tables already exist.
+    # DDL can be blocked by unrelated long-running sessions, while normal
+    # reads/writes remain usable.
+    missing = False
+    for table in ("research_pool_snapshots", "research_pool_items"):
+        try:
+            run_mysql(config, f"SELECT 1 FROM {table} LIMIT 1;")
+        except Exception as exc:
+            if "doesn't exist" in str(exc):
+                missing = True
+                break
+            raise
+    if not missing:
+        return
     sql = """
     CREATE TABLE IF NOT EXISTS research_pool_snapshots (
       trade_date DATE NOT NULL,

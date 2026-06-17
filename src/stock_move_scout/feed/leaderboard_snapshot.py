@@ -70,6 +70,15 @@ def assert_post_close_dependencies(config: MySqlConfig, trade_date: str) -> dict
 
 
 def ensure_leaderboard_snapshot_table(config: MySqlConfig) -> None:
+    # Avoid taking metadata locks when the table already exists.
+    # Some environments can accumulate long-running sessions that block DDL,
+    # while normal SELECT/INSERT is still healthy.
+    try:
+        run_mysql(config, "SELECT 1 FROM leaderboard_snapshots LIMIT 1;")
+        return
+    except Exception as exc:
+        if "doesn't exist" not in str(exc):
+            raise
     run_mysql(
         config,
         """
@@ -144,7 +153,38 @@ def upsert_leaderboard_snapshot_payload(
       generated_at=VALUES(generated_at),
       updated_at=CURRENT_TIMESTAMP(3);
     """
-    run_mysql(config, sql)
+    try:
+        run_mysql(config, sql)
+    except Exception as exc:
+        # MySQL 8.4 on some Windows installs can intermittently fail JSON UPDATE paths
+        # with a misleading "table is full" (1114). Snapshot rows are immutable-by-design,
+        # so falling back to delete+insert keeps the behavior deterministic.
+        if "ERROR 1114" not in str(exc):
+            raise
+        delete_sql = " AND ".join(
+            [
+                f"trade_date={sql_string(trade_date)}",
+                f"rule={sql_string(DEFAULT_RESEARCH_POOL_RULE)}",
+                f"limit_up_days={sql_int(limit_up_days)}",
+                f"gain_period_days={sql_int(gain_period_days)}",
+                f"gain_top={sql_int(gain_top)}",
+                f"source={sql_string(source)}",
+            ]
+        )
+        run_mysql(config, f"DELETE FROM leaderboard_snapshots WHERE {delete_sql};")
+        run_mysql(
+            config,
+            f"""
+            INSERT INTO leaderboard_snapshots(
+              trade_date, rule, limit_up_days, gain_period_days, gain_top, source,
+              leader_count, scope_count, source_hash, payload_json, generated_at
+            ) VALUES (
+              {sql_string(trade_date)}, {sql_string(DEFAULT_RESEARCH_POOL_RULE)},
+              {sql_int(limit_up_days)}, {sql_int(gain_period_days)}, {sql_int(gain_top)}, {sql_string(source)},
+              {sql_int(leader_count)}, {sql_int(scope_count)}, {sql_string(source_hash)}, {sql_json(payload)}, CURRENT_TIMESTAMP(3)
+            );
+            """,
+        )
     return {
         "trade_date": trade_date,
         "source": source,
@@ -223,31 +263,22 @@ def materialize_leaderboard_snapshot(
                 "dependencies": dependencies,
             }
 
-    sql = f"""
-    INSERT INTO leaderboard_snapshots(
-      trade_date, rule, limit_up_days, gain_period_days, gain_top, source,
-      leader_count, scope_count, source_hash, payload_json, generated_at
-    ) VALUES (
-      {sql_string(trade_date)}, {sql_string(DEFAULT_RESEARCH_POOL_RULE)},
-      {sql_int(limit_up_days)}, {sql_int(gain_period_days)}, {sql_int(gain_top)}, {sql_string(SNAPSHOT_SOURCE)},
-      {sql_int(leader_count)}, {sql_int(scope_count)}, {sql_string(source_hash)}, {sql_json(payload)}, CURRENT_TIMESTAMP(3)
+    upsert_result = upsert_leaderboard_snapshot_payload(
+        config,
+        trade_date,
+        payload,
+        source=SNAPSHOT_SOURCE,
+        limit_up_days=limit_up_days,
+        gain_period_days=gain_period_days,
+        gain_top=gain_top,
     )
-    ON DUPLICATE KEY UPDATE
-      leader_count=VALUES(leader_count),
-      scope_count=VALUES(scope_count),
-      source_hash=VALUES(source_hash),
-      payload_json=VALUES(payload_json),
-      generated_at=VALUES(generated_at),
-      updated_at=CURRENT_TIMESTAMP(3);
-    """
-    run_mysql(config, sql)
     return {
         "trade_date": trade_date,
         "generated": True,
         "unchanged": False,
-        "source_hash": source_hash,
-        "scope_count": scope_count,
-        "leader_count": leader_count,
+        "source_hash": upsert_result.get("source_hash", source_hash),
+        "scope_count": upsert_result.get("scope_count", scope_count),
+        "leader_count": upsert_result.get("leader_count", leader_count),
         "research_pool": pool_result,
         "dependencies": dependencies,
     }

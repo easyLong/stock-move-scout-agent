@@ -19,6 +19,7 @@
 | 09:30-14:59 | `realtime_mover_scan` | 研究池实时扫描，5 秒一轮，分钟级任务循环 |
 | 09:30-14:59 | `market_width_snapshot` | 市场概览实时快照，含开盘啦预测量能 |
 | 09:30-14:59 | `kpl_plate_strength` | 开盘啦精选板块强度刷新 |
+| 09:31-14:59 | `kpl_plate_details` | 开盘啦精选强度 Top5 点击详情，5 分钟刷新 |
 | 09:30-14:59 | `anchor_realtime_roles` | 题材内实时领涨和中军角色 |
 | 09:35-14:59 | `event_engine` | 生成标准化盘中异动事件 |
 | 09:35-14:59 | `stock_move_judgements` | 生成异动情报流判断 |
@@ -37,9 +38,9 @@
 | 16:30 | `ths_stock_concepts` | 研究池 | 增量刷新个股概念解释 |
 | 20:05 | `kpl_limit_up_reasons` | 研究池 | 采集开盘啦个股涨停原因 |
 | 20:15 | `kpl_replay_limit_themes` | 开盘啦复盘啦 | 采集涨停原因分组和主归因 |
-| 20:30 | `kpl_stock_featured_sections` | 研究池 | 采集个股精选板块 |
-| 20:45 | `post_close_leaderboard_snapshot` | 研究池、同花顺冻结题材、涨停池 | 生成同花顺领头羊快照 |
-| 21:00 | `kpl_leaderboard_snapshot` | 开盘啦精选强度、涨停原因、精选板块 | 生成开盘啦领头羊快照 |
+| 20:20 | `kpl_stock_featured_sections` | 研究池 | 采集个股精选板块 |
+| 20:35 | `post_close_leaderboard_snapshot` | 研究池、同花顺冻结题材、涨停池 | 生成同花顺领头羊快照 |
+| 20:45 | `kpl_leaderboard_snapshot` | 开盘啦精选强度、涨停原因、精选板块 | 生成开盘啦领头羊快照 |
 | 22:30 | `pre_trade_night_evidence_prepare` | 研究池、F10、有效事实 | 生成下一交易日证据底稿 |
 
 ## 手动或禁用任务

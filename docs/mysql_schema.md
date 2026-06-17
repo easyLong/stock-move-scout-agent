@@ -46,6 +46,7 @@
 | 表 | 用途 |
 | --- | --- |
 | `kpl_plate_featured_strengths` | 精选板块强度，支持实时和历史日期 |
+| `kpl_plate_featured_details` | 精选板块点击详情，保存板块爆发原因、子题材拆解、最强两个子板块下的研究池 Top5 |
 | `kpl_stock_featured_sections` | 研究池股票所属精选板块 |
 | `kpl_replay_limit_theme_groups` | 复盘啦涨停原因分组 |
 | `kpl_replay_limit_theme_stocks` | 分组下的涨停股票和说明 |

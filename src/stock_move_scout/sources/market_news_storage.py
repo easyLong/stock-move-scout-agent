@@ -32,6 +32,16 @@ def import_market_news_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> 
     if not rows:
         return 0
     statements: list[str] = []
+    imported = 0
+
+    def flush(batch: list[str]) -> None:
+        nonlocal imported
+        if not batch:
+            return
+        run_mysql(config, "START TRANSACTION;\n" + "\n".join(batch) + "\nCOMMIT;")
+        imported += len(batch)
+
+    batch_size = 120
     for row in rows:
         source = text_value(row, "source") or "other"
         if source not in {"cls", "wallstreetcn", "other"}:
@@ -70,8 +80,11 @@ def import_market_news_rows(config: MySqlConfig, rows: list[dict[str, Any]]) -> 
               collected_at=VALUES(collected_at);
             """
         )
-    run_mysql(config, "START TRANSACTION;\n" + "\n".join(statements) + "\nCOMMIT;")
-    return len(statements)
+        if len(statements) >= batch_size:
+            flush(statements)
+            statements = []
+    flush(statements)
+    return imported
 
 
 def import_market_news_json(config: MySqlConfig, path: Path) -> int:

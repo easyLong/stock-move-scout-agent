@@ -472,7 +472,7 @@ def insert_snapshot(config: Any, snapshot: dict[str, Any], top50: list[dict[str,
                     sql_number(row.get("pct_change")),
                     sql_number(row.get("amount")),
                     sql_int(row.get("volume")),
-                    sql_json(row),
+                    "NULL",
                 ]
             )
             + ")"

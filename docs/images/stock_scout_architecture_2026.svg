@@ -130,8 +130,8 @@
   <text x="965" y="525" class="text">15:25 涨停池</text>
   <text x="965" y="553" class="text">16:05 收盘市场概览 + 日 K</text>
   <text x="965" y="581" class="text">16:25 研究池快照</text>
-  <text x="965" y="609" class="text">20:45 同花顺领头羊快照</text>
-  <text x="965" y="637" class="text">21:00 开盘啦领头羊快照</text>
+  <text x="965" y="609" class="text">20:35 同花顺领头羊快照</text>
+  <text x="965" y="637" class="text">20:45 开盘啦领头羊快照</text>
   <text x="965" y="665" class="text">22:30 下一交易日证据底稿</text>
 
   <rect x="940" y="710" width="350" height="166" rx="16" fill="#fff9e9" stroke="#ead8a1"/>

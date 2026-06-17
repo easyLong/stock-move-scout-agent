@@ -7,6 +7,7 @@
 | 通达信快照 | `get_security_quotes` | `scan_runs`、`scan_movers`、`market_width_snapshots` | 异动情报流、窗口强度、市场概览 |
 | 上证指数快照 | 通达信指数符号 | `market_width_snapshots` | 市场概览指数展示 |
 | 开盘啦精选强度 | `ZhiShuRanking.RealRankingInfo` | `kpl_plate_featured_strengths` | 开盘啦领头羊板块排序 |
+| 开盘啦精选详情 | `ZhiShuRanking.SonPlate_Info` | `kpl_plate_featured_details` | 精选行业点击详情、板块爆发原因、最强两个子板块下的研究池 Top5 |
 | 开盘啦预测量能 | `HomeDingPan.MarketCapacity` | `kpl_market_capacity_snapshots`、`kpl_market_capacity_trends` | 市场概览预测成交额 |
 
 说明：

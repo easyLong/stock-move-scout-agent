@@ -52,6 +52,7 @@ $args = @(
     "--aggregate-top", "5",
     "--evidence-top", "5",
     "--min-evidence-pct-change", "0",
+    "--no-evidence",
     "--community-top", "3",
     "--community-mode", "cache",
     "--community-cache-hours", "72",

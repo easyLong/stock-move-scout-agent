@@ -147,6 +147,11 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
             "model_config": "default",
             "model_timeout": 60,
             "fallback_without_model": True,
+            "workflow": True,
+            "review_max_rewrites": 1,
+            "loop_until": "07:20",
+            "loop_interval_seconds": 60,
+            "min_themes": 1,
         },
         "dedupe": "morning_reference_post:{run_key}",
     },
@@ -345,6 +350,20 @@ SCHEDULED_TASKS: list[dict[str, Any]] = [
         "timeout": 90,
         "payload": {"limit": 100, "timeout": 8},
         "dedupe": "kpl_plate_strength:{minute_key}",
+    },
+    {
+        "task_id": "kpl_plate_details",
+        "task_name": "KPL Featured Plate Details",
+        "task_description": "Collect clicked-detail data for top 5 KPL featured plates, including sub-plates and plate-level explosion reason text when available.",
+        "task_kind": "kpl_plate_details",
+        "task_type": "hot",
+        "enabled": 1,
+        "schedule_type": "interval",
+        "interval": 300,
+        "priority": 38,
+        "timeout": 180,
+        "payload": {"limit": 5, "timeout": 8, "pause": 0.05},
+        "dedupe": "kpl_plate_details:{minute_key}",
     },
     {
         "task_id": "kpl_market_capacity",
@@ -639,9 +658,9 @@ def _next_pre_trade_night_timestamp(time_text: str) -> str:
 NEXT_RUN_SQL_BY_TASK = {
     "ths_root_extended_items": _today_or_next_trade_day_timestamp("22:00:00"),
     "pre_trade_night_evidence_prepare": _next_pre_trade_night_timestamp("22:30:00"),
-    "morning_market_news": _today_or_next_trade_day_timestamp("08:30:00"),
-    "daily_market_themes": _today_or_next_trade_day_timestamp("08:32:00"),
-    "morning_reference_post": _today_or_next_trade_day_timestamp("08:35:00"),
+    "morning_market_news": _today_or_next_trade_day_timestamp("07:00:00"),
+    "daily_market_themes": _today_or_next_trade_day_timestamp("07:02:00"),
+    "morning_reference_post": _today_or_next_trade_day_timestamp("07:05:00"),
     "scheduled_task_health_check": _today_or_next_trade_day_timestamp("08:00:00"),
     "ths_market_after_close_summary": _today_or_next_trade_day_timestamp("16:10:00"),
     "ths_hot_concepts": _today_or_next_trade_day_timestamp("15:30:00"),
@@ -656,9 +675,9 @@ NEXT_RUN_SQL_BY_TASK = {
     "research_pool_snapshot": _today_or_next_trade_day_timestamp("16:25:00"),
     "kpl_limit_up_reasons": _today_or_next_trade_day_timestamp("20:05:00"),
     "kpl_replay_limit_themes": _today_or_next_trade_day_timestamp("20:15:00"),
-    "kpl_stock_featured_sections": _today_or_next_trade_day_timestamp("20:30:00"),
-    "post_close_leaderboard_snapshot": _today_or_next_trade_day_timestamp("20:45:00"),
-    "kpl_leaderboard_snapshot": _today_or_next_trade_day_timestamp("21:00:00"),
+    "kpl_stock_featured_sections": _today_or_next_trade_day_timestamp("20:20:00"),
+    "post_close_leaderboard_snapshot": _today_or_next_trade_day_timestamp("20:35:00"),
+    "kpl_leaderboard_snapshot": _today_or_next_trade_day_timestamp("20:45:00"),
     "kpl_plate_strength": (
         "CASE "
         "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:30:00') "
@@ -667,6 +686,15 @@ NEXT_RUN_SQL_BY_TASK = {
         "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
         "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 60 SECOND) "
         f"ELSE {_next_trade_day_timestamp('09:30:00')} END"
+    ),
+    "kpl_plate_details": (
+        "CASE "
+        "WHEN WEEKDAY(CURDATE()) >= 5 THEN TIMESTAMP(DATE_ADD(CURDATE(), INTERVAL 7 - WEEKDAY(CURDATE()) DAY), '09:31:00') "
+        "WHEN TIME(NOW()) < '09:31:00' THEN TIMESTAMP(CURDATE(), '09:31:00') "
+        "WHEN TIME(NOW()) < '11:29:00' THEN DATE_ADD(NOW(3), INTERVAL 300 SECOND) "
+        "WHEN TIME(NOW()) < '13:00:00' THEN TIMESTAMP(CURDATE(), '13:00:00') "
+        "WHEN TIME(NOW()) < '14:59:00' THEN DATE_ADD(NOW(3), INTERVAL 300 SECOND) "
+        f"ELSE {_next_trade_day_timestamp('09:31:00')} END"
     ),
     "kpl_market_capacity": (
         "CASE "

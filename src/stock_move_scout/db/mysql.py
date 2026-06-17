@@ -42,21 +42,23 @@ def run_mysql(config: MySqlConfig, sql: str, *, database: bool = True, batch: bo
     env = os.environ.copy()
     if config.password:
         env["MYSQL_PWD"] = config.password
+    # Feed bytes to mysql.exe to avoid Windows text-mode / encoding quirks.
+    # We still request utf8mb4 on the client side via --default-character-set.
+    input_bytes = (sql or "").encode("utf-8", errors="replace")
     result = subprocess.run(
         command,
-        input=sql,
-        text=True,
+        input=input_bytes,
         capture_output=True,
-        encoding="utf-8",
-        errors="replace",
         timeout=config.timeout,
         env=env,
         check=False,
     )
     if result.returncode != 0:
-        tail = (result.stderr or result.stdout)[-3000:]
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace")
+        stdout = (result.stdout or b"").decode("utf-8", errors="replace")
+        tail = (stderr or stdout)[-3000:]
         raise RuntimeError(tail.strip())
-    return result.stdout.strip()
+    return (result.stdout or b"").decode("utf-8", errors="replace").strip()
 
 
 def mysql_rows(output: str) -> list[list[str]]:

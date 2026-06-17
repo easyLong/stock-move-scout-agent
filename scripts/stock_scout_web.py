@@ -18,6 +18,7 @@ from stock_move_scout.feed import (
     intel_feed_list_sql,
     intel_feed_sql,
     kpl_leaderboard_sql,
+    kpl_plate_breakout_sql,
     leaderboard_sql,
     latest_scan_sql,
     latest_window_sql,
@@ -42,6 +43,7 @@ from stock_move_scout.market_width import ensure_market_width_tables
 from stock_move_scout.research_pool import ResearchPoolProvider, ensure_headline_theme_role_evidence_table
 from stock_move_scout.sources.kpl_featured_sections import ensure_kpl_featured_section_table
 from stock_move_scout.sources.kpl_market_capacity import ensure_kpl_market_capacity_tables
+from stock_move_scout.sources.kpl_plate_details import ensure_kpl_plate_detail_table
 from stock_move_scout.sources.kpl_plate_strength import ensure_kpl_plate_strength_table
 from stock_move_scout.sources.kpl_replay_limit_themes import ensure_kpl_replay_limit_theme_tables
 from stock_move_scout.web import json_query, latest_data_date, resolve_trade_date
@@ -130,12 +132,26 @@ def ensure_async_evidence_summary_table(config: MySqlConfig) -> None:
     ensure_async_evidence_summary_column(config, "impact_summary_text", "TEXT NULL")
 
 
-def resolve_leader_data_date(config: MySqlConfig, service_trade_date: str) -> str:
-    """Leaderboards are post-close conclusions for the next trading day."""
+def resolve_leader_data_date(config: MySqlConfig, service_trade_date: str, source: str = SNAPSHOT_SOURCE) -> str:
+    """Use same-day post-close snapshots once they exist; otherwise fall back to the previous trade day."""
+    same_day_sql = f"""
+    SELECT 1
+    FROM leaderboard_snapshots
+    WHERE trade_date={sql_string(service_trade_date)}
+      AND source={sql_string(source)}
+    LIMIT 1;
+    """
+    try:
+        same_day_rows = mysql_rows(run_mysql(config, same_day_sql, batch=True, raw=True))
+    except Exception:
+        same_day_rows = []
+    if same_day_rows:
+        return service_trade_date
+
     sql = f"""
     SELECT DATE_FORMAT(MAX(trade_date), '%Y-%m-%d')
     FROM (
-      SELECT trade_date FROM leaderboard_snapshots WHERE trade_date < {sql_string(service_trade_date)}
+      SELECT trade_date FROM leaderboard_snapshots WHERE trade_date < {sql_string(service_trade_date)} AND source={sql_string(source)}
       UNION
       SELECT trade_date FROM limit_up_pool_items WHERE trade_date < {sql_string(service_trade_date)}
       UNION
@@ -156,7 +172,7 @@ def explicit_leader_data_date(config: MySqlConfig, requested_trade_date: str, ta
     """Historical page selections should show that date's post-close snapshot directly."""
     requested = str(requested_trade_date or "").strip()
     if not requested or requested.lower() == "latest":
-        return resolve_leader_data_date(config, target_date)
+        return resolve_leader_data_date(config, target_date, source)
     sql = f"""
     SELECT 1
     FROM leaderboard_snapshots
@@ -168,7 +184,7 @@ def explicit_leader_data_date(config: MySqlConfig, requested_trade_date: str, ta
         rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
     except Exception:
         rows = []
-    return target_date if rows else resolve_leader_data_date(config, target_date)
+    return target_date if rows else resolve_leader_data_date(config, target_date, source)
 
 
 def ensure_async_evidence_summary_column(config: MySqlConfig, column_name: str, column_sql: str) -> None:
@@ -339,6 +355,7 @@ def create_app(config: MySqlConfig) -> FastAPI:
     ensure_leaderboard_snapshot_table(config)
     ensure_kpl_featured_section_table(config)
     ensure_kpl_market_capacity_tables(config)
+    ensure_kpl_plate_detail_table(config)
     ensure_kpl_plate_strength_table(config)
     ensure_kpl_replay_limit_theme_tables(config)
     app = FastAPI(title=APP_TITLE)
@@ -362,6 +379,10 @@ def create_app(config: MySqlConfig) -> FastAPI:
     @app.get("/kpl-leaders", response_class=HTMLResponse)
     def kpl_leaders_page() -> str:
         return KPL_LEADERS_HTML
+
+    @app.get("/plate-breakouts", response_class=HTMLResponse)
+    def plate_breakouts_page() -> str:
+        return PLATE_BREAKOUT_HTML
 
     @app.get("/api/top10")
     def api_top10() -> JSONResponse:
@@ -495,10 +516,20 @@ def create_app(config: MySqlConfig) -> FastAPI:
         payload["service_context"] = build_service_context(config, target_date)
         return JSONResponse(payload)
 
+    @app.get("/api/plate-breakouts")
+    def api_plate_breakouts(trade_date: str = "") -> JSONResponse:
+        target_date = resolve_trade_date(config, trade_date)
+        payload = json_query(config, kpl_plate_breakout_sql(target_date), {})
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["trade_date"] = target_date
+        payload["service_context"] = build_service_context(config, target_date)
+        return JSONResponse(payload)
+
     return app
 
 
-from stock_scout_web_templates import HTML, MARKET_WIDTH_HTML, LEADERS_HTML, KPL_LEADERS_HTML
+from stock_scout_web_templates import HTML, MARKET_WIDTH_HTML, LEADERS_HTML, KPL_LEADERS_HTML, PLATE_BREAKOUT_HTML
 
 
 def parse_args() -> argparse.Namespace:
