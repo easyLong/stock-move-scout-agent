@@ -23,6 +23,20 @@ from stock_move_scout.evidence.model_config import (
     resolve_api_key,
     resolve_model_runtime_config,
 )
+from stock_move_scout.posts.morning.artifacts import (
+    morning_mirror_paths,
+    morning_post_paths,
+    write_json,
+    write_text_outputs,
+)
+from stock_move_scout.posts.morning.facts import (
+    format_pct,
+    read_fallback,
+    read_market_acceleration_model,
+    read_top3_concept_new_high,
+    to_float,
+)
+from stock_move_scout.posts.morning.style_guide import FORBIDDEN_MACHINE_PHRASES
 from stock_move_scout.sources.market_news import read_market_news_window
 from stock_move_scout.sources.market_themes import read_market_themes
 
@@ -113,7 +127,7 @@ MARKET_CONTEXT_PROMPT = """
 二八行情按轮动理解：权重和情绪票会轮流分歧、轮流修复。谁在分歧延续，就优先观察谁的承接机会；情绪票分歧延续看情绪票，科技权重分歧延续看科技权重。
 推演过程必须结合昨晚外围消息：外围强弱用于判断今天高开、低开、冲高或恐慌的预期，但最后要落到A股自己的承接、量能、扩散和资金切换，不能只复述外围新闻。
 如果 previous_market_context 显示上一交易日下跌家数多、跌超5%家数多、跌停压力明显，
-今天必须先按“修复盘/分歧承接”来写，不能因为外盘 AI 或美股科技强，就直接写成纯进攻。
+今天直接写弱盘后的承接判断：高开不追，分歧看核心能不能接住，不能因为外盘 AI 或美股科技强，就直接写成纯进攻。
 所有强主题都要落回一句话：它能不能修复昨天弱盘，并吸引真实跟随。
 """
 
@@ -402,7 +416,7 @@ def read_previous_market_context(config: Any, trade_day: date) -> dict[str, Any]
         else:
             temperature = "上一交易日市场偏强，今天关注修复延续和分化"
     elif down_ratio >= 0.72 or down5_ratio >= 0.08 or limit_down_count >= 10:
-        temperature = "上一交易日市场明显偏弱/大跌，今天先按修复盘和分歧承接处理"
+        temperature = "上一交易日市场很弱，今天高开不追，分歧看核心承接"
     elif down_ratio >= 0.6 or down5_ratio >= 0.03:
         temperature = "上一交易日市场偏弱，今天需要先看修复力度"
     elif up_count > down_count:
@@ -537,24 +551,6 @@ def read_previous_kpl_tomorrow_fry(config: Any, trade_day: date, limit: int = 8)
     }
 
 
-def read_json_payload(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def read_fallback(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    theme_payload = read_json_payload(root / "runs" / "data_tasks" / "daily_market_themes.json")
-    news_payload = read_json_payload(root / "runs" / "data_tasks" / "morning_market_news.json")
-    themes = theme_payload.get("rows") if isinstance(theme_payload.get("rows"), list) else []
-    news = news_payload.get("rows") if isinstance(news_payload.get("rows"), list) else []
-    return themes, news
-
-
 def format_day(trade_day: date) -> str:
     return f"{trade_day.month}月{trade_day.day}日"
 
@@ -608,8 +604,19 @@ def split_long_line(line: str, limit: int = 170) -> list[str]:
     return chunks
 
 
-XUEQIU_KEEP_HEADINGS = {"今日最佳入手机会", "今日风险点", "今天盯什么"}
+XUEQIU_LAYOUT_HEADINGS = {
+    "市场分析",
+    "消息推演",
+    "风险或机会点",
+    "备选分析建议",
+}
+XUEQIU_KEEP_HEADINGS = {
+    "今日最佳入手机会",
+    "今日风险点",
+    "今天盯什么",
+}
 XUEQIU_DROP_HEADINGS = {
+    *XUEQIU_LAYOUT_HEADINGS,
     "上一交易日市场温度+情绪周期",
     "上一交易日市场温度",
     "市场温度+情绪周期",
@@ -632,9 +639,10 @@ def normalize_xueqiu_line(line: str) -> str | None:
     clean = clean.strip()
     if re.fullmatch(r"【(?:风险点|结论|条件)】", clean):
         return None
-    bracket_heading = re.fullmatch(r"【(今日最佳入手机会|今日风险点|今天盯什么)】", clean)
+    bracket_heading = re.fullmatch(r"【(市场分析|消息推演|风险或机会点|备选分析建议|今日最佳入手机会|今日风险点|今天盯什么)】", clean)
     if bracket_heading:
-        return bracket_heading.group(1)
+        heading = bracket_heading.group(1)
+        return None if heading in XUEQIU_LAYOUT_HEADINGS else heading
     heading = clean.rstrip(":：").strip()
     if heading in XUEQIU_KEEP_HEADINGS:
         return heading
@@ -705,6 +713,19 @@ def enforce_strategy_watch_block(content: str, strategy: dict[str, Any]) -> str:
     if disclaimer:
         body = f"{body}\n\n{disclaimer}"
     return body.strip() + "\n"
+
+
+def enforce_stock_links(content: str, post_plan: dict[str, Any]) -> str:
+    links = post_plan.get("stock_links") if isinstance(post_plan.get("stock_links"), dict) else {}
+    text = content or ""
+    for name, url in links.items():
+        name_text = str(name or "").strip()
+        url_text = str(url or "").strip()
+        if not name_text or not url_text:
+            continue
+        pattern = rf"(?<!\[){re.escape(name_text)}(?!\]\()"
+        text = re.sub(pattern, f"[{name_text}]({url_text})", text)
+    return text
 
 
 def compact_blanks(lines: list[str]) -> list[str]:
@@ -813,9 +834,10 @@ def normalize_xueqiu_post(content: str, trade_day: date, themes: list[dict[str, 
                 lines.append("")
             previous_blank = True
             continue
-        inline_heading = re.match(r"^(今日最佳入手机会|今日风险点|今天盯什么)[:：]\s*(.+)$", line)
+        inline_heading = re.match(r"^(市场分析|消息推演|风险或机会点|备选分析建议|今日最佳入手机会|今日风险点|今天盯什么)[:：]\s*(.+)$", line)
         if inline_heading:
-            lines.append(inline_heading.group(1))
+            if inline_heading.group(1) not in XUEQIU_LAYOUT_HEADINGS:
+                lines.append(inline_heading.group(1))
             lines.append(inline_heading.group(2).strip())
             previous_blank = False
             continue
@@ -939,6 +961,16 @@ def fact_collector_agent(payload: dict[str, Any]) -> dict[str, Any]:
     latest = market.get("latest") if isinstance(market.get("latest"), dict) else {}
     ths = market.get("ths_after_close_summary") if isinstance(market.get("ths_after_close_summary"), dict) else {}
     kpl = payload.get("kpl_tomorrow_fry") if isinstance(payload.get("kpl_tomorrow_fry"), dict) else {}
+    market_acceleration = (
+        payload.get("market_acceleration_model")
+        if isinstance(payload.get("market_acceleration_model"), dict)
+        else {}
+    )
+    top3_concept = (
+        payload.get("top3_concept_new_high")
+        if isinstance(payload.get("top3_concept_new_high"), dict)
+        else {}
+    )
     themes = payload.get("themes") if isinstance(payload.get("themes"), list) else []
     news = payload.get("news") if isinstance(payload.get("news"), list) else []
     theme_names = [theme_name(item) for item in themes if isinstance(item, dict) and theme_name(item)]
@@ -976,11 +1008,265 @@ def fact_collector_agent(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "theme_names": theme_names[:8],
         "kpl_plate_names": plate_names,
+        "market_acceleration_model": market_acceleration,
+        "top3_concept_new_high": top3_concept,
         "external_news": external_news,
         "raw_counts": {
             "themes": len(themes),
             "news": len(news),
         },
+    }
+
+
+def skill_judgement_from_facts(facts: dict[str, Any]) -> dict[str, Any]:
+    acceleration = (
+        facts.get("market_acceleration_model")
+        if isinstance(facts.get("market_acceleration_model"), dict)
+        else {}
+    )
+    top3 = facts.get("top3_concept_new_high") if isinstance(facts.get("top3_concept_new_high"), dict) else {}
+    external_news = facts.get("external_news") if isinstance(facts.get("external_news"), list) else []
+    external = external_market_bias(external_news)
+    top3_subs = top3.get("top3_sub_plates") if isinstance(top3.get("top3_sub_plates"), list) else []
+    strong_lines = [
+        str(item.get("sub_name") or item.get("plate_name") or "").strip()
+        for item in top3_subs
+        if isinstance(item, dict) and str(item.get("sub_name") or item.get("plate_name") or "").strip()
+    ]
+    if not strong_lines:
+        strong_lines = facts.get("kpl_plate_names") if isinstance(facts.get("kpl_plate_names"), list) else []
+    leader_info = acceleration.get("five_day_leader") if isinstance(acceleration.get("five_day_leader"), dict) else {}
+    accel_info = (
+        acceleration.get("leader_acceleration")
+        if isinstance(acceleration.get("leader_acceleration"), dict)
+        else {}
+    )
+    return {
+        "agent": "skill_result_judgement",
+        "uses": ["stock-market-acceleration-model", "stock-top3-concept-new-high"],
+        "market_acceleration": acceleration,
+        "top3_concept": top3,
+        "external_bias": external,
+        "strong_lines": strong_lines[:5],
+        "leader": str(leader_info.get("leader") or "未知"),
+        "leader_action_state": str(accel_info.get("action_state") or ""),
+        "core_view": str(acceleration.get("conclusion") or ""),
+    }
+
+
+def stock_core_reason_brief(row: dict[str, Any]) -> str:
+    text = compact(row.get("core_reason") or row.get("support_basis"), 180)
+    if not text:
+        return ""
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"^\d+[.、]\s*", "", text)
+    first = re.split(r"[；;。]", text, maxsplit=1)[0].strip()
+    if len(first) >= 4 and not first.startswith("据"):
+        return compact(first, 34)
+    text = re.sub(r"据\d{4}年\d{1,2}月\d{1,2}日(?:互动易|公告|投资者关系活动记录表)?[，,:：]?", "", text)
+    text = re.sub(r"据\d{4}年(?:年报|半年报)[，,:：]?", "", text)
+    return compact(text, 42)
+
+
+def stock_reason_text(item: dict[str, str]) -> str:
+    name = item.get("name", "")
+    url = item.get("url", "")
+    reason = item.get("reason", "")
+    display_name = f"[{name}]({url})" if url else name
+    support = item.get("support", "")
+    pool = item.get("pool", "")
+    meta = "，".join(part for part in (support, pool) if part)
+    meta_text = f"（{meta}）" if meta else ""
+    return f"{display_name}{meta_text}看{reason}" if reason else f"{display_name}{meta_text}"
+
+
+def post_plan_from_skill_results(facts: dict[str, Any], skill_judgement: dict[str, Any]) -> dict[str, Any]:
+    acceleration = (
+        skill_judgement.get("market_acceleration")
+        if isinstance(skill_judgement.get("market_acceleration"), dict)
+        else {}
+    )
+    top3 = skill_judgement.get("top3_concept") if isinstance(skill_judgement.get("top3_concept"), dict) else {}
+    external = skill_judgement.get("external_bias") if isinstance(skill_judgement.get("external_bias"), dict) else {}
+    leader_info = acceleration.get("five_day_leader") if isinstance(acceleration.get("five_day_leader"), dict) else {}
+    accel_info = (
+        acceleration.get("leader_acceleration")
+        if isinstance(acceleration.get("leader_acceleration"), dict)
+        else {}
+    )
+    style = acceleration.get("style_strength") if isinstance(acceleration.get("style_strength"), dict) else {}
+    current = acceleration.get("current") if isinstance(acceleration.get("current"), dict) else {}
+    top3_subs = top3.get("top3_sub_plates") if isinstance(top3.get("top3_sub_plates"), list) else []
+    top3_rows = top3.get("rows") if isinstance(top3.get("rows"), list) else []
+    strong_lines = [
+        str(item.get("sub_name") or item.get("plate_name") or "").strip()
+        for item in top3_subs
+        if isinstance(item, dict) and str(item.get("sub_name") or item.get("plate_name") or "").strip()
+    ]
+    theme_text = "、".join(strong_lines[:3]) if strong_lines else "核心方向"
+    leader = str(leader_info.get("leader") or "")
+    action_state = str(accel_info.get("action_state") or "")
+    leader_state = str(accel_info.get("state") or "")
+    external_hint = "外围消息只看对开盘情绪的影响，最后仍回到A股自己的承接"
+    if external.get("tech_related") and external.get("bias") == "外围偏强":
+        external_hint = "外围科技偏强会抬高开盘预期，但高开不能直接当承接"
+    elif external.get("tech_related") and external.get("bias") == "外围偏弱":
+        external_hint = "外围科技偏弱主要影响开盘，重点看核心分支被动分歧后有没有资金接"
+    elif external.get("bias") == "外围偏强":
+        external_hint = "外围偏强会抬高开盘预期，但盘中还是看承接和扩散"
+    elif external.get("bias") == "外围偏弱":
+        external_hint = "外围偏弱先压开盘情绪，盘中重点看恐慌有没有被接住"
+
+    market_ratio = to_float(style.get("market_ratio") if style else current.get("market_ratio"))
+    top50_ratio = to_float(style.get("top50_ratio") if style else current.get("top50_ratio"))
+    pool_ratio = to_float(style.get("research_pool_ratio") if style else current.get("research_pool_ratio"))
+    style_gap = to_float(style.get("style_gap"))
+    weight_days = to_int(leader_info.get("weight_stronger_days"))
+    emotion_days = to_int(leader_info.get("emotion_stronger_days"))
+    market_analysis = (
+        f"全市场上涨比例{format_pct(market_ratio)}，成交额Top50上涨比例{format_pct(top50_ratio)}，"
+        f"研究池上涨比例{format_pct(pool_ratio)}。Top50相对全市场强{format_pct(style_gap)}，"
+        f"近5日权重强{weight_days}天、情绪强{emotion_days}天，当前龙头是{leader or '混合轮动'}。"
+        f"龙头状态是{leader_state or '继续观察'}，对应{action_state or '先看承接'}。"
+    )
+    theme_names = facts.get("theme_names") if isinstance(facts.get("theme_names"), list) else []
+    news_items = facts.get("external_news") if isinstance(facts.get("external_news"), list) else []
+    after_close = facts.get("after_close_summary") if isinstance(facts.get("after_close_summary"), dict) else {}
+    news_anchor = "；".join(compact(item, 70) for item in news_items[:2] if compact(item, 70))
+    theme_anchor = "、".join(compact(item, 20) for item in theme_names[:3] if compact(item, 20))
+    close_anchor = compact(after_close.get("summary") or after_close.get("title"), 120)
+    news_deduction_parts = []
+    if close_anchor:
+        news_deduction_parts.append(f"昨日收盘后的盘面线索是{close_anchor}")
+    if news_anchor:
+        news_deduction_parts.append(f"隔夜重要消息主要看{news_anchor}")
+    if theme_anchor:
+        news_deduction_parts.append(f"日内题材热度集中在{theme_anchor}")
+    sub_reason_texts = []
+    for item in top3_subs[:3]:
+        if not isinstance(item, dict):
+            continue
+        sub_name = str(item.get("sub_name") or item.get("plate_name") or "").strip()
+        reason = compact(item.get("explosion_reason"), 46)
+        if sub_name and reason:
+            sub_reason_texts.append(f"{sub_name}是{reason}")
+    if sub_reason_texts:
+        news_deduction_parts.append("Top3子版块里，" + "；".join(sub_reason_texts))
+    news_deduction_parts.append(external_hint)
+    news_deduction_parts.append(f"今天推演先看{theme_text}能不能承接住开盘预期，再看是否扩散。")
+    news_deduction = "。".join(part.rstrip("。") for part in news_deduction_parts if part) + "。"
+    stock_groups: dict[str, list[dict[str, str]]] = {}
+    strong_support_groups: dict[str, list[dict[str, str]]] = {}
+    stock_links: dict[str, str] = {}
+    for row in top3_rows:
+        if not isinstance(row, dict):
+            continue
+        sub_name = str(row.get("sub_name") or "").strip()
+        stock_name = str(row.get("stock_name") or "").strip()
+        if not sub_name or not stock_name:
+            continue
+        url = str(row.get("xueqiu_url") or "").strip()
+        if url:
+            stock_links[stock_name] = url
+        item = {
+            "name": stock_name,
+            "url": url,
+            "reason": stock_core_reason_brief(row),
+            "support": str(row.get("support") or row.get("strong_line_support") or "").strip(),
+            "pool": (
+                f"研究池{to_int(row.get('pool_rank'))}/{to_int(row.get('pool_count'))}"
+                if to_int(row.get("pool_rank")) > 0 and to_int(row.get("pool_count")) > 0
+                else ""
+            ),
+        }
+        stock_groups.setdefault(sub_name, [])
+        if all(existing.get("name") != stock_name for existing in stock_groups[sub_name]) and len(stock_groups[sub_name]) < 3:
+            stock_groups[sub_name].append(item)
+        support = str(row.get("support") or row.get("strong_line_support") or "").strip()
+        if support == "强支撑":
+            strong_support_groups.setdefault(sub_name, [])
+            if all(existing.get("name") != stock_name for existing in strong_support_groups[sub_name]) and len(strong_support_groups[sub_name]) < 3:
+                strong_support_groups[sub_name].append(item)
+    backup_lines = []
+    for sub_name in strong_lines[:3]:
+        stocks = stock_groups.get(sub_name) or []
+        if stocks:
+            backup_lines.append(f"{sub_name}：" + "；".join(stock_reason_text(item) for item in stocks) + "。重点看分歧承接。")
+        else:
+            backup_lines.append(f"{sub_name}：先看板块强度能不能延续到核心票。")
+    backup_note = "；".join(backup_lines) if backup_lines else "备选只从Top3强分支里找，先看分歧承接，不追一致。"
+    llm_review = top3.get("llm_review") if isinstance(top3.get("llm_review"), dict) else {}
+    if llm_review.get("ok") is False:
+        backup_note += " 这批备选来自KPL板块详情兜底，未经过完整LLM强支撑复核，只做盘前观察。"
+    strong_support_parts = []
+    for sub_name in strong_lines[:3]:
+        stocks = strong_support_groups.get(sub_name) or []
+        if stocks:
+            strong_support_parts.append(f"{sub_name}里的" + "、".join(stock_reason_text(item) for item in stocks))
+    if strong_support_parts:
+        strong_support_advice = (
+            "强支撑票单独看"
+            + "，".join(strong_support_parts)
+            + "。这类票不是用来开盘追高的，只有对应分支分歧后还能主动回流，才优先看低吸承接；"
+            "如果板块高开兑现，强支撑也要后置。"
+        )
+    elif isinstance(top3.get("strong_support_clean"), list) and top3.get("strong_support_clean"):
+        names = "、".join(str(item) for item in top3.get("strong_support_clean") if str(item).strip())
+        strong_support_advice = (
+            f"这版里最干净的强支撑是：{names}。"
+            "这类票只在对应分支分歧后还能主动回流时优先看，开盘一致不追。"
+        )
+    elif llm_review.get("ok") is False:
+        strong_support_advice = "强支撑票暂时不单独定名单，因为这批数据还没有完整LLM复核；今天只把Top3分支当观察池。"
+    else:
+        strong_support_advice = "强支撑票这次没有单独留下，备选只看Top3分支里的主动承接，不把普通跟风当核心。"
+
+    if leader == "权重核心" and action_state.startswith("左侧卖"):
+        best_section = "今日风险点"
+        best_opportunity = (
+            f"{leader}还没坏，但{leader_state}，{theme_text}修复太顺不追。"
+            "风险在高开一致后承接变差，先降激进，等一次像样分歧。"
+        )
+        trade_bias = f"{theme_text}分歧后再看，不追一致"
+    elif leader == "权重核心" and action_state.startswith("右侧买"):
+        best_section = "今日最佳入手机会"
+        best_opportunity = f"{leader}仍在右侧，优先看{theme_text}第一次分歧后的承接低吸，高开太顺不追。"
+        trade_bias = f"{theme_text}分歧承接"
+    elif leader == "全市场情绪":
+        best_section = "今日最佳入手机会"
+        best_opportunity = f"全市场情绪占优，优先看{theme_text}能不能从核心票扩散到板块。"
+        trade_bias = f"{theme_text}扩散承接"
+    else:
+        best_section = "今日最佳入手机会"
+        best_opportunity = f"轮动里只看{theme_text}分歧后的主动承接，不追没有换手的一致。"
+        trade_bias = f"{theme_text}轮动承接"
+    risk_or_opportunity = f"{best_section}：{best_opportunity}"
+
+    return {
+        "agent": "skill_post_plan",
+        "uses": ["stock-market-acceleration-model", "stock-top3-concept-new-high"],
+        "decisive_view": str(acceleration.get("conclusion") or ""),
+        "trade_bias": trade_bias,
+        "primary_strategy": trade_bias,
+        "best_section": best_section,
+        "best_opportunity": best_opportunity,
+        "risk_or_opportunity": risk_or_opportunity,
+        "market_analysis": market_analysis,
+        "news_deduction": news_deduction,
+        "backup_suggestions": backup_note,
+        "strong_support_advice": strong_support_advice,
+        "stock_links": stock_links,
+        "external_hint": external_hint,
+        "watch_points": [
+            f"{theme_text}分歧时有没有主动承接" if strong_lines else "核心方向分歧时有没有主动承接",
+            "成交额Top50和全市场情绪谁更强",
+            "研究池能不能继续强于全市场",
+            "外围扰动落地后，核心分支有没有扩散",
+        ],
+        "strong_lines": strong_lines[:5],
+        "leader": leader,
+        "leader_action_state": action_state,
+        "style_gap": style.get("style_gap"),
     }
 
 
@@ -1311,54 +1597,61 @@ def strategy_agent(facts: dict[str, Any], judgement: dict[str, Any]) -> dict[str
 def workflow_fallback_post(
     trade_day: date,
     facts: dict[str, Any],
-    judgement: dict[str, Any],
-    strategy: dict[str, Any],
+    skill_judgement: dict[str, Any],
+    post_plan: dict[str, Any],
 ) -> str:
     temp = facts.get("market_temperature") if isinstance(facts.get("market_temperature"), dict) else {}
-    summary = facts.get("after_close_summary") if isinstance(facts.get("after_close_summary"), dict) else {}
-    strong_lines = judgement.get("strong_lines") if isinstance(judgement.get("strong_lines"), list) else []
+    acceleration = (
+        skill_judgement.get("market_acceleration")
+        if isinstance(skill_judgement.get("market_acceleration"), dict)
+        else {}
+    )
+    accel_info = acceleration.get("leader_acceleration") if isinstance(acceleration.get("leader_acceleration"), dict) else {}
+    strong_lines = post_plan.get("strong_lines") if isinstance(post_plan.get("strong_lines"), list) else []
     primary = [str(item) for item in strong_lines if str(item).strip()]
     first = primary[0] if primary else "核心方向"
     second = primary[1] if len(primary) > 1 else "次强方向"
-    decisive_view = str(strategy.get("decisive_view") or "")
-    trade_bias = str(strategy.get("trade_bias") or strategy.get("primary_strategy") or "买点后置看承接")
-    title_action = "科技权重低吸机会还在" if "权重科技" in decisive_view else "买点后置看承接"
-    title = f"【{day_label(trade_day)}盘前：{judgement.get('cycle', '盘面修复')}，{title_action}】"
+    decisive_view = str(post_plan.get("decisive_view") or "")
+    trade_bias = str(post_plan.get("trade_bias") or post_plan.get("primary_strategy") or "买点后置看承接")
+    title_action = trade_bias or "买点后置看承接"
+    title = f"【{day_label(trade_day)}盘前：{first}看承接，{title_action}】"
     market_line = (
-        f"上一交易日A股温度先看修复，收盘{to_int(temp.get('up_count'))}家上涨、"
+        f"上一交易日A股温度不算宽，收盘{to_int(temp.get('up_count'))}家上涨、"
         f"{to_int(temp.get('down_count'))}家下跌，跌超5%的{to_int(temp.get('down5_count'))}家，"
         f"跌停{to_int(temp.get('limit_down_count'))}家，涨停{to_int(temp.get('limit_up_count'))}家。"
     )
     if to_int(temp.get("amount_top50_down_count")) > to_int(temp.get("amount_top50_up_count")):
         market_line += " 情绪是回暖了，但权重内部没那么强，成交额前50里下跌数量还更多。"
+    else:
+        market_line += " 成交额Top50仍然强于全市场，权重核心还是主要观察对象。"
     if primary:
         market_line += " 核心方向主要看" + "、".join(primary[:4]) + "。"
-    watch_points = strategy.get("watch_points") if isinstance(strategy.get("watch_points"), list) else []
+    watch_points = post_plan.get("watch_points") if isinstance(post_plan.get("watch_points"), list) else []
     watch_points = [compact(item, 80) for item in watch_points if compact(item, 80)][:4]
     while len(watch_points) < 4:
         watch_points.append("量能和跌停压力能不能继续改善。")
+    acceleration_line = ""
+    if decisive_view:
+        acceleration_line = decisive_view
+    elif accel_info:
+        acceleration_line = (
+            f"市场加速度这里给的信号是{accel_info.get('state', '继续观察')}，"
+            f"对应{accel_info.get('action_state', '先看承接')}。"
+        )
     lines = [
         title,
         "",
         market_line,
         "",
-        (
-            f"今天先按{judgement.get('cycle', '修复延续')}看。{decisive_view}，具体买点看{trade_bias}。"
-            if decisive_view
-            else f"今天先按{judgement.get('cycle', '修复延续')}看。{judgement.get('core_view', '重点看分歧承接')}，不适合开盘只看谁冲得快。"
-        ),
+        post_plan.get("market_analysis") or f"{acceleration_line} 具体买点看{trade_bias}，不适合开盘只看谁冲得快。",
         "",
-        f"外围这里先当情绪背景处理。{strategy.get('external_hint', '最后还是看A股自己的承接')}。",
+        post_plan.get("news_deduction") or f"外围这里先当情绪背景处理。{post_plan.get('external_hint', '最后还是看A股自己的承接')}。",
         "",
-        f"最强先看{first}。如果开盘直接一致，不急；更好的点在第一次分歧延续，核心品种回落后还能被接住，才说明上一交易日的强不是一日游。",
+        post_plan.get("risk_or_opportunity") or post_plan.get("best_opportunity", "我更看强主线第一次分歧承接。修复太顺不追，分歧延续后还能回流，才是更舒服的点。"),
         "",
-        f"{second}也放进观察。它要从个股强变成板块强，不能只靠前排硬顶，后排没有扩散就还是脉冲。",
+        post_plan.get("backup_suggestions") or f"{first}先看分歧承接，{second}只做后手观察；没有换手的一致不追。",
         "",
-        "科技明天位置后置。只要科技权重没有重新打出强度，就先看半导体、通信这些方向能不能修复弱势，别急着把高开当反包。",
-        "",
-        strategy.get("best_section", "今日最佳入手机会"),
-        "",
-        strategy.get("best_opportunity", "我更看强主线第一次分歧承接。修复太顺不追，分歧延续后还能回流，才是更舒服的点。"),
+        post_plan.get("strong_support_advice", ""),
         "",
         "今天盯什么",
         "",
@@ -1366,14 +1659,15 @@ def workflow_fallback_post(
         "",
         DISCLAIMER,
     ]
-    return enforce_strategy_watch_block(normalize_xueqiu_post("\n".join(lines), trade_day, []), strategy)
+    content = enforce_strategy_watch_block(normalize_xueqiu_post("\n".join(lines), trade_day, []), post_plan)
+    return enforce_stock_links(content, post_plan)
 
 
 def draft_writer_agent(
     payload: dict[str, Any],
     facts: dict[str, Any],
-    judgement: dict[str, Any],
-    strategy: dict[str, Any],
+    skill_judgement: dict[str, Any],
+    post_plan: dict[str, Any],
     *,
     trade_day: date,
     themes: list[dict[str, Any]],
@@ -1386,47 +1680,51 @@ def draft_writer_agent(
     user = "\n".join(
         [
             "请按下面已固定的 workflow 产物写一篇雪球早盘帖。",
-            "硬性结构：标题；自然短段写市场温度+情绪周期、今日总判断、主线和后手观察；单独写今日最佳入手机会或今日风险点；单独写今天盯什么；免责声明。",
-            "雪球排版：不要写一、二、三、四、五、六；不要写第一、第二、第三；不要写公众号式小标题。只允许保留“今日最佳入手机会/今日风险点”和“今天盯什么”两个栏目标题，标题后不要加冒号，不要用【】包住栏目标题。",
+            "硬性顺序：标题；开头自然段写市场分析；随后自然段写消息推演；再写风险点或机会点；再写备选和强支撑票建议；今天盯什么；免责声明。",
+            "不要写“市场分析/消息推演/风险或机会点/备选分析建议”这些栏目标题，直接自然分段。",
+            "开头市场分析只使用 stock-market-acceleration-model：先写上一交易日市场温度，再写全市场/成交额Top50/研究池上涨比例、风格强弱差、近5日龙头/跟风、龙头加速度和对应动作。",
+            "市场分析里的比例统一写成百分比，不要写0.78这类小数。",
+            "消息推演必须结合 morning_market_news、daily_market_themes 和昨日收盘后摘要：不要罗列新闻，要写这些消息会怎样影响开盘预期、主线承接和扩散。",
+            "非Top3强分支的油气、军工、黄金、汇率、关税等，只能作为风险偏好背景一句带过，不要展开成主线或备选方向。",
+            "风险点或机会点只回答今天该怎么处理盘面，段内必须明确出现“今日风险点”或“今日最佳入手机会”其中一个词。",
+            "备选只使用 stock-top3-concept-new-high 的Top3子版块和候选股，必须带上每只票的核心原因，写成“股票名看什么逻辑”的短句；不要只列名字，不要替代市场判断。",
+            "如果 POST_PLAN.backup_suggestions 提到未经过完整LLM复核，必须保留这个限制。",
+            "如果 POST_PLAN.strong_support_advice 不为空，必须单独用一个自然段写强支撑票的合理建议，并带核心原因，不要只列名字。",
+            "雪球排版：不要写一、二、三、四、五、六；不要写第一、第二、第三；不要写公众号式小标题。只允许保留“今天盯什么”这个栏目标题，标题后不要加冒号，不要用【】包住栏目标题。",
             "今天盯什么下面只写3-4行，每行一个观察点，不编号，不拆成解释性两行。",
-            "语气短句、有判断、不要研报味。不要出现：分歧减缓、有几个事实、推演如下、因素叠加、最合理的推演、可以得出、映射方向包括、盘中验证点、结论先放前面、条件也很清楚。",
-            "策略部分必须观点明确，先写结论，再写条件，不要只写“看承接”。如果 STRATEGY.decisive_view 不为空，今日总判断必须直接使用这个观点。",
-            "只能使用事实、判断和策略里的内容，不要编造个股。",
+            "语气短句、有判断、不要研报味。不要出现：今天先按、先按修复盘、修复盘和分歧承接处理、分歧减缓、有几个事实、推演如下、因素叠加、最合理的推演、可以得出、映射方向包括、盘中验证点、结论先放前面、条件也很清楚。",
+            "策略部分必须观点明确，先写结论，再写条件，不要只写“看承接”。如果 POST_PLAN.decisive_view 不为空，今日总判断必须直接使用这个观点。",
+            "只能使用 FACTS、SKILL_JUDGEMENT 和 POST_PLAN 里的内容，不要编造个股。",
+            "核心判断必须来自 stock-market-acceleration-model；强分支必须来自 stock-top3-concept-new-high。",
             "用户词汇：修复延续=修复还在但弱于前一日；继续修复=力度相当；加强修复=更强；分歧延续=分歧还在但弱于前一日。",
             "FACTS:",
             json.dumps(facts, ensure_ascii=False, indent=2),
-            "JUDGEMENT:",
-            json.dumps(judgement, ensure_ascii=False, indent=2),
-            "STRATEGY:",
-            json.dumps(strategy, ensure_ascii=False, indent=2),
+            "SKILL_JUDGEMENT:",
+            json.dumps(skill_judgement, ensure_ascii=False, indent=2),
+            "POST_PLAN:",
+            json.dumps(post_plan, ensure_ascii=False, indent=2),
             "RAW_PAYLOAD_FOR_REFERENCE:",
             json.dumps(payload, ensure_ascii=False, indent=2)[:6000],
         ]
     )
     text = call_model_text(system=system, user=user, model=model, base_url=base_url, api_key=api_key, timeout=timeout)
-    return enforce_strategy_watch_block(normalize_xueqiu_post(text, trade_day, themes), strategy)
+    content = enforce_strategy_watch_block(normalize_xueqiu_post(text, trade_day, themes), post_plan)
+    return enforce_stock_links(content, post_plan)
 
 
 FORBIDDEN_POST_PHRASES = [
     "分歧减缓",
     "映射方向包括",
-    "消息密度最高",
-    "风险偏好形成压制",
-    "持续性取决于",
-    "总体思路",
-    "核心不是单一利好",
-    "盘中验证点",
     "第一条",
     "第二条",
     "第三条",
-    "有几个事实",
-    "推演如下",
-    "因素叠加",
-    "最合理的推演",
-    "可以得出",
+    "今天先按",
+    "先按修复盘",
+    "修复盘和分歧承接处理",
+    "修复盘",
     "强线",
     "弱线",
-]
+] + list(FORBIDDEN_MACHINE_PHRASES)
 
 
 ALLOWED_POST_HEADINGS = {
@@ -1448,13 +1746,19 @@ ALLOWED_POST_HEADINGS = {
 def review_goal_agent(content: str) -> dict[str, Any]:
     stripped = (content or "").strip()
     issues: list[str] = []
+    decision_text = stripped
+    has_risk_word = "风险点" in decision_text or "风险在" in decision_text or "风险" in decision_text
+    has_opportunity_word = "机会点" in decision_text or "入手机会" in decision_text or "机会" in decision_text
     if not stripped.startswith("【"):
         issues.append("标题必须是首行，且用【】包住")
     first_line = stripped.splitlines()[0].strip() if stripped.splitlines() else ""
     if first_line.endswith(("？", "?")) or "？" in first_line or "?" in first_line:
         issues.append("标题不要使用疑问句，要直接给出策略")
-    if "今日最佳入手机会" not in stripped and "今日风险点" not in stripped:
-        issues.append("缺少今日最佳入手机会或今日风险点")
+    for heading in XUEQIU_LAYOUT_HEADINGS:
+        if re.search(rf"(?m)^{re.escape(heading)}[:：]?$", stripped):
+            issues.append(f"不要写栏目标题：{heading}")
+    if not has_risk_word and not has_opportunity_word:
+        issues.append("缺少风险点或机会点")
     if "今天盯什么" not in stripped:
         issues.append("缺少今天盯什么")
     if DISCLAIMER not in stripped:
@@ -1473,7 +1777,7 @@ def review_goal_agent(content: str) -> dict[str, Any]:
     if len(stripped) > 1500:
         issues.append("正文过长")
     if "今日最佳入手机会" in stripped and "今日风险点" in stripped:
-        issues.append("今日最佳入手机会和今日风险点不能同时写")
+        issues.append("机会点和风险点不能同时作为主判断")
     for line in stripped.splitlines():
         clean = line.strip()
         if clean in ALLOWED_POST_HEADINGS:
@@ -1493,7 +1797,8 @@ def review_goal_agent(content: str) -> dict[str, Any]:
         "issues": issues,
         "checks": {
             "has_title": stripped.startswith("【"),
-            "has_best_or_risk": "今日最佳入手机会" in stripped or "今日风险点" in stripped,
+            "no_layout_headings": not any(re.search(rf"(?m)^{re.escape(heading)}[:：]?$", stripped) for heading in XUEQIU_LAYOUT_HEADINGS),
+            "has_best_or_risk": has_opportunity_word or has_risk_word,
             "has_watch": "今天盯什么" in stripped,
             "has_disclaimer": DISCLAIMER in stripped,
             "length": len(stripped),
@@ -1505,8 +1810,8 @@ def rewrite_agent(
     draft: str,
     review: dict[str, Any],
     facts: dict[str, Any],
-    judgement: dict[str, Any],
-    strategy: dict[str, Any],
+    skill_judgement: dict[str, Any],
+    post_plan: dict[str, Any],
     *,
     trade_day: date,
     themes: list[dict[str, Any]],
@@ -1520,7 +1825,13 @@ def rewrite_agent(
         [
             "下面这篇早盘帖没有通过审稿，请重写成最终版。",
             "必须修复 review issues，仍保持真人短线复盘语气。",
-            "策略部分必须观点明确，先写结论，再写条件，不要只写“看承接”。如果 STRATEGY.decisive_view 不为空，今日总判断必须直接使用这个观点。",
+            "硬性顺序：标题；市场分析自然段；消息推演自然段；风险点或机会点自然段；备选和强支撑票建议自然段；今天盯什么；免责声明。",
+            "不要写“市场分析/消息推演/风险或机会点/备选分析建议”这些栏目标题。",
+            "市场分析只用 stock-market-acceleration-model；消息推演结合 morning_market_news、daily_market_themes 和昨日收盘后摘要；备选和强支撑票建议只用 stock-top3-concept-new-high。",
+            "备选和强支撑票必须保留每只票的核心原因，写成“股票名看什么逻辑”的短句，不要只列名字。",
+            "如果 POST_PLAN.strong_support_advice 不为空，必须单独用一个自然段写强支撑票的合理建议，不要只列名字。",
+            "比例写百分比；非Top3强分支的油气、军工、黄金、汇率、关税等只做风险偏好背景，不展开成主线。",
+            "策略部分必须观点明确，先写结论，再写条件，不要只写“看承接”。如果 POST_PLAN.decisive_view 不为空，今日总判断必须直接使用这个观点。",
             "不要出现“结论先放前面”“条件也很清楚”这类写作提示词口吻。",
             "DRAFT:",
             draft,
@@ -1528,14 +1839,15 @@ def rewrite_agent(
             json.dumps(review, ensure_ascii=False, indent=2),
             "FACTS:",
             json.dumps(facts, ensure_ascii=False, indent=2),
-            "JUDGEMENT:",
-            json.dumps(judgement, ensure_ascii=False, indent=2),
-            "STRATEGY:",
-            json.dumps(strategy, ensure_ascii=False, indent=2),
+            "SKILL_JUDGEMENT:",
+            json.dumps(skill_judgement, ensure_ascii=False, indent=2),
+            "POST_PLAN:",
+            json.dumps(post_plan, ensure_ascii=False, indent=2),
         ]
     )
     text = call_model_text(system=system, user=user, model=model, base_url=base_url, api_key=api_key, timeout=timeout)
-    return enforce_strategy_watch_block(normalize_xueqiu_post(text, trade_day, themes), strategy)
+    content = enforce_strategy_watch_block(normalize_xueqiu_post(text, trade_day, themes), post_plan)
+    return enforce_stock_links(content, post_plan)
 
 
 def run_morning_reference_workflow(
@@ -1552,12 +1864,19 @@ def run_morning_reference_workflow(
     review_max_rewrites: int,
 ) -> dict[str, Any]:
     facts = fact_collector_agent(payload)
-    judgement = market_judge_agent(facts)
-    strategy = strategy_agent(facts, judgement)
+    skill_judgement = skill_judgement_from_facts(facts)
+    post_plan = post_plan_from_skill_results(facts, skill_judgement)
     stages: list[dict[str, Any]] = [
         {"name": "fact_collector", "ok": True},
-        {"name": "market_judge", "ok": True},
-        {"name": "strategy_builder", "ok": True},
+        {
+            "name": "stock_market_acceleration_model",
+            "ok": bool((facts.get("market_acceleration_model") or {}).get("ok")),
+        },
+        {
+            "name": "stock_top3_concept_new_high",
+            "ok": bool((facts.get("top3_concept_new_high") or {}).get("ok")),
+        },
+        {"name": "skill_post_plan", "ok": True},
     ]
     model_ok = False
     model_error = ""
@@ -1566,8 +1885,8 @@ def run_morning_reference_workflow(
         content = draft_writer_agent(
             payload,
             facts,
-            judgement,
-            strategy,
+            skill_judgement,
+            post_plan,
             trade_day=trade_day,
             themes=themes,
             model=model,
@@ -1583,7 +1902,7 @@ def run_morning_reference_workflow(
         stages.append({"name": "draft_writer", "ok": False, "error": model_error[:1000]})
         if not fallback_without_model:
             raise
-        content = workflow_fallback_post(trade_day, facts, judgement, strategy)
+        content = workflow_fallback_post(trade_day, facts, skill_judgement, post_plan)
         drafts.append(content)
         stages.append({"name": "fallback_writer", "ok": True})
 
@@ -1602,8 +1921,8 @@ def run_morning_reference_workflow(
                 content,
                 review,
                 facts,
-                judgement,
-                strategy,
+                skill_judgement,
+                post_plan,
                 trade_day=trade_day,
                 themes=themes,
                 model=model,
@@ -1624,8 +1943,10 @@ def run_morning_reference_workflow(
     return {
         "content": content,
         "facts": facts,
-        "judgement": judgement,
-        "strategy": strategy,
+        "judgement": skill_judgement,
+        "strategy": post_plan,
+        "market_acceleration": facts.get("market_acceleration_model"),
+        "top3_concept": facts.get("top3_concept_new_high"),
         "drafts": drafts,
         "reviews": reviews,
         "final_review": final_review,
@@ -1643,29 +1964,42 @@ def write_workflow_artifacts(
     payload: dict[str, Any],
     workflow: dict[str, Any],
 ) -> dict[str, str]:
-    workflow_dir = output_dir / f"morning_reference_{trade_day.strftime('%Y-%m-%d')}.workflow"
+    paths = morning_post_paths(output_dir, trade_day)
+    workflow_dir = paths.workflow_dir
     workflow_dir.mkdir(parents=True, exist_ok=True)
     artifacts = {
         "workflow_dir": workflow_dir,
         "facts_path": workflow_dir / "facts.json",
         "market_judgement_path": workflow_dir / "market_judgement.json",
         "strategy_view_path": workflow_dir / "strategy_view.json",
+        "market_acceleration_path": workflow_dir / "market_acceleration.json",
+        "top3_concept_path": workflow_dir / "top3_concept.json",
+        "post_plan_path": workflow_dir / "post_plan.json",
         "review_path": workflow_dir / "review.json",
         "final_path": workflow_dir / "final.md",
         "payload_path": workflow_dir / "payload.json",
-        "workflow_path": output_dir / f"morning_reference_{trade_day.strftime('%Y-%m-%d')}.workflow.json",
+        "workflow_path": paths.workflow_path,
     }
-    artifacts["facts_path"].write_text(json.dumps(workflow["facts"], ensure_ascii=False, indent=2), encoding="utf-8")
-    artifacts["market_judgement_path"].write_text(json.dumps(workflow["judgement"], ensure_ascii=False, indent=2), encoding="utf-8")
-    artifacts["strategy_view_path"].write_text(json.dumps(workflow["strategy"], ensure_ascii=False, indent=2), encoding="utf-8")
-    artifacts["review_path"].write_text(json.dumps(workflow["reviews"], ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(artifacts["facts_path"], workflow["facts"])
+    write_json(artifacts["market_judgement_path"], workflow["judgement"])
+    write_json(artifacts["strategy_view_path"], workflow["strategy"])
+    write_json(
+        artifacts["market_acceleration_path"],
+        workflow.get("market_acceleration") or workflow["facts"].get("market_acceleration_model") or {},
+    )
+    write_json(
+        artifacts["top3_concept_path"],
+        workflow.get("top3_concept") or workflow["facts"].get("top3_concept_new_high") or {},
+    )
+    write_json(artifacts["post_plan_path"], workflow["strategy"])
+    write_json(artifacts["review_path"], workflow["reviews"])
     draft_paths: list[str] = []
     for idx, draft in enumerate(workflow.get("drafts") or [], start=1):
         draft_path = workflow_dir / f"draft_v{idx}.md"
         draft_path.write_text(str(draft), encoding="utf-8")
         draft_paths.append(str(draft_path))
     artifacts["final_path"].write_text(str(workflow["content"]), encoding="utf-8")
-    artifacts["payload_path"].write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(artifacts["payload_path"], payload)
     workflow_summary = {
         "ok": bool(workflow.get("final_review", {}).get("pass")),
         "workflow": "morning_reference_post",
@@ -1673,12 +2007,14 @@ def write_workflow_artifacts(
         "facts": workflow["facts"],
         "judgement": workflow["judgement"],
         "strategy": workflow["strategy"],
+        "market_acceleration": workflow.get("market_acceleration") or workflow["facts"].get("market_acceleration_model") or {},
+        "top3_concept": workflow.get("top3_concept") or workflow["facts"].get("top3_concept_new_high") or {},
         "reviews": workflow["reviews"],
         "stages": workflow["stages"],
         "drafts": draft_paths,
         "artifacts": {key: str(value) for key, value in artifacts.items()},
     }
-    artifacts["workflow_path"].write_text(json.dumps(workflow_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(artifacts["workflow_path"], workflow_summary)
     return {key: str(value) for key, value in artifacts.items()}
 
 
@@ -1709,15 +2045,24 @@ def read_inputs(
     theme_limit: int,
     news_limit: int,
     min_importance: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
     if config is not None:
         themes = read_themes_mysql(config, trade_day, theme_limit)
         news = read_news_mysql(config, start, end, min_importance, news_limit)
         market_context = read_previous_market_context(config, trade_day)
         kpl_tomorrow_fry = read_previous_kpl_tomorrow_fry(config, trade_day, limit=8)
-        return themes, news, market_context, kpl_tomorrow_fry
+        market_acceleration = read_market_acceleration_model(config, trade_day)
+        top3_concept = read_top3_concept_new_high(config, root, trade_day)
+        return themes, news, market_context, kpl_tomorrow_fry, market_acceleration, top3_concept
     themes, news = read_fallback(root)
-    return themes, news, {}, {}
+    return themes, news, {}, {}, {}, {}
 
 
 def model_payload(
@@ -1728,6 +2073,8 @@ def model_payload(
     news: list[dict[str, Any]],
     market_context: dict[str, Any] | None = None,
     kpl_tomorrow_fry: dict[str, Any] | None = None,
+    market_acceleration_model: dict[str, Any] | None = None,
+    top3_concept_new_high: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "task": "morning_reference_post",
@@ -1739,6 +2086,8 @@ def model_payload(
         },
         "previous_market_context": market_context or {},
         "kpl_tomorrow_fry": kpl_tomorrow_fry or {},
+        "market_acceleration_model": market_acceleration_model or {},
+        "top3_concept_new_high": top3_concept_new_high or {},
         "themes": themes[:8],
         "news": news[:30],
         "output_constraints": {
@@ -1791,7 +2140,7 @@ def main() -> int:
     trade_day, start, end = resolve_window(args, config)
     deadline = loop_deadline_today(args.loop_until)
     while True:
-        themes, news, market_context, kpl_tomorrow_fry = read_inputs(
+        themes, news, market_context, kpl_tomorrow_fry, market_acceleration, top3_concept = read_inputs(
             config=config,
             root=root,
             trade_day=trade_day,
@@ -1806,7 +2155,17 @@ def main() -> int:
         if deadline is None or datetime.now() >= deadline:
             break
         time.sleep(max(5, int(args.loop_interval_seconds)))
-    payload = model_payload(trade_day, start, end, themes, news, market_context, kpl_tomorrow_fry)
+    payload = model_payload(
+        trade_day,
+        start,
+        end,
+        themes,
+        news,
+        market_context,
+        kpl_tomorrow_fry,
+        market_acceleration,
+        top3_concept,
+    )
     model_ok = False
     model_error = ""
     model_name = "fallback_without_model"
@@ -1891,22 +2250,43 @@ def main() -> int:
         if not args.fallback_without_model:
             raise
         if args.workflow:
-            fallback_payload = model_payload(trade_day, start, end, themes, news, market_context, kpl_tomorrow_fry)
+            fallback_payload = model_payload(
+                trade_day,
+                start,
+                end,
+                themes,
+                news,
+                market_context,
+                kpl_tomorrow_fry,
+                market_acceleration,
+                top3_concept,
+            )
             facts = fact_collector_agent(fallback_payload)
-            judgement = market_judge_agent(facts)
-            strategy = strategy_agent(facts, judgement)
-            content = workflow_fallback_post(trade_day, facts, judgement, strategy)
+            skill_judgement = skill_judgement_from_facts(facts)
+            post_plan = post_plan_from_skill_results(facts, skill_judgement)
+            content = workflow_fallback_post(trade_day, facts, skill_judgement, post_plan)
             review = review_goal_agent(content)
             workflow_result = {
                 "content": content,
                 "facts": facts,
-                "judgement": judgement,
-                "strategy": strategy,
+                "judgement": skill_judgement,
+                "strategy": post_plan,
+                "market_acceleration": facts.get("market_acceleration_model"),
+                "top3_concept": facts.get("top3_concept_new_high"),
                 "drafts": [content],
                 "reviews": [review],
                 "final_review": review,
                 "stages": [
                     {"name": "workflow_exception", "ok": False, "error": model_error[:1000]},
+                    {
+                        "name": "stock_market_acceleration_model",
+                        "ok": bool((facts.get("market_acceleration_model") or {}).get("ok")),
+                    },
+                    {
+                        "name": "stock_top3_concept_new_high",
+                        "ok": bool((facts.get("top3_concept_new_high") or {}).get("ok")),
+                    },
+                    {"name": "skill_post_plan", "ok": True},
                     {"name": "fallback_writer", "ok": True},
                     {"name": "review_goal", "ok": bool(review.get("pass")), "attempt": 0},
                 ],
@@ -1916,21 +2296,9 @@ def main() -> int:
             }
         else:
             content = build_post(trade_day, start, end, themes, news)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = args.output_dir / f"morning_reference_{trade_day.strftime('%Y-%m-%d')}.txt"
-    latest_path = args.output_dir / "morning_reference_latest.txt"
-    meta_path = args.output_dir / f"morning_reference_{trade_day.strftime('%Y-%m-%d')}.json"
-    output_path.write_text(content, encoding="utf-8")
-    latest_path.write_text(content, encoding="utf-8")
-    if args.mirror_output_dir:
-        args.mirror_output_dir.mkdir(parents=True, exist_ok=True)
-        mirror_output_path = args.mirror_output_dir / output_path.name
-        mirror_latest_path = args.mirror_output_dir / latest_path.name
-        mirror_output_path.write_text(content, encoding="utf-8")
-        mirror_latest_path.write_text(content, encoding="utf-8")
-    else:
-        mirror_output_path = None
-        mirror_latest_path = None
+    paths = morning_post_paths(args.output_dir, trade_day)
+    mirror_paths = morning_mirror_paths(args.mirror_output_dir, paths)
+    text_outputs = write_text_outputs(content, paths, mirror_paths)
     if workflow_result is not None:
         workflow_artifacts = write_workflow_artifacts(
             output_dir=args.output_dir,
@@ -1951,14 +2319,14 @@ def main() -> int:
         "workflow_enabled": bool(args.workflow),
         "review_pass": bool(workflow_result.get("final_review", {}).get("pass")) if workflow_result else None,
         "workflow_artifacts": workflow_artifacts,
-        "output_path": str(output_path),
-        "latest_path": str(latest_path),
-        "mirror_output_path": str(mirror_output_path) if mirror_output_path else "",
-        "mirror_latest_path": str(mirror_latest_path) if mirror_latest_path else "",
-        "meta_path": str(meta_path),
+        "output_path": text_outputs["output_path"],
+        "latest_path": text_outputs["latest_path"],
+        "mirror_output_path": text_outputs["mirror_output_path"],
+        "mirror_latest_path": text_outputs["mirror_latest_path"],
+        "meta_path": str(paths.meta_path),
         "generated_at": now_text(),
     }
-    meta_path.write_text(json.dumps({**meta, "payload": payload}, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(paths.meta_path, {**meta, "payload": payload})
     print(json.dumps(meta, ensure_ascii=False))
     return 0
 

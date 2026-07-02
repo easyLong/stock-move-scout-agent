@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -91,7 +92,57 @@ def _is_today(day: str) -> bool:
 def load_latest_plate_rows(config: MySqlConfig, cfg: KplPlateDetailConfig) -> list[dict[str, Any]]:
     code_filter = f"AND plate_code={sql_string(cfg.plate_code)}" if cfg.plate_code else ""
     limit_sql = f"LIMIT {max(1, int(cfg.limit))}" if int(cfg.limit or 0) > 0 and not cfg.plate_code else ""
+    min_valid_rows = max(1, min(max(1, int(cfg.limit or 1)), 5))
     sql = f"""
+    WITH valid_snapshots AS (
+      SELECT
+        captured_at,
+        SUM(plate_code REGEXP '^[0-9]+$') AS valid_count
+      FROM kpl_plate_featured_strengths
+      WHERE trade_date={sql_string(cfg.trade_date)}
+      GROUP BY captured_at
+    ),
+    latest AS (
+      SELECT captured_at
+      FROM valid_snapshots
+      WHERE valid_count >= {min_valid_rows}
+      ORDER BY captured_at DESC
+      LIMIT 1
+    )
+    SELECT
+      DATE_FORMAT(s.captured_at, '%Y-%m-%d %H:%i:%s.%f'),
+      s.row_rank,
+      s.plate_code,
+      s.plate_name,
+      s.strength,
+      s.change_pct,
+      s.speed
+    FROM kpl_plate_featured_strengths s
+    JOIN latest l ON l.captured_at=s.captured_at
+    WHERE s.trade_date={sql_string(cfg.trade_date)}
+      AND s.plate_code REGEXP '^[0-9]+$'
+      {code_filter}
+    ORDER BY s.row_rank ASC, s.plate_code ASC
+    {limit_sql};
+    """
+    rows: list[dict[str, Any]] = []
+    for row in mysql_rows(run_mysql(config, sql, batch=True, raw=True)):
+        if len(row) < 7:
+            continue
+        rows.append(
+            {
+                "source_snapshot_at": str(row[0] or "").strip(),
+                "row_rank": int(float(row[1] or 0)),
+                "plate_code": str(row[2] or "").strip(),
+                "plate_name": str(row[3] or "").strip(),
+                "strength": row[4],
+                "change_pct": row[5],
+                "speed": row[6],
+            }
+        )
+    return rows
+    if cfg.plate_code:
+        sql = f"""
     WITH latest AS (
       SELECT MAX(captured_at) AS captured_at
       FROM kpl_plate_featured_strengths
@@ -110,7 +161,120 @@ def load_latest_plate_rows(config: MySqlConfig, cfg: KplPlateDetailConfig) -> li
     WHERE s.trade_date={sql_string(cfg.trade_date)}
       {code_filter}
     ORDER BY s.row_rank ASC, s.plate_code ASC
-    {limit_sql};
+    LIMIT 1;
+    """
+    else:
+        strength_candidate_limit = max(5, int(cfg.limit or 5))
+        candidate_limit = max(10, strength_candidate_limit)
+        sql = f"""
+    WITH latest_by_day AS (
+      SELECT trade_date, MAX(captured_at) AS captured_at
+      FROM kpl_plate_featured_strengths
+      WHERE trade_date <= {sql_string(cfg.trade_date)}
+        AND trade_date >= DATE_SUB({sql_string(cfg.trade_date)}, INTERVAL 21 DAY)
+      GROUP BY trade_date
+    ),
+    latest_snapshot AS (
+      SELECT MAX(captured_at) AS captured_at
+      FROM kpl_plate_featured_strengths
+      WHERE trade_date={sql_string(cfg.trade_date)}
+    ),
+    current_rows AS (
+      SELECT
+        DATE_FORMAT(s.captured_at, '%Y-%m-%d %H:%i:%s.%f') AS source_snapshot_at,
+        s.row_rank,
+        s.plate_code,
+        s.plate_name,
+        s.strength,
+        s.change_pct,
+        s.speed
+      FROM kpl_plate_featured_strengths s
+      JOIN latest_snapshot l ON l.captured_at=s.captured_at
+      WHERE s.trade_date={sql_string(cfg.trade_date)}
+        AND s.row_rank <= {candidate_limit}
+    ),
+    recent_rows AS (
+      SELECT s.trade_date, s.row_rank, s.plate_code, s.strength
+      FROM kpl_plate_featured_strengths s
+      JOIN latest_by_day l
+        ON l.trade_date=s.trade_date
+       AND l.captured_at=s.captured_at
+      WHERE s.row_rank <= 20
+    ),
+    trend_scores AS (
+      SELECT
+        plate_code,
+        COUNT(DISTINCT trade_date) AS trend_days,
+        ROUND(
+          SUM(GREATEST(0, 21 - row_rank) * 1000 + COALESCE(strength, 0)) +
+          COUNT(DISTINCT trade_date) * 100000,
+          4
+        ) AS trend_score
+      FROM recent_rows
+      GROUP BY plate_code
+    ),
+    ranked AS (
+      SELECT
+        c.*,
+        COALESCE(t.trend_days, 0) AS trend_days,
+        COALESCE(t.trend_score, 0) AS trend_score,
+        ROW_NUMBER() OVER (
+          ORDER BY COALESCE(t.trend_score, 0) DESC, COALESCE(c.strength, 0) DESC, c.row_rank ASC, c.plate_code ASC
+        ) AS trend_pick_rank
+      FROM current_rows c
+      LEFT JOIN trend_scores t ON t.plate_code=c.plate_code
+      WHERE c.row_rank > {strength_candidate_limit}
+    ),
+    selected AS (
+      SELECT
+        c.source_snapshot_at,
+        c.row_rank,
+        c.plate_code,
+        c.plate_name,
+        c.strength,
+        c.change_pct,
+        c.speed,
+        'strength_candidate' AS selection_kind,
+        '强度候选' AS selection_label,
+        c.row_rank AS selection_rank,
+        0 AS trend_score,
+        0 AS trend_days,
+        c.row_rank AS selection_sort
+      FROM current_rows c
+      WHERE c.row_rank <= {strength_candidate_limit}
+      UNION ALL
+      SELECT
+        r.source_snapshot_at,
+        r.row_rank,
+        r.plate_code,
+        r.plate_name,
+        r.strength,
+        r.change_pct,
+        r.speed,
+        'trend_top1' AS selection_kind,
+        '趋势Top1' AS selection_label,
+        1 AS selection_rank,
+        r.trend_score,
+        r.trend_days,
+        100 AS selection_sort
+      FROM ranked r
+      WHERE r.trend_pick_rank = 1
+    )
+    SELECT
+      source_snapshot_at,
+      row_rank,
+      plate_code,
+      plate_name,
+      strength,
+      change_pct,
+      speed,
+      selection_kind,
+      selection_label,
+      selection_rank,
+      trend_score,
+      trend_days
+    FROM selected
+    ORDER BY selection_sort ASC, selection_rank ASC, row_rank ASC, plate_code ASC;
     """
     rows: list[dict[str, Any]] = []
     for row in mysql_rows(run_mysql(config, sql, batch=True, raw=True)):
@@ -125,6 +289,11 @@ def load_latest_plate_rows(config: MySqlConfig, cfg: KplPlateDetailConfig) -> li
                 "strength": row[4],
                 "change_pct": row[5],
                 "speed": row[6],
+                "selection_kind": str(row[7] or "manual").strip() if len(row) > 7 else "manual",
+                "selection_label": str(row[8] or "指定板块").strip() if len(row) > 8 else "指定板块",
+                "selection_rank": int(float(row[9] or 0)) if len(row) > 9 and str(row[9]).strip() else 0,
+                "trend_score": row[10] if len(row) > 10 else None,
+                "trend_days": int(float(row[11] or 0)) if len(row) > 11 and str(row[11]).strip() else 0,
             }
         )
     return rows
@@ -237,10 +406,58 @@ def _to_float(value: Any) -> float | None:
         return None
 
 
-def load_replay_reason_text(config: MySqlConfig, *, trade_date: str, plate_code: str, plate_name: str) -> str:
+def _sub_plate_codes(sub_plates: list[dict[str, Any]]) -> list[str]:
+    codes: list[str] = []
+    for item in sub_plates:
+        code = str(item.get("code") or item.get("plate_code") or item.get("sub_plate_code") or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _json_text_list(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value or "[]")
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+def load_featured_plate_codes(config: MySqlConfig, *, trade_date: str, limit: int = 10) -> set[str]:
+    sql = f"""
+    WITH latest AS (
+      SELECT MAX(captured_at) AS captured_at
+      FROM kpl_plate_featured_strengths
+      WHERE trade_date={sql_string(trade_date)}
+    )
+    SELECT plate_code
+    FROM kpl_plate_featured_strengths s
+    JOIN latest l ON l.captured_at=s.captured_at
+    WHERE s.trade_date={sql_string(trade_date)}
+      AND s.row_rank <= {max(1, int(limit))}
+      AND COALESCE(s.plate_code, '') <> '';
+    """
+    try:
+        rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    except Exception:
+        rows = []
+    return {str(row[0] or "").strip() for row in rows if row}
+
+
+def load_replay_reason_text(
+    config: MySqlConfig,
+    *,
+    trade_date: str,
+    plate_code: str,
+    plate_name: str,
+    sub_plates: list[dict[str, Any]],
+) -> str:
     sql = f"""
     SELECT
-      REPLACE(REPLACE(REPLACE(COALESCE(boom_theme, ''), CHAR(13), ' '), CHAR(10), ' '), CHAR(9), ' ') AS boom_theme
+      REPLACE(REPLACE(REPLACE(COALESCE(boom_theme, ''), CHAR(13), ' '), CHAR(10), ' '), CHAR(9), ' ') AS boom_theme,
+      COALESCE(CAST(reason_zscode AS CHAR), '[]') AS reason_zscode
     FROM kpl_replay_limit_theme_stocks
     WHERE trade_date={sql_string(trade_date)}
       AND (theme_code={sql_string(plate_code)} OR theme_name={sql_string(plate_name)})
@@ -255,9 +472,18 @@ def load_replay_reason_text(config: MySqlConfig, *, trade_date: str, plate_code:
     if not rows:
         return ""
 
+    allowed_codes = {str(plate_code or "").strip(), *_sub_plate_codes(sub_plates)}
+    allowed_codes.discard("")
+    competing_plate_codes = load_featured_plate_codes(config, trade_date=trade_date, limit=10)
+    competing_plate_codes.discard(str(plate_code or "").strip())
     boom_lines: list[str] = []
     for row in rows:
         boom_theme = str(row[0] or "").strip() if len(row) > 0 else ""
+        reason_codes = set(_json_text_list(str(row[1] or "[]") if len(row) > 1 else "[]"))
+        if reason_codes and competing_plate_codes.intersection(reason_codes):
+            continue
+        if allowed_codes and reason_codes and not allowed_codes.intersection(reason_codes):
+            continue
         if boom_theme:
             line = _short_text(boom_theme, 140)
             if line and line not in boom_lines:
@@ -357,6 +583,8 @@ def load_top_research_pool_stocks_by_sub_plate(
     config: MySqlConfig,
     *,
     trade_date: str,
+    plate_code: str,
+    plate_name: str,
     sub_plates: list[dict[str, Any]],
     limit: int = 5,
 ) -> list[dict[str, Any]]:
@@ -392,6 +620,33 @@ def load_top_research_pool_stocks_by_sub_plate(
                     "stock_count": len(ranked),
                 }
             )
+    twenty_cm_section_codes = [
+        code
+        for code in [str(plate_code or "").strip(), *_sub_plate_codes(sub_plates)]
+        if code
+    ]
+    twenty_cm_ranked = load_sub_plate_leader_top_stocks(
+        config,
+        trade_date=trade_date,
+        sub_plate_code="20cm",
+        sub_plate_name="双创",
+        sub_plate_rank=len(groups) + 1,
+        sub_plate_strength="科创+创业",
+        limit=limit,
+        section_codes=twenty_cm_section_codes,
+        only_20cm=True,
+    )
+    if twenty_cm_ranked:
+        groups.append(
+            {
+                "sub_plate_rank": len(groups) + 1,
+                "sub_plate_code": "20cm",
+                "sub_plate_name": "双创",
+                "sub_plate_strength": "科创+创业",
+                "stocks": twenty_cm_ranked,
+                "stock_count": len(twenty_cm_ranked),
+            }
+        )
     return groups
 
 
@@ -404,12 +659,27 @@ def load_sub_plate_leader_top_stocks(
     sub_plate_rank: int,
     sub_plate_strength: Any,
     limit: int = 5,
+    section_codes: list[str] | None = None,
+    only_20cm: bool = False,
 ) -> list[dict[str, Any]]:
     day = sql_string(trade_date)
     section = sql_string(sub_plate_code)
+    scope_section_codes = [
+        str(code or "").strip()
+        for code in (section_codes or [sub_plate_code])
+        if str(code or "").strip()
+    ]
+    section_condition = (
+        f"k.section_code IN ({', '.join(sql_string(code) for code in scope_section_codes)})"
+        if scope_section_codes
+        else f"k.section_code={section}"
+    )
+    stock_code_filter = "AND (k.code LIKE '30%' OR k.code LIKE '68%')" if only_20cm else ""
     sql = f"""
     WITH
     scope_codes AS (
+      SELECT *
+      FROM (
       SELECT
         k.code,
         k.stock_name AS name,
@@ -422,14 +692,21 @@ def load_sub_plate_leader_top_stocks(
         k.leader_code,
         k.leader_name,
         k.leader_pct,
-        COALESCE(db.pct_change, 0) AS today_pct
+        COALESCE(db.pct_change, 0) AS today_pct,
+        ROW_NUMBER() OVER (
+          PARTITION BY k.code
+          ORDER BY k.pool_rank ASC, k.section_rank ASC, k.section_score DESC, k.section_code ASC
+        ) AS scope_rn
       FROM kpl_stock_featured_sections k
       LEFT JOIN stock_daily_bars db
         ON db.code=k.code
        AND db.trade_date=CAST({day} AS DATE)
       WHERE k.trade_date=CAST({day} AS DATE)
-        AND k.section_code={section}
+        AND {section_condition}
         AND COALESCE(k.code, '') <> ''
+        {stock_code_filter}
+      ) scoped
+      WHERE scope_rn=1
     ),
     recent_trade_days AS (
       SELECT CAST({day} AS DATE) AS trade_date
@@ -671,27 +948,38 @@ def load_sub_plate_leader_top_stocks(
       LEFT JOIN dimension_summary ds ON ds.code=sc.code
     ),
     ranked AS (
+      SELECT *
+      FROM (
       SELECT
         scored.*,
+        IF(pool_source_kind='five_day_gain_top', 'trend', 'emotion') AS pool_type,
+        IF(pool_source_kind='five_day_gain_top', '趋势票', '情绪票') AS pool_type_label,
         ROW_NUMBER() OVER (
+          PARTITION BY IF(pool_source_kind='five_day_gain_top', 'trend', 'emotion')
           ORDER BY
-            total_score DESC,
-            limit_up_days_score DESC,
-            today_limit_score DESC,
-            first_limit_10d_score DESC,
-            COALESCE(limit_up_days_rank, 999999) ASC,
-            COALESCE(today_limit_rank, 999999) ASC,
-            COALESCE(first_limit_10d_rank, 999999) ASC,
-            today_pct DESC,
+            IF(pool_source_kind='five_day_gain_top', COALESCE(pool_rank, 999999), 0) ASC,
+            IF(pool_source_kind='five_day_gain_top', COALESCE(today_pct, -999), total_score) DESC,
+            IF(pool_source_kind='five_day_gain_top', 0, limit_up_days_score) DESC,
+            IF(pool_source_kind='five_day_gain_top', 0, today_limit_score) DESC,
+            IF(pool_source_kind='five_day_gain_top', 0, first_limit_10d_score) DESC,
+            IF(pool_source_kind='five_day_gain_top', 999999, COALESCE(limit_up_days_rank, 999999)) ASC,
+            IF(pool_source_kind='five_day_gain_top', 999999, COALESCE(today_limit_rank, 999999)) ASC,
+            IF(pool_source_kind='five_day_gain_top', 999999, COALESCE(first_limit_10d_rank, 999999)) ASC,
+            COALESCE(today_pct, -999) DESC,
             code ASC
         ) AS leader_rank
       FROM scored
+      ) ranked_leader
+      WHERE (pool_type='emotion' AND leader_rank <= 3)
+         OR (pool_type='trend' AND leader_rank <= 1)
     )
     SELECT
       r.code,
       r.name,
       r.pool_rank,
       r.pool_source_kind,
+      r.pool_type,
+      r.pool_type_label,
       r.section_rank,
       r.section_score,
       r.leader_code,
@@ -711,34 +999,50 @@ def load_sub_plate_leader_top_stocks(
       r.today_limit_amount_yi,
       r.first_limit_10d_amount_yi,
       r.limit_up_days,
-      COALESCE(cp.company_highlights, '') AS company_highlights,
-      COALESCE(kr.reason_text, sr.reason_text, '') AS kpl_limit_reason,
-      COALESCE(DATE_FORMAT(kr.reason_date, '%Y-%m-%d'), DATE_FORMAT(sr.reason_date, '%Y-%m-%d'), '') AS kpl_limit_reason_date
+      REPLACE(REPLACE(REPLACE(COALESCE(cp.company_highlights, ''), CHAR(13), ' '), CHAR(10), ' '), CHAR(9), ' ') AS company_highlights,
+      COALESCE((
+        SELECT REPLACE(REPLACE(REPLACE(x.reason_text, CHAR(13), ' '), CHAR(10), ' '), CHAR(9), ' ')
+        FROM kpl_replay_limit_theme_stocks x
+        WHERE x.code=r.code
+          AND x.trade_date <= CAST({day} AS DATE)
+          AND x.reason_date <= CAST({day} AS DATE)
+          AND x.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+          AND COALESCE(x.reason_text, '') <> ''
+        ORDER BY x.reason_date DESC, x.captured_at DESC, x.theme_rank ASC
+        LIMIT 1
+      ), (
+        SELECT REPLACE(REPLACE(REPLACE(x.reason_text, CHAR(13), ' '), CHAR(10), ' '), CHAR(9), ' ')
+        FROM kpl_stock_limit_up_reasons x
+        WHERE x.code=r.code
+          AND x.reason_date <= CAST({day} AS DATE)
+          AND x.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+          AND COALESCE(x.reason_text, '') <> ''
+        ORDER BY x.reason_date DESC, x.captured_at DESC
+        LIMIT 1
+      ), '') AS kpl_limit_reason,
+      COALESCE((
+        SELECT DATE_FORMAT(x.reason_date, '%Y-%m-%d')
+        FROM kpl_replay_limit_theme_stocks x
+        WHERE x.code=r.code
+          AND x.trade_date <= CAST({day} AS DATE)
+          AND x.reason_date <= CAST({day} AS DATE)
+          AND x.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+          AND COALESCE(x.reason_text, '') <> ''
+        ORDER BY x.reason_date DESC, x.captured_at DESC, x.theme_rank ASC
+        LIMIT 1
+      ), (
+        SELECT DATE_FORMAT(x.reason_date, '%Y-%m-%d')
+        FROM kpl_stock_limit_up_reasons x
+        WHERE x.code=r.code
+          AND x.reason_date <= CAST({day} AS DATE)
+          AND x.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
+          AND COALESCE(x.reason_text, '') <> ''
+        ORDER BY x.reason_date DESC, x.captured_at DESC
+        LIMIT 1
+      ), '') AS kpl_limit_reason_date
     FROM ranked r
     LEFT JOIN stock_company_profiles cp ON cp.code=r.code
-    LEFT JOIN LATERAL (
-      SELECT x.reason_text, x.reason_date
-      FROM kpl_replay_limit_theme_stocks x
-      WHERE x.code=r.code
-        AND x.trade_date <= CAST({day} AS DATE)
-        AND x.reason_date <= CAST({day} AS DATE)
-        AND x.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
-        AND COALESCE(x.reason_text, '') <> ''
-      ORDER BY x.reason_date DESC, x.captured_at DESC, x.theme_rank ASC
-      LIMIT 1
-    ) kr ON TRUE
-    LEFT JOIN LATERAL (
-      SELECT x.reason_text, x.reason_date
-      FROM kpl_stock_limit_up_reasons x
-      WHERE x.code=r.code
-        AND x.reason_date <= CAST({day} AS DATE)
-        AND x.reason_date >= DATE_SUB(CAST({day} AS DATE), INTERVAL 10 DAY)
-        AND COALESCE(x.reason_text, '') <> ''
-      ORDER BY x.reason_date DESC, x.captured_at DESC
-      LIMIT 1
-    ) sr ON TRUE
-    WHERE r.leader_rank <= {max(1, int(limit))}
-    ORDER BY r.leader_rank ASC;
+    ORDER BY IF(r.pool_type='trend', 1, 0) ASC, r.leader_rank ASC;
     """
     try:
         rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
@@ -748,6 +1052,8 @@ def load_sub_plate_leader_top_stocks(
     for row in rows:
         if len(row) < 26:
             continue
+        if len(row) < 28:
+            row = [*row, *([""] * (28 - len(row)))]
         code = str(row[0] or "").strip()
         if not code:
             continue
@@ -756,32 +1062,34 @@ def load_sub_plate_leader_top_stocks(
             "stock_name": str(row[1] or "").strip(),
             "pool_rank": _to_int(row[2]),
             "pool_source_kind": str(row[3] or "").strip(),
+            "pool_type": str(row[4] or "").strip(),
+            "pool_type_label": str(row[5] or "").strip(),
             "sub_plate_rank": int(sub_plate_rank),
             "sub_plate_code": str(sub_plate_code),
             "sub_plate_name": str(sub_plate_name),
             "sub_plate_strength": sub_plate_strength,
-            "section_rank": _to_int(row[4]),
-            "section_score": _to_float(row[5]),
-            "leader_code": str(row[6] or "").strip(),
-            "leader_name": str(row[7] or "").strip(),
-            "leader_pct": _to_float(row[8]),
-            "today_pct": _to_float(row[9]),
-            "total_score": _to_int(row[10]),
-            "today_limit_score": _to_int(row[11]),
-            "first_limit_10d_score": _to_int(row[12]),
-            "limit_up_days_score": _to_int(row[13]),
-            "today_limit_rank": _to_int(row[14]) or None,
-            "first_limit_10d_rank": _to_int(row[15]) or None,
-            "limit_up_days_rank": _to_int(row[16]) or None,
-            "today_limit_time": str(row[17] or "").strip(),
-            "first_limit_10d_time": str(row[18] or "").strip(),
-            "limit_up_days_text": str(row[19] or "").strip(),
-            "today_limit_amount_yi": _to_float(row[20]),
-            "first_limit_10d_amount_yi": _to_float(row[21]),
-            "limit_up_days": _to_float(row[22]),
-            "company_highlights": str(row[23] or "").strip(),
-            "kpl_limit_reason": str(row[24] or "").strip(),
-            "kpl_limit_reason_date": str(row[25] or "").strip(),
+            "section_rank": _to_int(row[6]),
+            "section_score": _to_float(row[7]),
+            "leader_code": str(row[8] or "").strip(),
+            "leader_name": str(row[9] or "").strip(),
+            "leader_pct": _to_float(row[10]),
+            "today_pct": _to_float(row[11]),
+            "total_score": _to_int(row[12]),
+            "today_limit_score": _to_int(row[13]),
+            "first_limit_10d_score": _to_int(row[14]),
+            "limit_up_days_score": _to_int(row[15]),
+            "today_limit_rank": _to_int(row[16]) or None,
+            "first_limit_10d_rank": _to_int(row[17]) or None,
+            "limit_up_days_rank": _to_int(row[18]) or None,
+            "today_limit_time": str(row[19] or "").strip(),
+            "first_limit_10d_time": str(row[20] or "").strip(),
+            "limit_up_days_text": str(row[21] or "").strip(),
+            "today_limit_amount_yi": _to_float(row[22]),
+            "first_limit_10d_amount_yi": _to_float(row[23]),
+            "limit_up_days": _to_float(row[24]),
+            "company_highlights": str(row[25] or "").strip(),
+            "kpl_limit_reason": str(row[26] or "").strip(),
+            "kpl_limit_reason_date": str(row[27] or "").strip(),
         }
         item["dimensions"] = _leader_dimensions(item)
         ranked.append(item)
@@ -913,20 +1221,16 @@ def collect_kpl_plate_details(config: MySqlConfig, cfg: KplPlateDetailConfig) ->
                     trade_date=cfg.trade_date,
                     plate_code=code,
                     plate_name=str(plate.get("plate_name") or ""),
+                    sub_plates=sub_plates,
                 )
                 reason_source = "kpl_replay_limit_theme_stocks" if reason_text else ""
             if not reason_text:
-                skipped.append(
-                    {
-                        "plate_code": code,
-                        "plate_name": str(plate.get("plate_name") or ""),
-                        "reason": "empty_reason",
-                    }
-                )
-                continue
+                reason_source = "empty_reason"
             top_stock_groups = load_top_research_pool_stocks_by_sub_plate(
                 config,
                 trade_date=cfg.trade_date,
+                plate_code=code,
+                plate_name=str(plate.get("plate_name") or ""),
                 sub_plates=sub_plates,
                 limit=5,
             )
@@ -935,12 +1239,12 @@ def collect_kpl_plate_details(config: MySqlConfig, cfg: KplPlateDetailConfig) ->
                 for group in top_stock_groups
                 for stock in (group.get("stocks") or [])
             ]
-            if not top_stock_groups:
+            if not top_stock_groups and not sub_plates:
                 skipped.append(
                     {
                         "plate_code": code,
                         "plate_name": str(plate.get("plate_name") or ""),
-                        "reason": "empty_research_pool_top_stocks",
+                        "reason": "empty_sub_plates_and_research_pool_top_stocks",
                     }
                 )
                 continue
@@ -954,7 +1258,7 @@ def collect_kpl_plate_details(config: MySqlConfig, cfg: KplPlateDetailConfig) ->
                     "raw_json": {
                         "son_plate_info": payload,
                         "reason_source": reason_source,
-                        "top_stock_rule": "top2_sub_plates -> each sub-plate kpl_stock_featured_sections research-pool intersection -> pool_rank top5",
+                        "top_stock_rule": "top2_sub_plates plus fixed dual-growth group -> each group kpl_stock_featured_sections research-pool intersection -> emotion top3 + trend top1",
                     },
                 }
             )

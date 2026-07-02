@@ -75,6 +75,41 @@ def close_row_count(config: Any, trade_date: str) -> int:
         return 0
 
 
+def daily_bars_refresh_status(config: Any, trade_date: str, *, min_rows: int) -> dict[str, Any]:
+    sql = f"""
+    SELECT
+      COUNT(*) AS row_count,
+      COALESCE(SUM(IF(b.source='akshare_stock_zh_a_spot_em_close', 1, 0)), 0) AS spot_count,
+      COALESCE(SUM(IF(
+        b.source='akshare_stock_zh_a_spot_em_close'
+        AND b.updated_at < TIMESTAMP({sql_string(trade_date)}, '15:00:00'),
+        1,
+        0
+      )), 0) AS early_spot_count
+    FROM stock_daily_bars b
+    JOIN stocks s ON s.code=b.code
+    WHERE b.trade_date={sql_string(trade_date)}
+      AND b.close_price IS NOT NULL
+      AND b.code REGEXP {sql_string(MAIN_A_PREFIX_REGEXP)}
+      AND COALESCE(s.is_st, 0)=0
+      AND s.name NOT LIKE '%ST%'
+      AND s.name NOT LIKE '%閫€甯?'
+      AND COALESCE(b.stock_name, '') NOT LIKE '%ST%'
+      AND COALESCE(b.stock_name, '') NOT LIKE '%閫€甯?';
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    row = rows[0] if rows else []
+    row_count = int(row[0] or 0) if len(row) >= 1 else 0
+    spot_count = int(row[1] or 0) if len(row) >= 2 else 0
+    early_spot_count = int(row[2] or 0) if len(row) >= 3 else 0
+    return {
+        "row_count": row_count,
+        "spot_count": spot_count,
+        "early_spot_count": early_spot_count,
+        "needs_refresh": row_count < int(min_rows) or early_spot_count > 50,
+    }
+
+
 def load_previous_close_map(config: Any, trade_date: str) -> dict[str, float]:
     sql = f"""
     SELECT b.code, b.close_price
@@ -168,6 +203,18 @@ def refresh_daily_bars(config: Any, trade_date: str, *, workers: int, batch_size
 
 
 def refresh_daily_bars_from_spot(config: Any, trade_date: str) -> dict[str, Any]:
+    try:
+        trade_day = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    except ValueError:
+        trade_day = None
+    now = datetime.now()
+    if trade_day != now.date() or now < datetime.strptime(f"{trade_date} 15:00:00", "%Y-%m-%d %H:%M:%S"):
+        return {
+            "skipped": True,
+            "reason": "spot_snapshot_not_confirmed_for_trade_date",
+            "trade_date": trade_date,
+            "now": now_text(),
+        }
     source, df = fetch_spot_frame("auto")
     rows: list[dict[str, Any]] = []
     for row in normalize_rows(df, include_bj=False, include_st=False):
@@ -265,23 +312,35 @@ def main() -> int:
     attempts: list[dict[str, Any]] = []
     result: dict[str, Any] = {}
     while True:
-        before_rows = close_row_count(config, args.trade_date)
+        before_status = daily_bars_refresh_status(config, args.trade_date, min_rows=args.min_rows)
+        before_rows = int(before_status["row_count"])
         fetch_result: dict[str, Any] = {"skipped": True, "reason": "refresh_disabled_or_already_complete"}
-        if not args.no_refresh_bars and before_rows < int(args.min_rows):
+        if not args.no_refresh_bars and bool(before_status["needs_refresh"]):
             spot_result = try_refresh_daily_bars_from_spot(config, args.trade_date)
-            after_spot_rows = close_row_count(config, args.trade_date)
-            if after_spot_rows < int(args.min_rows):
+            after_spot_status = daily_bars_refresh_status(config, args.trade_date, min_rows=args.min_rows)
+            if bool(after_spot_status["needs_refresh"]):
                 per_stock_result = refresh_daily_bars(config, args.trade_date, workers=args.workers, batch_size=args.batch_size)
             else:
                 per_stock_result = {"skipped": True, "reason": "spot_rows_sufficient"}
-            fetch_result = {"spot": spot_result, "per_stock": per_stock_result}
-        after_rows = close_row_count(config, args.trade_date)
+            fetch_result = {"before_status": before_status, "spot": spot_result, "after_spot_status": after_spot_status, "per_stock": per_stock_result}
+        after_status = daily_bars_refresh_status(config, args.trade_date, min_rows=args.min_rows)
+        after_rows = int(after_status["row_count"])
         result = build_daily_close_snapshot(
             config,
             args.trade_date,
             min_rows=args.min_rows,
         )
-        attempts.append({"at": now_text(), "before_rows": before_rows, "after_rows": after_rows, "fetch": fetch_result, "result": result})
+        attempts.append(
+            {
+                "at": now_text(),
+                "before_rows": before_rows,
+                "after_rows": after_rows,
+                "before_status": before_status,
+                "after_status": after_status,
+                "fetch": fetch_result,
+                "result": result,
+            }
+        )
         if result.get("ok") or time.monotonic() >= deadline:
             break
         time.sleep(max(10, int(args.retry_seconds)))

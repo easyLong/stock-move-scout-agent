@@ -5,6 +5,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from stock_move_scout.db import MySqlConfig, sql_string
+from stock_move_scout.research_pool import normalize_research_pool_ma_mode, research_pool_system_label
 from stock_move_scout.web.runtime import json_query
 
 
@@ -48,9 +49,10 @@ def service_market_phase(service_trade_date: str) -> dict[str, str]:
     return {"phase": "after_close_pending", "phase_label": "盘后确认中"}
 
 
-def build_service_context(config: MySqlConfig, service_trade_date: str) -> dict[str, Any]:
+def build_service_context(config: MySqlConfig, service_trade_date: str, *, ma_mode: str = "") -> dict[str, Any]:
     phase = service_market_phase(service_trade_date)
     day = sql_string(service_trade_date)
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
     sql = f"""
     SELECT JSON_OBJECT(
       'service_trade_date', DATE_FORMAT({day}, '%Y-%m-%d'),
@@ -114,6 +116,9 @@ def build_service_context(config: MySqlConfig, service_trade_date: str) -> dict[
         {
             "service_trade_date": str(context.get("service_trade_date") or service_trade_date),
             "base_trade_date": base_trade_date,
+            "research_pool_ma_mode": resolved_ma_mode,
+            "research_pool_system": "bull" if resolved_ma_mode != "none" else "bear",
+            "research_pool_system_label": research_pool_system_label(resolved_ma_mode),
             "phase": phase["phase"],
             "phase_label": phase["phase_label"],
             "base_data_label": f"基于 {base_trade_date} 收盘",

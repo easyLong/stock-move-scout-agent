@@ -7,6 +7,8 @@
 | 文档 | 内容 |
 | --- | --- |
 | `project_architecture.md` | 当前整体架构、分层职责、核心数据链路 |
+| `architecture_refactor.md` | 新一轮松耦合重构准则、pipeline 边界、后续拆分路线 |
+| `morning_reference_workflow.md` | 早盘帖子 workflow、事实输入、产物路径、写作规则 |
 | `data_sources.md` | 数据源、刷新周期、落库表、使用位置 |
 | `evidence_layer.md` | 有效事实层、模型总结层、根证据缓存 |
 | `mysql_schema.md` | 主要表按职责分组说明 |

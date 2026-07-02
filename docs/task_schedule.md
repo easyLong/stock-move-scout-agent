@@ -34,7 +34,7 @@
 | 16:05 | `ths_homepage_headline_freeze` | 同花顺首页题材 | 冻结同花顺题材快照 |
 | 16:05 | `market_width_daily_close` | AkShare 日 K | 生成收盘市场概览 |
 | 16:10 | `ths_market_after_close_summary` | 同花顺盘后小结 | 早参市场背景 |
-| 16:25 | `research_pool_snapshot` | 涨停池、日 K | 生成当日研究池 |
+| 16:25 | `research_pool_snapshot` | 涨停池、日 K、MA5/10/20/30 | 生成当日精细研究池 |
 | 16:30 | `ths_stock_concepts` | 研究池 | 增量刷新个股概念解释 |
 | 20:05 | `kpl_limit_up_reasons` | 研究池 | 采集开盘啦个股涨停原因 |
 | 20:15 | `kpl_replay_limit_themes` | 开盘啦复盘啦 | 采集涨停原因分组和主归因 |

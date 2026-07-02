@@ -18,6 +18,7 @@ COMMANDS = {
     "judgements": "build_stock_move_judgements.py",
     "anchor-roles": "build_anchor_realtime_roles.py",
     "async-evidence": "summarize_async_evidence.py",
+    "rebuild-history": "rebuild_history_week.py",
 }
 
 

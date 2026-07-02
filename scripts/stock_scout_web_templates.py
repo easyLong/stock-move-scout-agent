@@ -150,6 +150,31 @@ HTML = r"""<!doctype html>
       border-color: #bfdbfe;
       color: var(--accent);
     }
+    .pool-toggle {
+      display: inline-flex;
+      gap: 2px;
+      height: 32px;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .pool-toggle button {
+      min-width: 48px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #475569;
+      padding: 0 9px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 750;
+      cursor: pointer;
+    }
+    .pool-toggle button.active {
+      background: #1f2937;
+      color: #fff;
+    }
     .intel-layout {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 360px;
@@ -1713,6 +1738,10 @@ HTML = r"""<!doctype html>
   <main>
     <div class="toolbar">
       <select class="date-picker" id="tradeDateSelect" aria-label="选择交易日"></select>
+      <div class="pool-toggle" role="group" aria-label="研究池系统">
+        <button id="bearPoolBtn" type="button" data-pool-mode="bear">熊市</button>
+        <button id="bullPoolBtn" type="button" data-pool-mode="bull">牛市</button>
+      </div>
       <button class="toolbtn" id="latestBtn" type="button">最近交易日</button>
     </div>
     <div class="summarybar" id="summarybar"></div>
@@ -1746,6 +1775,38 @@ HTML = r"""<!doctype html>
     const detailCache = new Map();
     const activeDetailTheme = new Map();
     let detailRequestSeq = 0;
+    const POOL_MODE_KEY = "stock_scout_pool_mode";
+    function queryPoolMode() {
+      const raw = clean(new URLSearchParams(window.location.search).get("pool_mode"));
+      if (raw === "bull" || raw === "bear") return raw;
+      try {
+        const saved = clean(localStorage.getItem(POOL_MODE_KEY));
+        if (saved === "bull" || saved === "bear") return saved;
+      } catch (error) {}
+      return "bear";
+    }
+    function syncPoolButtons() {
+      const mode = queryPoolMode();
+      ["bearPoolBtn", "bullPoolBtn"].forEach(id => {
+        const button = $(id);
+        if (button) button.classList.toggle("active", button.dataset.poolMode === mode);
+      });
+    }
+    function setPoolMode(mode, replace = false) {
+      const next = mode === "bull" ? "bull" : "bear";
+      try { localStorage.setItem(POOL_MODE_KEY, next); } catch (error) {}
+      const url = new URL(window.location.href);
+      url.searchParams.set("pool_mode", next);
+      const method = replace ? "replaceState" : "pushState";
+      window.history[method]({}, "", `${url.pathname}${url.search}${url.hash}`);
+      detailCache.clear();
+      syncPoolButtons();
+      refresh();
+    }
+    function appendPoolMode(params) {
+      params.set("pool_mode", queryPoolMode());
+      return params;
+    }
     function rowKey(row) {
       return [row.kind, row.event_time, row.code, row.title].map(clean).join("|");
     }
@@ -1790,6 +1851,7 @@ HTML = r"""<!doctype html>
       const serviceDate = ctx.service_trade_date || data.trade_date || "最近交易日";
       const chips = [
         `${serviceDate} ${ctx.phase_label || "观察"}`,
+        ctx.research_pool_system_label ? `研究池 ${ctx.research_pool_system_label}` : "",
         ctx.base_trade_date ? `底稿 ${ctx.base_trade_date} 收盘` : "",
         ctx.latest_realtime_at ? `实时 ${timeText(ctx.latest_realtime_at)}` : "",
         ctx.root_cache_updated_at ? `证据缓存 ${timeText(ctx.root_cache_updated_at)}` : "",
@@ -3315,8 +3377,9 @@ HTML = r"""<!doctype html>
     }
     function feedUrl() {
       const tradeDate = clean($("tradeDateSelect").value || queryTradeDate());
-      if (!tradeDate) return "/api/feed";
-      return `/api/feed?trade_date=${encodeURIComponent(tradeDate)}`;
+      const params = appendPoolMode(new URLSearchParams());
+      if (tradeDate) params.set("trade_date", tradeDate);
+      return `/api/feed?${params.toString()}`;
     }
     function detailUrl(row) {
       const tradeDate = clean($("tradeDateSelect").value || queryTradeDate());
@@ -3325,6 +3388,7 @@ HTML = r"""<!doctype html>
       params.set("kind", clean(row.kind));
       params.set("event_time", clean(row.event_time));
       params.set("code", clean(row.code));
+      appendPoolMode(params);
       return `/api/feed/detail?${params.toString()}`;
     }
     function renderDetailLoading(row) {
@@ -3409,6 +3473,9 @@ HTML = r"""<!doctype html>
       setTradeDateParam($("tradeDateSelect").value);
       refresh();
     });
+    ["bearPoolBtn", "bullPoolBtn"].forEach(id => {
+      $(id).addEventListener("click", event => setPoolMode(event.currentTarget.dataset.poolMode || "bear"));
+    });
     $("latestBtn").addEventListener("click", () => {
       const target = latestTradeDate || availableDates[0] || "";
       renderTradeDates(target);
@@ -3440,6 +3507,7 @@ HTML = r"""<!doctype html>
       loadDetail(currentFeed.find(row => rowKey(row) === selectedKey));
       renderList("feed", currentFeed, "暂无情报");
     });
+    syncPoolButtons();
     loadTradeDates().then(refresh);
     setInterval(refresh, 15000);
   </script>
@@ -3521,6 +3589,31 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
     .btn:hover {
       color: var(--blue);
       border-color: #bfdbfe;
+    }
+    .pool-toggle {
+      display: inline-flex;
+      gap: 2px;
+      height: 32px;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .pool-toggle button {
+      min-width: 48px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #475569;
+      padding: 0 9px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 750;
+      cursor: pointer;
+    }
+    .pool-toggle button.active {
+      background: #1f2937;
+      color: #fff;
     }
     .date-nav {
       display: inline-flex;
@@ -4117,6 +4210,10 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
         <input id="tradeDate" class="date-input" type="date" />
         <button id="nextDateBtn" class="btn date-step" type="button" title="Next trading day" aria-label="Next trading day">›</button>
       </div>
+      <div class="pool-toggle" role="group" aria-label="研究池系统">
+        <button id="bearPoolBtn" type="button" data-pool-mode="bear">熊市</button>
+        <button id="bullPoolBtn" type="button" data-pool-mode="bull">牛市</button>
+      </div>
       <button id="refreshBtn" class="btn" type="button">刷新</button>
       <a class="btn" href="/">异动情报流</a>
       <a class="btn" href="/leaders">领头羊</a>
@@ -4250,6 +4347,37 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       }
     ];
     const dateState = { dates: [], loaded: false };
+    const POOL_MODE_KEY = "stock_scout_pool_mode";
+    function queryPoolMode() {
+      const raw = clean(new URLSearchParams(window.location.search).get("pool_mode"));
+      if (raw === "bull" || raw === "bear") return raw;
+      try {
+        const saved = clean(localStorage.getItem(POOL_MODE_KEY));
+        if (saved === "bull" || saved === "bear") return saved;
+      } catch (error) {}
+      return "bear";
+    }
+    function syncPoolButtons() {
+      const mode = queryPoolMode();
+      ["bearPoolBtn", "bullPoolBtn"].forEach(id => {
+        const button = $(id);
+        if (button) button.classList.toggle("active", button.dataset.poolMode === mode);
+      });
+    }
+    function setPoolMode(mode, replace = false) {
+      const next = mode === "bull" ? "bull" : "bear";
+      try { localStorage.setItem(POOL_MODE_KEY, next); } catch (error) {}
+      const url = new URL(window.location.href);
+      url.searchParams.set("pool_mode", next);
+      const method = replace ? "replaceState" : "pushState";
+      window.history[method]({}, "", `${url.pathname}${url.search}${url.hash}`);
+      syncPoolButtons();
+      load();
+    }
+    function appendPoolMode(params) {
+      params.set("pool_mode", queryPoolMode());
+      return params;
+    }
     function queryTradeDate() {
       return clean(new URLSearchParams(window.location.search).get("trade_date"));
     }
@@ -4825,6 +4953,7 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       try {
         const params = new URLSearchParams();
         if (queryDate()) params.set("trade_date", queryDate());
+        appendPoolMode(params);
         const response = await fetch(`/api/market-width?${params.toString()}`, { cache: "no-store" });
         const data = await response.json();
         const latest = normalizeWidthRow(data.latest || {});
@@ -4845,9 +4974,13 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
       }
     }
     $("refreshBtn").addEventListener("click", load);
+    ["bearPoolBtn", "bullPoolBtn"].forEach(id => {
+      $(id).addEventListener("click", event => setPoolMode(event.currentTarget.dataset.poolMode || "bear"));
+    });
     $("tradeDate").addEventListener("change", event => setTradeDate(event.target.value));
     $("prevDateBtn").addEventListener("click", () => stepTradeDate(-1));
     $("nextDateBtn").addEventListener("click", () => stepTradeDate(1));
+    syncPoolButtons();
     loadTradeDates();
     load();
     setInterval(load, 60000);
@@ -4928,6 +5061,31 @@ LEADERS_HTML = r"""<!doctype html>
       justify-content: center;
       cursor: pointer;
       font-weight: 750;
+    }
+    .pool-toggle {
+      display: inline-flex;
+      gap: 2px;
+      height: 32px;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .pool-toggle button {
+      min-width: 48px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #475569;
+      padding: 0 9px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 750;
+      cursor: pointer;
+    }
+    .pool-toggle button.active {
+      background: #1f2937;
+      color: #fff;
     }
     .date-nav {
       display: inline-flex;
@@ -5584,6 +5742,10 @@ LEADERS_HTML = r"""<!doctype html>
         <input id="tradeDate" class="date-input" type="date" />
         <button id="nextDateBtn" class="btn date-step" type="button" title="Next trading day" aria-label="Next trading day">›</button>
       </div>
+      <div class="pool-toggle" role="group" aria-label="研究池系统">
+        <button id="bearPoolBtn" type="button" data-pool-mode="bear">熊市</button>
+        <button id="bullPoolBtn" type="button" data-pool-mode="bull">牛市</button>
+      </div>
       <button id="refreshBtn" class="btn" type="button">刷新</button>
       <a class="btn" href="/">异动情报流</a>
       <a class="btn" href="/market-width">市场概览</a>
@@ -5659,6 +5821,37 @@ LEADERS_HTML = r"""<!doctype html>
     const dimOrder = { today_limit: 1, first_limit_10d: 2, limit_up_days: 3, trend_strength: 4, pool_rank: 5, first_limit: 6, "3d": 7, "5d": 8, "10d": 9 };
     const state = { scopes: [], activeKey: "", filter: "" };
     const dateState = { dates: [], loaded: false };
+    const POOL_MODE_KEY = "stock_scout_pool_mode";
+    function queryPoolMode() {
+      const raw = clean(new URLSearchParams(window.location.search).get("pool_mode"));
+      if (raw === "bull" || raw === "bear") return raw;
+      try {
+        const saved = clean(localStorage.getItem(POOL_MODE_KEY));
+        if (saved === "bull" || saved === "bear") return saved;
+      } catch (error) {}
+      return "bear";
+    }
+    function syncPoolButtons() {
+      const mode = queryPoolMode();
+      ["bearPoolBtn", "bullPoolBtn"].forEach(id => {
+        const button = $(id);
+        if (button) button.classList.toggle("active", button.dataset.poolMode === mode);
+      });
+    }
+    function setPoolMode(mode, replace = false) {
+      const next = mode === "bull" ? "bull" : "bear";
+      try { localStorage.setItem(POOL_MODE_KEY, next); } catch (error) {}
+      const url = new URL(window.location.href);
+      url.searchParams.set("pool_mode", next);
+      const method = replace ? "replaceState" : "pushState";
+      window.history[method]({}, "", `${url.pathname}${url.search}${url.hash}`);
+      syncPoolButtons();
+      load();
+    }
+    function appendPoolMode(params) {
+      params.set("pool_mode", queryPoolMode());
+      return params;
+    }
     function queryTradeDate() {
       return clean(new URLSearchParams(window.location.search).get("trade_date"));
     }
@@ -6006,6 +6199,7 @@ LEADERS_HTML = r"""<!doctype html>
       try {
         const params = new URLSearchParams();
         if (queryDate()) params.set("trade_date", queryDate());
+        appendPoolMode(params);
         const response = await fetch(`/api/leaders?${params.toString()}`, { cache: "no-store" });
         const data = await response.json();
         try { window.__leaderDataTradeDate = data.leader_data_trade_date || data.leader_data_trade_day || ""; } catch (error) {}
@@ -6027,6 +6221,9 @@ LEADERS_HTML = r"""<!doctype html>
       }
     }
     $("refreshBtn").addEventListener("click", load);
+    ["bearPoolBtn", "bullPoolBtn"].forEach(id => {
+      $(id).addEventListener("click", event => setPoolMode(event.currentTarget.dataset.poolMode || "bear"));
+    });
     $("tradeDate").addEventListener("change", event => setTradeDate(event.target.value));
     $("prevDateBtn").addEventListener("click", () => stepTradeDate(-1));
     $("nextDateBtn").addEventListener("click", () => stepTradeDate(1));
@@ -6042,6 +6239,7 @@ LEADERS_HTML = r"""<!doctype html>
       const button = event.target.closest(".theme-tab");
       if (button) selectScope(button.dataset.scopeKey || "");
     });
+    syncPoolButtons();
     loadTradeDates();
     load();
   </script>
@@ -6143,6 +6341,31 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
       justify-content: center;
       cursor: pointer;
       font-weight: 750;
+    }
+    .pool-toggle {
+      display: inline-flex;
+      gap: 2px;
+      height: 32px;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+    .pool-toggle button {
+      min-width: 48px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: #475569;
+      padding: 0 9px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 750;
+      cursor: pointer;
+    }
+    .pool-toggle button.active {
+      background: #1f2937;
+      color: #fff;
     }
     .date-nav {
       display: inline-flex;
@@ -6248,7 +6471,7 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
     }
     .plate-tab {
       width: 100%;
-      min-height: 78px;
+      min-height: 88px;
       border: 1px solid #e8edf4;
       border-radius: 8px;
       background: #fff;
@@ -6324,6 +6547,31 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
       font-size: 12px;
       font-weight: 900;
       font-variant-numeric: tabular-nums;
+    }
+    .tab-tags {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+      min-height: 20px;
+    }
+    .selection-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 20px;
+      border: 1px solid #dbeafe;
+      border-radius: 999px;
+      background: #eff6ff;
+      color: #1d4ed8;
+      padding: 0 7px;
+      font-size: 11px;
+      font-weight: 850;
+      white-space: nowrap;
+    }
+    .selection-badge.trend {
+      border-color: #fde68a;
+      background: #fffbeb;
+      color: #92400e;
     }
     .tab-sub {
       display: flex;
@@ -6450,7 +6698,7 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
     }
     .subplates {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 8px;
       padding: 12px 14px 0;
     }
@@ -6658,7 +6906,10 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
       .meta { justify-content: flex-start; }
       .overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .overview-cell:nth-child(2) { border-right: 0; }
-      .subplates { grid-template-columns: 1fr; }
+      .subplates { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .subplate { padding: 8px 6px; }
+      .subplate strong { font-size: 12px; }
+      .subplate small { font-size: 11px; }
       .stock-row {
         grid-template-columns: 46px minmax(0, 1fr);
       }
@@ -6677,6 +6928,10 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
         <button id="prevDateBtn" class="btn date-step" type="button" title="Prev trading day" aria-label="Prev trading day">‹</button>
         <input id="tradeDate" class="date-input" type="date" />
         <button id="nextDateBtn" class="btn date-step" type="button" title="Next trading day" aria-label="Next trading day">›</button>
+      </div>
+      <div class="pool-toggle" role="group" aria-label="研究池系统">
+        <button id="bearPoolBtn" type="button" data-pool-mode="bear">熊市</button>
+        <button id="bullPoolBtn" type="button" data-pool-mode="bull">牛市</button>
       </div>
       <button id="refreshBtn" class="btn" type="button">刷新</button>
       <a class="btn" href="/">异动情报流</a>
@@ -6720,6 +6975,37 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
     };
     const state = { plates: [], activeKey: "", filter: "" };
     const dateState = { dates: [], loaded: false };
+    const POOL_MODE_KEY = "stock_scout_pool_mode";
+    function queryPoolMode() {
+      const raw = clean(new URLSearchParams(window.location.search).get("pool_mode"));
+      if (raw === "bull" || raw === "bear") return raw;
+      try {
+        const saved = clean(localStorage.getItem(POOL_MODE_KEY));
+        if (saved === "bull" || saved === "bear") return saved;
+      } catch (error) {}
+      return "bear";
+    }
+    function syncPoolButtons() {
+      const mode = queryPoolMode();
+      ["bearPoolBtn", "bullPoolBtn"].forEach(id => {
+        const button = $(id);
+        if (button) button.classList.toggle("active", button.dataset.poolMode === mode);
+      });
+    }
+    function setPoolMode(mode, replace = false) {
+      const next = mode === "bull" ? "bull" : "bear";
+      try { localStorage.setItem(POOL_MODE_KEY, next); } catch (error) {}
+      const url = new URL(window.location.href);
+      url.searchParams.set("pool_mode", next);
+      const method = replace ? "replaceState" : "pushState";
+      window.history[method]({}, "", `${url.pathname}${url.search}${url.hash}`);
+      syncPoolButtons();
+      load();
+    }
+    function appendPoolMode(params) {
+      params.set("pool_mode", queryPoolMode());
+      return params;
+    }
     function timeText(value) {
       if (!value) return "";
       const parts = String(value).split(" ");
@@ -6737,6 +7023,51 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
     }
     function plateKey(plate) {
       return clean(plate.plate_code) || clean(plate.plate_name) || String(plate.rank || "");
+    }
+    function selectionKind(plate) {
+      return clean(plate.selection_kind) || (Number(plate.rank || 0) <= 3 ? "strength_top3" : "trend_top1");
+    }
+    function selectionLabel(plate) {
+      return clean(plate.selection_label) || (selectionKind(plate) === "trend_top1" ? "趋势Top1" : "强度Top3");
+    }
+    function selectionOrder(plate) {
+      return selectionKind(plate) === "trend_top1" ? 1 : 0;
+    }
+    function selectionRank(plate) {
+      const value = Number(plate.selection_rank || 0);
+      return Number.isFinite(value) && value > 0 ? value : (selectionOrder(plate) === 0 ? Number(plate.rank || 999999) : 1);
+    }
+    function selectionBadge(plate) {
+      return "";
+      const trend = selectionKind(plate) === "trend_top1";
+      return `<span class="selection-badge${trend ? " trend" : ""}">${esc(selectionLabel(plate))}</span>`;
+    }
+    function plateStrengthSort(a, b) {
+      return Number(b.strength || 0) - Number(a.strength || 0)
+        || Number(a.rank || 999999) - Number(b.rank || 999999);
+    }
+    function plateTrendSort(a, b) {
+      return Number(b.trend_score || 0) - Number(a.trend_score || 0)
+        || Number(b.strength || 0) - Number(a.strength || 0)
+        || Number(a.rank || 999999) - Number(b.rank || 999999);
+    }
+    function breakoutDisplayPlates(plates) {
+      return Array.isArray(plates) ? plates : [];
+      const rows = Array.isArray(plates) ? plates : [];
+      const strength = rows
+        .filter(plate => selectionKind(plate) !== "trend_top1")
+        .slice()
+        .sort(plateStrengthSort)
+        .slice(0, 3)
+        .map((plate, index) => ({ ...plate, selection_kind: "strength_top3", selection_label: "强度Top3", selection_rank: index + 1 }));
+      const strengthKeys = new Set(strength.map(plateKey));
+      const trend = rows
+        .filter(plate => selectionKind(plate) === "trend_top1" && !strengthKeys.has(plateKey(plate)))
+        .slice()
+        .sort(plateTrendSort)
+        .slice(0, 1)
+        .map(plate => ({ ...plate, selection_kind: "trend_top1", selection_label: "趋势Top1", selection_rank: 1 }));
+      return [...strength, ...trend];
     }
     function clip(value, limit = 72) {
       const text = String(value || "").replace(/\s+/g, " ").trim();
@@ -6843,6 +7174,7 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
               <span class="tab-name"${hoverTitle(plate.plate_name)}>${esc(plate.plate_name)}</span>
               <span class="tab-score">${esc(fmt(plate.strength || 0))}</span>
             </span>
+            <span class="tab-tags">${selectionBadge(plate)}</span>
             <span class="tab-sub">
               <span>${plate.change_pct == null ? "涨幅 -" : `涨幅 ${pct(plate.change_pct)}`}</span>
               <span>${fmt(stockCount)}只</span>
@@ -6877,7 +7209,7 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
         .map(group => ({ ...group, stocks: parseJsonArray(group.stocks) }))
         .filter(group => groupKey(group) && group.stocks.length);
       if (groups.length) {
-        return groups.slice(0, 2);
+        return groups.slice(0, 3);
       }
       const subplates = parseJsonArray(plate.sub_plates).slice(0, 2);
       const stocks = parseJsonArray(plate.top_research_pool_stocks);
@@ -6941,6 +7273,7 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
       const reason = clean(row.kpl_limit_reason || row.reason_text);
       const reasonDate = clean(row.kpl_limit_reason_date);
       const meta = [
+        row.pool_type_label ? `类型：${row.pool_type_label}` : "",
         subplate ? `子板块：${subplate}` : "",
         `研究池：#${rank}`,
         pctValue === "" ? "" : `涨幅：${pct(pctValue)}`,
@@ -6973,6 +7306,8 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
       const activeGroupKey = activeSubPlateKey(plate, groups);
       const activeGroup = groups.find(group => groupKey(group) === activeGroupKey) || groups[0] || {};
       const stocks = parseJsonArray(activeGroup.stocks);
+      const isTrendPlate = selectionKind(plate) === "trend_top1";
+      const trendScore = Number(plate.trend_score || 0);
       return `<section class="detail">
         <div class="detail-head">
           <div class="detail-title">
@@ -7034,12 +7369,13 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
       try {
         const params = new URLSearchParams();
         if (queryDate()) params.set("trade_date", queryDate());
+        appendPoolMode(params);
         const response = await fetch(`/api/plate-breakouts?${params.toString()}`, { cache: "no-store" });
         const data = await response.json();
         if (!$("tradeDate").value && data.trade_date) $("tradeDate").value = data.trade_date;
         updateDateButtons();
         renderServiceContext(data);
-        state.plates = (Array.isArray(data.plates) ? data.plates : [])
+        state.plates = breakoutDisplayPlates(data.plates)
           .slice()
           .sort((a, b) => Number(b.strength || 0) - Number(a.strength || 0) || Number(a.rank || 999999) - Number(b.rank || 999999));
         let saved = "";
@@ -7055,6 +7391,9 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
       }
     }
     $("refreshBtn").addEventListener("click", load);
+    ["bearPoolBtn", "bullPoolBtn"].forEach(id => {
+      $(id).addEventListener("click", event => setPoolMode(event.currentTarget.dataset.poolMode || "bear"));
+    });
     $("tradeDate").addEventListener("change", event => setTradeDate(event.target.value));
     $("prevDateBtn").addEventListener("click", () => stepTradeDate(-1));
     $("nextDateBtn").addEventListener("click", () => stepTradeDate(1));
@@ -7074,13 +7413,10 @@ PLATE_BREAKOUT_HTML = r"""<!doctype html>
       const button = event.target.closest(".subplate");
       if (button) selectSubPlate(button.dataset.subPlateKey || "");
     });
+    syncPoolButtons();
     loadTradeDates();
     load();
   </script>
 </body>
 </html>"""
-
-
-
-
 

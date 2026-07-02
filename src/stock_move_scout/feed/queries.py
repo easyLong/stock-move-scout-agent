@@ -99,6 +99,7 @@ def trade_dates_sql() -> str:
         SELECT trade_date AS day_value FROM stock_root_evidence_cache
       ) days
       WHERE day_value IS NOT NULL
+        AND day_value <= CURDATE()
         AND WEEKDAY(day_value) < 5
       ORDER BY day_text DESC
     ) ordered_days;
@@ -1392,6 +1393,12 @@ def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
       SELECT trade_date, MAX(captured_at) AS captured_at
       FROM kpl_plate_featured_details
       WHERE trade_date=CAST({day} AS DATE)
+        AND (
+          COALESCE(JSON_LENGTH(sub_plates), 0) > 0
+          OR
+          COALESCE(JSON_LENGTH(top_research_pool_stocks_by_sub_plate), 0) > 0
+          OR COALESCE(JSON_LENGTH(top_research_pool_stocks), 0) > 0
+        )
       GROUP BY trade_date
     )
     SELECT COALESCE(JSON_OBJECT(
@@ -1399,11 +1406,11 @@ def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
       'breakout_data_trade_date', COALESCE((SELECT DATE_FORMAT(trade_date, '%Y-%m-%d') FROM latest_snapshot LIMIT 1), DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d')),
       'breakout_captured_at', COALESCE((SELECT DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s') FROM latest_snapshot LIMIT 1), ''),
       'source', 'kpl_plate_featured_details',
-      'rule', '开盘啦精选强度Top5板块；必须有板块爆发原因；取最强两个子板块；每个子板块只保留研究池交集股票并按研究池排名各取Top5',
+      'rule', '开盘啦精选强度Top5板块；爆发原因仅展示不参与筛选；取最强两个子板块；每个子板块只保留研究池交集股票，并按情绪Top3+趋势Top1展示',
       'plates', COALESCE((
         SELECT CAST(CONCAT(
           '[',
-          GROUP_CONCAT(CAST(plate_item AS CHAR) ORDER BY sort_strength DESC, sort_rank ASC, sort_name ASC SEPARATOR ','),
+          GROUP_CONCAT(CAST(plate_item AS CHAR) ORDER BY sort_group ASC, sort_selection_rank ASC, sort_strength DESC, sort_rank ASC, sort_name ASC SEPARATOR ','),
           ']'
         ) AS JSON)
         FROM (
@@ -1414,12 +1421,22 @@ def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
             'strength', p.strength,
             'change_pct', p.change_pct,
             'speed', p.speed,
+            'selection_kind', COALESCE(JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.selection_kind')), IF(p.row_rank <= 3, 'strength_top3', 'trend_top1')),
+            'selection_label', COALESCE(JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.selection_label')), IF(p.row_rank <= 3, '强度Top3', '趋势Top1')),
+            'selection_rank', COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.selection_rank')) AS UNSIGNED), IF(p.row_rank <= 3, p.row_rank, 1)),
+            'trend_score', COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.trend_score')) AS DECIMAL(18,4)), 0),
+            'trend_days', COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.trend_days')) AS UNSIGNED), 0),
             'reason_text', COALESCE(p.reason_text, ''),
             'sub_plates', COALESCE(p.sub_plates, JSON_ARRAY()),
             'top_research_pool_stocks', COALESCE(p.top_research_pool_stocks, JSON_ARRAY()),
             'top_research_pool_stocks_by_sub_plate', COALESCE(p.top_research_pool_stocks_by_sub_plate, JSON_ARRAY()),
             'stock_count', COALESCE(JSON_LENGTH(p.top_research_pool_stocks), 0)
           ) AS plate_item,
+          CASE
+            WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.selection_kind')), IF(p.row_rank <= 3, 'strength_top3', 'trend_top1'))='trend_top1' THEN 1
+            ELSE 0
+          END AS sort_group,
+          COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(p.raw_json, '$.selection_rank')) AS UNSIGNED), IF(p.row_rank <= 3, p.row_rank, 1)) AS sort_selection_rank,
           COALESCE(p.strength, 0) AS sort_strength,
           p.row_rank AS sort_rank,
           p.plate_name AS sort_name
@@ -1428,8 +1445,9 @@ def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
             ON s.trade_date=p.trade_date
            AND s.captured_at=p.captured_at
           WHERE p.trade_date=CAST({day} AS DATE)
-            AND COALESCE(p.reason_text, '') <> ''
             AND (
+              COALESCE(JSON_LENGTH(p.sub_plates), 0) > 0
+              OR
               COALESCE(JSON_LENGTH(p.top_research_pool_stocks_by_sub_plate), 0) > 0
               OR COALESCE(JSON_LENGTH(p.top_research_pool_stocks), 0) > 0
             )
@@ -1723,7 +1741,7 @@ def market_width_series_sql(trade_date: str | None = "", limit: int = 240) -> st
 
 
 def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5) -> str:
-    day_filter = f"AND trade_date <= {sql_string(trade_date)}" if trade_date else ""
+    day_filter = f"s.trade_date <= {sql_string(trade_date)}" if trade_date else "1=1"
     return f"""
     SELECT COALESCE(JSON_ARRAYAGG(item), JSON_ARRAY())
     FROM (
@@ -1780,10 +1798,9 @@ def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5) -> st
                   s.captured_at DESC
               ) AS row_no
             FROM market_width_snapshots s
-            WHERE s.total_count >= 4800
-              {day_filter}
+            WHERE {day_filter}
               AND (
-                s.source='stock_daily_bars_close'
+                (s.source='stock_daily_bars_close' AND s.total_count >= 4800)
                 OR (
                   (TIME(s.captured_at) >= '09:30:00' AND TIME(s.captured_at) <= '11:30:00.999')
                   OR (TIME(s.captured_at) >= '13:00:00' AND TIME(s.captured_at) <= '15:00:00.999')

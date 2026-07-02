@@ -11,10 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from stock_move_scout.db import add_mysql_args, mysql_config_from_args
 from stock_move_scout.research_pool import (
+    DEFAULT_RESEARCH_POOL_MA_MODE,
     DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     DEFAULT_RESEARCH_POOL_GAIN_TOP,
     DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
     materialize_research_pool_snapshot,
+    normalize_research_pool_ma_mode,
 )
 
 
@@ -25,6 +27,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-up-days", type=int, default=DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS)
     parser.add_argument("--gain-period-days", type=int, default=DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS)
     parser.add_argument("--gain-top", type=int, default=DEFAULT_RESEARCH_POOL_GAIN_TOP)
+    parser.add_argument(
+        "--ma-mode",
+        default=DEFAULT_RESEARCH_POOL_MA_MODE,
+        help="Research-pool MA filter: none (default, bear/adjustment mode) or ma5_10_20_30_up (bull mode).",
+    )
     parser.add_argument("--force", action="store_true", help="Rebuild the snapshot even if it already exists.")
     return parser.parse_args()
 
@@ -43,6 +50,7 @@ def main() -> int:
         limit_up_days=max(1, int(args.limit_up_days)),
         gain_period_days=max(1, int(args.gain_period_days)),
         gain_top=max(1, int(args.gain_top)),
+        ma_mode=normalize_research_pool_ma_mode(args.ma_mode),
         force=bool(args.force),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

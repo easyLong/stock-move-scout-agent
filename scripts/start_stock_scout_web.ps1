@@ -4,7 +4,8 @@ param(
     [string]$MysqlUser = "root",
     [string]$MysqlPassword = $env:MYSQL_PWD,
     [string]$MysqlHost = "127.0.0.1",
-    [int]$MysqlPort = 3306
+    [int]$MysqlPort = 3306,
+    [int]$MysqlTimeout = 180
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,7 +35,8 @@ $args = @(
     "--mysql-enabled",
     "--mysql-user", $MysqlUser,
     "--mysql-host", $MysqlHost,
-    "--mysql-port", "$MysqlPort"
+    "--mysql-port", "$MysqlPort",
+    "--mysql-timeout", "$MysqlTimeout"
 )
 
 if ($MysqlPassword) {

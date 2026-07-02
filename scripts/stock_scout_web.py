@@ -35,12 +35,14 @@ from stock_move_scout.feed.leaderboard_snapshot import (
     KPL_SNAPSHOT_SOURCE,
     SNAPSHOT_SOURCE,
     ensure_leaderboard_snapshot_table,
-    latest_leaderboard_snapshot_payload,
-    latest_leaderboard_snapshot_payload_by_source,
-    materialize_kpl_leaderboard_snapshot,
 )
 from stock_move_scout.market_width import ensure_market_width_tables
-from stock_move_scout.research_pool import ResearchPoolProvider, ensure_headline_theme_role_evidence_table
+from stock_move_scout.research_pool import (
+    ResearchPoolProvider,
+    ensure_headline_theme_role_evidence_table,
+    normalize_research_pool_ma_mode,
+    research_pool_system_label,
+)
 from stock_move_scout.sources.kpl_featured_sections import ensure_kpl_featured_section_table
 from stock_move_scout.sources.kpl_market_capacity import ensure_kpl_market_capacity_tables
 from stock_move_scout.sources.kpl_plate_details import ensure_kpl_plate_detail_table
@@ -185,6 +187,27 @@ def explicit_leader_data_date(config: MySqlConfig, requested_trade_date: str, ta
     except Exception:
         rows = []
     return target_date if rows else resolve_leader_data_date(config, target_date, source)
+
+
+def resolve_pool_ma_mode(pool_mode: str = "") -> str:
+    value = str(pool_mode or "").strip()
+    if value in {"", "latest"}:
+        value = "bear"
+    return normalize_research_pool_ma_mode(value)
+
+
+def pool_mode_payload(ma_mode: str) -> dict[str, str]:
+    system = "bull" if ma_mode != "none" else "bear"
+    return {
+        "pool_mode": system,
+        "research_pool_ma_mode": ma_mode,
+        "research_pool_system": system,
+        "research_pool_system_label": research_pool_system_label(ma_mode),
+    }
+
+
+def ensure_selected_research_pool(config: MySqlConfig, trade_date: str, ma_mode: str) -> None:
+    ResearchPoolProvider(config).latest_snapshot(trade_date, ma_mode=ma_mode)
 
 
 def ensure_async_evidence_summary_column(config: MySqlConfig, column_name: str, column_sql: str) -> None:
@@ -397,9 +420,10 @@ def create_app(config: MySqlConfig) -> FastAPI:
         return JSONResponse(payload)
 
     @app.get("/api/feed")
-    def api_feed(trade_date: str = "") -> JSONResponse:
+    def api_feed(trade_date: str = "", pool_mode: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
-        research_codes = ResearchPoolProvider(config).latest_codes(target_date)
+        ma_mode = resolve_pool_ma_mode(pool_mode)
+        research_codes = ResearchPoolProvider(config).latest_codes(target_date, ma_mode=ma_mode)
         missing_codes = root_cache.root_evidence_cache_missing_codes(config, target_date, research_codes)
         if missing_codes:
             root_cache.refresh_root_evidence_cache(config, target_date, codes=missing_codes, force=True)
@@ -408,7 +432,8 @@ def create_app(config: MySqlConfig) -> FastAPI:
         feed_rows = feed if isinstance(feed, list) else []
         payload = {
             "trade_date": target_date,
-            "service_context": build_service_context(config, target_date),
+            "service_context": build_service_context(config, target_date, ma_mode=ma_mode),
+            **pool_mode_payload(ma_mode),
             "feed": feed,
             "feed_meta": {
                 "count": len(feed_rows),
@@ -422,28 +447,36 @@ def create_app(config: MySqlConfig) -> FastAPI:
         return JSONResponse(payload)
 
     @app.get("/api/feed/detail")
-    def api_feed_detail(trade_date: str = "", kind: str = "", event_time: str = "", code: str = "") -> JSONResponse:
+    def api_feed_detail(trade_date: str = "", kind: str = "", event_time: str = "", code: str = "", pool_mode: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
+        ma_mode = resolve_pool_ma_mode(pool_mode)
         if code:
             if not root_cache.root_evidence_cache_code_exists(config, target_date, code):
                 root_cache.refresh_root_evidence_cache(config, target_date, codes=[code], force=True)
         else:
-            research_codes = ResearchPoolProvider(config).latest_codes(target_date)
+            research_codes = ResearchPoolProvider(config).latest_codes(target_date, ma_mode=ma_mode)
             missing_codes = root_cache.root_evidence_cache_missing_codes(config, target_date, research_codes)
             if missing_codes:
                 root_cache.refresh_root_evidence_cache(config, target_date, codes=missing_codes, force=True)
         feed = json_query(config, intel_feed_sql(target_date, kind=kind, event_time=event_time, code=code), [])
         rows = attach_evidence_views(feed)
         row = rows[0] if isinstance(rows, list) and rows else {}
-        return JSONResponse({"trade_date": target_date, "service_context": build_service_context(config, target_date), "row": row})
+        return JSONResponse({
+            "trade_date": target_date,
+            "service_context": build_service_context(config, target_date, ma_mode=ma_mode),
+            **pool_mode_payload(ma_mode),
+            "row": row,
+        })
 
     @app.get("/api/trade_dates")
     def api_trade_dates() -> JSONResponse:
         return JSONResponse(json_query(config, trade_dates_sql(), {"latest": latest_data_date(config), "dates": []}))
 
     @app.get("/api/market-width")
-    def api_market_width(trade_date: str = "", limit: int = 240) -> JSONResponse:
+    def api_market_width(trade_date: str = "", limit: int = 240, pool_mode: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
+        ma_mode = resolve_pool_ma_mode(pool_mode)
+        ensure_selected_research_pool(config, target_date, ma_mode)
         market_data_date = target_date
         latest = json_query(config, market_width_latest_sql(target_date), {})
         if not isinstance(latest, dict) or not latest:
@@ -457,7 +490,8 @@ def create_app(config: MySqlConfig) -> FastAPI:
         payload = {
             "trade_date": target_date,
             "market_data_trade_date": market_data_date,
-            "service_context": build_service_context(config, target_date),
+            "service_context": build_service_context(config, target_date, ma_mode=ma_mode),
+            **pool_mode_payload(ma_mode),
             "latest": latest,
             "series": series,
             "cycle_5d": sort_market_width_cycle(json_query(config, market_width_cycle_5d_sql(market_data_date), [])),
@@ -466,46 +500,34 @@ def create_app(config: MySqlConfig) -> FastAPI:
         return JSONResponse(payload)
 
     @app.get("/api/leaders")
-    def api_leaders(trade_date: str = "") -> JSONResponse:
+    def api_leaders(trade_date: str = "", pool_mode: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
+        ma_mode = resolve_pool_ma_mode(pool_mode)
         leader_data_date = explicit_leader_data_date(config, trade_date, target_date, SNAPSHOT_SOURCE)
-        snapshot_payload = latest_leaderboard_snapshot_payload(config, leader_data_date)
-        if snapshot_payload is not None:
-            payload = snapshot_payload
-        else:
-            ResearchPoolProvider(config).latest_snapshot(leader_data_date)
-            payload = json_query(config, leaderboard_sql(leader_data_date), {})
+        ensure_selected_research_pool(config, leader_data_date, ma_mode)
+        if leader_data_date != target_date:
+            ensure_selected_research_pool(config, target_date, ma_mode)
+        payload = json_query(config, leaderboard_sql(leader_data_date), {})
         if not isinstance(payload, dict):
             payload = {}
         payload["service_trade_date"] = target_date
         payload["leader_data_trade_date"] = payload.get("leader_data_trade_date") or payload.get("trade_date") or leader_data_date
-        payload["leader_data_source"] = payload.get("leader_data_source") or ("dynamic_sql" if snapshot_payload is None else "post_close_confirm")
+        payload["leader_data_source"] = payload.get("leader_data_source") or "dynamic_sql"
         payload["leader_data_label"] = f"{payload['leader_data_trade_date']} 收盘确认，服务 {target_date}"
         payload["trade_date"] = target_date
-        payload["service_context"] = build_service_context(config, target_date)
+        payload["service_context"] = build_service_context(config, target_date, ma_mode=ma_mode)
+        payload.update(pool_mode_payload(ma_mode))
         return JSONResponse(payload)
 
     @app.get("/api/kpl-leaders")
-    def api_kpl_leaders(trade_date: str = "") -> JSONResponse:
+    def api_kpl_leaders(trade_date: str = "", pool_mode: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
+        ma_mode = resolve_pool_ma_mode(pool_mode)
         leader_data_date = explicit_leader_data_date(config, trade_date, target_date, KPL_SNAPSHOT_SOURCE)
-        snapshot_payload = latest_leaderboard_snapshot_payload_by_source(
-            config,
-            leader_data_date,
-            source=KPL_SNAPSHOT_SOURCE,
-            exact=True,
-        )
-        if snapshot_payload is not None:
-            payload = snapshot_payload
-        else:
-            ResearchPoolProvider(config).latest_snapshot(leader_data_date)
-            materialize_kpl_leaderboard_snapshot(config, leader_data_date)
-            payload = latest_leaderboard_snapshot_payload_by_source(
-                config,
-                leader_data_date,
-                source=KPL_SNAPSHOT_SOURCE,
-                exact=True,
-            ) or {}
+        ensure_selected_research_pool(config, leader_data_date, ma_mode)
+        if leader_data_date != target_date:
+            ensure_selected_research_pool(config, target_date, ma_mode)
+        payload = json_query(config, kpl_leaderboard_sql(leader_data_date), {})
         if not isinstance(payload, dict):
             payload = {}
         payload["service_trade_date"] = target_date
@@ -513,17 +535,21 @@ def create_app(config: MySqlConfig) -> FastAPI:
         payload["leader_data_source"] = KPL_SNAPSHOT_SOURCE
         payload["leader_data_label"] = f"{payload['leader_data_trade_date']} 收盘确认，服务 {target_date}"
         payload["trade_date"] = target_date
-        payload["service_context"] = build_service_context(config, target_date)
+        payload["service_context"] = build_service_context(config, target_date, ma_mode=ma_mode)
+        payload.update(pool_mode_payload(ma_mode))
         return JSONResponse(payload)
 
     @app.get("/api/plate-breakouts")
-    def api_plate_breakouts(trade_date: str = "") -> JSONResponse:
+    def api_plate_breakouts(trade_date: str = "", pool_mode: str = "") -> JSONResponse:
         target_date = resolve_trade_date(config, trade_date)
+        ma_mode = resolve_pool_ma_mode(pool_mode)
+        ensure_selected_research_pool(config, target_date, ma_mode)
         payload = json_query(config, kpl_plate_breakout_sql(target_date), {})
         if not isinstance(payload, dict):
             payload = {}
         payload["trade_date"] = target_date
-        payload["service_context"] = build_service_context(config, target_date)
+        payload["service_context"] = build_service_context(config, target_date, ma_mode=ma_mode)
+        payload.update(pool_mode_payload(ma_mode))
         return JSONResponse(payload)
 
     return app

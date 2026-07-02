@@ -14,6 +14,9 @@ DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS = 5
 DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS = 5
 DEFAULT_RESEARCH_POOL_GAIN_TOP = 30
 DEFAULT_RESEARCH_POOL_RULE = "recent_limit_up_or_5d_gain_top"
+RESEARCH_POOL_MA_NONE = "none"
+RESEARCH_POOL_MA_TREND = "ma5_10_20_30_up"
+DEFAULT_RESEARCH_POOL_MA_MODE = RESEARCH_POOL_MA_NONE
 RESEARCH_POOL_THEME_SOURCE = "research_pool_theme_members"
 HEADLINE_THEME_SOURCE = "ths_homepage_headline"
 
@@ -40,6 +43,25 @@ class ResearchPoolSnapshot:
 def _clean_periods(periods: Iterable[int] | None = None, period_days: int | None = None) -> list[int]:
     raw = [int(period_days)] if period_days else [int(item) for item in (periods or DEFAULT_RESEARCH_POOL_PERIODS)]
     return sorted({item for item in raw if item > 0})
+
+
+def normalize_research_pool_ma_mode(value: str | None) -> str:
+    mode = str(value or DEFAULT_RESEARCH_POOL_MA_MODE).strip().lower()
+    if mode in {"", "default"}:
+        return DEFAULT_RESEARCH_POOL_MA_MODE
+    if mode in {"ma", "ma5_30", "ma5_10_20_30", "ma5_10_20_30_up", "no_ma60", "bull", "bull_market", "bullish"}:
+        return RESEARCH_POOL_MA_TREND
+    if mode in {"none", "off", "false", "0", "loose", "no_filter", "no_ma", "bear", "bear_market", "adjust", "adjustment"}:
+        return RESEARCH_POOL_MA_NONE
+    raise ValueError(f"unsupported research-pool ma_mode: {value}")
+
+
+def research_pool_system_label(ma_mode: str | None = None) -> str:
+    """Human label for the selected research-pool system."""
+    resolved = normalize_research_pool_ma_mode(ma_mode)
+    if resolved == RESEARCH_POOL_MA_TREND:
+        return "牛市系统"
+    return "熊市系统"
 
 
 def ensure_research_pool_tables(config: MySqlConfig) -> None:
@@ -169,6 +191,7 @@ def research_pool_cte(
     limit_up_days: int = DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
     gain_period_days: int = DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     gain_top: int = DEFAULT_RESEARCH_POOL_GAIN_TOP,
+    ma_mode: str = DEFAULT_RESEARCH_POOL_MA_MODE,
     cte_name: str = "research_pool",
 ) -> str:
     """Active pool: recent limit-up stocks plus 5-day gain TopN without recent limit-up."""
@@ -176,7 +199,66 @@ def research_pool_cte(
     limit_days = max(1, int(limit_up_days))
     period_days = max(1, int(gain_period_days))
     top = max(1, int(gain_top))
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
     main_a_regexp = "'^(000|001|002|003|300|301|600|601|603|605|688|689)'"
+    ma_ctes = ""
+    seed_ma_join = ""
+    if resolved_ma_mode == RESEARCH_POOL_MA_TREND:
+        seed_ma_join = "JOIN ma_pass_codes mp ON mp.code=seed.code"
+        ma_ctes = f"""
+    ma_trade_days AS (
+      SELECT trade_date
+      FROM (
+        SELECT DISTINCT trade_date
+        FROM stock_daily_bars
+        WHERE trade_date <= {day}
+        ORDER BY trade_date DESC
+        LIMIT 90
+      ) d
+    ),
+    price_ma AS (
+      SELECT
+        b.code,
+        b.trade_date,
+        b.close_price,
+        AVG(b.close_price) OVER (PARTITION BY b.code ORDER BY b.trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma5,
+        AVG(b.close_price) OVER (PARTITION BY b.code ORDER BY b.trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma10,
+        AVG(b.close_price) OVER (PARTITION BY b.code ORDER BY b.trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS ma20,
+        AVG(b.close_price) OVER (PARTITION BY b.code ORDER BY b.trade_date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS ma30
+      FROM stock_daily_bars b
+      JOIN market_universe u ON u.code=b.code
+      JOIN ma_trade_days td ON td.trade_date=b.trade_date
+      WHERE b.trade_date <= {day}
+        AND b.close_price IS NOT NULL
+    ),
+    price_ma_with_previous AS (
+      SELECT
+        m.*,
+        LAG(ma5, 5) OVER (PARTITION BY code ORDER BY trade_date) AS pma5,
+        LAG(ma10, 10) OVER (PARTITION BY code ORDER BY trade_date) AS pma10,
+        LAG(ma20, 20) OVER (PARTITION BY code ORDER BY trade_date) AS pma20,
+        LAG(ma30, 30) OVER (PARTITION BY code ORDER BY trade_date) AS pma30
+      FROM price_ma m
+    ),
+    ma_pass_codes AS (
+      SELECT
+        m.code,
+        m.ma5,
+        m.ma10,
+        m.ma20,
+        m.ma30,
+        m.pma5,
+        m.pma10,
+        m.pma20,
+        m.pma30
+      FROM price_ma_with_previous m
+      JOIN gain_trade_days latest_day ON latest_day.rn=1 AND latest_day.trade_date=m.trade_date
+      WHERE m.ma5 > m.pma5
+        AND m.ma10 > m.pma10
+        AND m.ma20 > m.pma20
+        AND m.ma30 > m.pma30
+    ),
+"""
     return f"""
     market_universe AS (
       SELECT code, name
@@ -229,6 +311,7 @@ def research_pool_cte(
         WHERE trade_date <= {day}
       ) d
     ),
+{ma_ctes}
     daily_gain_metrics AS (
       SELECT
         u.code,
@@ -278,7 +361,7 @@ def research_pool_cte(
       FROM gain_rank_base
       WHERE filtered_rank_no <= {top}
     ),
-    research_pool_seed AS (
+    research_pool_seed_unfiltered AS (
       SELECT
         lu.code,
         lu.name,
@@ -306,6 +389,11 @@ def research_pool_cte(
         g.latest_pct AS latest_pct,
         2 AS source_priority
       FROM gain_rank_candidates g
+    ),
+    research_pool_seed AS (
+      SELECT seed.*
+      FROM research_pool_seed_unfiltered seed
+      {seed_ma_join}
     ),
     {cte_name} AS (
       SELECT
@@ -371,6 +459,7 @@ def research_pool_codes(
     limit_up_days: int = DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
     gain_period_days: int = DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     gain_top: int = DEFAULT_RESEARCH_POOL_GAIN_TOP,
+    ma_mode: str = DEFAULT_RESEARCH_POOL_MA_MODE,
 ) -> list[str]:
     sql = f"""
     WITH {research_pool_cte(
@@ -378,6 +467,7 @@ def research_pool_codes(
         limit_up_days=limit_up_days,
         gain_period_days=gain_period_days,
         gain_top=gain_top,
+        ma_mode=ma_mode,
     )}
     SELECT code
     FROM research_pool
@@ -403,6 +493,7 @@ def _dynamic_pool_rows(
     limit_up_days: int = DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
     gain_period_days: int = DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     gain_top: int = DEFAULT_RESEARCH_POOL_GAIN_TOP,
+    ma_mode: str = DEFAULT_RESEARCH_POOL_MA_MODE,
 ) -> list[dict[str, object]]:
     sql = f"""
     WITH {research_pool_cte(
@@ -410,6 +501,7 @@ def _dynamic_pool_rows(
         limit_up_days=limit_up_days,
         gain_period_days=gain_period_days,
         gain_top=gain_top,
+        ma_mode=ma_mode,
     )}
     SELECT
       code,
@@ -508,16 +600,23 @@ def materialize_research_pool_snapshot(
     limit_up_days: int = DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
     gain_period_days: int = DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     gain_top: int = DEFAULT_RESEARCH_POOL_GAIN_TOP,
+    ma_mode: str = DEFAULT_RESEARCH_POOL_MA_MODE,
     force: bool = False,
 ) -> dict[str, object]:
     assert_weekday_trade_date(trade_date)
     ensure_research_pool_tables(config)
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
     key = _snapshot_key_sql(trade_date, limit_up_days, gain_period_days, gain_top)
     if not force:
         existing = mysql_rows(
             run_mysql(
                 config,
-                f"SELECT code_count FROM research_pool_snapshots WHERE {key};",
+                f"""
+                SELECT code_count
+                FROM research_pool_snapshots
+                WHERE {key}
+                  AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(params_json, '$.ma_mode')), '')={sql_string(resolved_ma_mode)};
+                """,
                 batch=True,
                 raw=True,
             )
@@ -536,6 +635,7 @@ def materialize_research_pool_snapshot(
         limit_up_days=limit_up_days,
         gain_period_days=gain_period_days,
         gain_top=gain_top,
+        ma_mode=resolved_ma_mode,
     )
     source_dates: dict[str, str] = {}
     for row in rows:
@@ -554,6 +654,7 @@ def materialize_research_pool_snapshot(
         "limit_up_days": int(limit_up_days),
         "gain_period_days": int(gain_period_days),
         "gain_top": int(gain_top),
+        "ma_mode": resolved_ma_mode,
     }
     statements = [
         "START TRANSACTION;",
@@ -567,6 +668,7 @@ def materialize_research_pool_snapshot(
                 "source_rank": row.get("source_rank"),
                 "source_label": row.get("source_label"),
                 "source_trade_date": row.get("source_trade_date"),
+                "ma_mode": resolved_ma_mode,
             }
             values.append(
                 "("
@@ -647,6 +749,7 @@ def materialize_research_pool_snapshot(
         "rule": DEFAULT_RESEARCH_POOL_RULE,
         "code_count": len(rows),
         "source_dates": source_dates,
+        "ma_mode": resolved_ma_mode,
         "source_hash": source_hash,
         "generated": True,
         "force": bool(force),
@@ -1029,8 +1132,9 @@ def materialize_headline_theme_role_evidence(config: MySqlConfig, trade_date: st
 class ResearchPoolProvider:
     """Query active stock research pools from persisted source tables.
 
-    The default pool is recent 5-trading-day limit-up stocks plus 5-day gain
-    Top30 stocks without a recent limit-up. Keeping this behind a provider
+    The default bear/adjustment pool is recent 5-trading-day limit-up stocks
+    plus 5-day gain Top30 stocks without a recent limit-up. Bull mode can add
+    MA5/10/20/30 rising filters through ma_mode. Keeping this behind a provider
     avoids scattering pool SQL across collectors and scanners.
     """
 
@@ -1052,8 +1156,9 @@ class ResearchPoolProvider:
         periods: Iterable[int] | None = None,
         period_days: int | None = None,
         top: int | None = None,
+        ma_mode: str = DEFAULT_RESEARCH_POOL_MA_MODE,
     ) -> list[str]:
-        snapshot = self.latest_snapshot(trade_date, periods=periods, period_days=period_days, top=top)
+        snapshot = self.latest_snapshot(trade_date, periods=periods, period_days=period_days, top=top, ma_mode=ma_mode)
         return list(snapshot.codes)
 
     def latest_code_set(
@@ -1063,6 +1168,7 @@ class ResearchPoolProvider:
         periods: Iterable[int] | None = None,
         period_days: int | None = None,
         top: int | None = None,
+        ma_mode: str = DEFAULT_RESEARCH_POOL_MA_MODE,
     ) -> set[str]:
         return set(
             self.latest_codes(
@@ -1070,6 +1176,7 @@ class ResearchPoolProvider:
                 periods=periods,
                 period_days=period_days,
                 top=top,
+                ma_mode=ma_mode,
             )
         )
 
@@ -1080,9 +1187,11 @@ class ResearchPoolProvider:
         periods: Iterable[int] | None = None,
         period_days: int | None = None,
         top: int | None = None,
+        ma_mode: str = DEFAULT_RESEARCH_POOL_MA_MODE,
     ) -> ResearchPoolSnapshot:
         pool_top = int(top or self.default_top)
         pool_period_days = int(period_days or DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS)
+        resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
         rows = _persisted_pool_rows(
             self.config,
             trade_date,
@@ -1090,13 +1199,28 @@ class ResearchPoolProvider:
             gain_period_days=pool_period_days,
             gain_top=pool_top,
         )
-        if not rows:
+        snapshot_params = mysql_rows(
+            run_mysql(
+                self.config,
+                f"""
+                SELECT COALESCE(JSON_UNQUOTE(JSON_EXTRACT(params_json, '$.ma_mode')), '')
+                FROM research_pool_snapshots
+                WHERE {_snapshot_key_sql(trade_date, DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS, pool_period_days, pool_top)}
+                LIMIT 1;
+                """,
+                batch=True,
+                raw=True,
+            )
+        )
+        persisted_ma_mode = str(snapshot_params[0][0] or "") if snapshot_params and snapshot_params[0] else ""
+        if not rows or persisted_ma_mode != resolved_ma_mode:
             materialize_research_pool_snapshot(
                 self.config,
                 trade_date,
                 limit_up_days=DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
                 gain_period_days=pool_period_days,
                 gain_top=pool_top,
+                ma_mode=resolved_ma_mode,
                 force=True,
             )
             rows = _persisted_pool_rows(
@@ -1166,7 +1290,9 @@ __all__ = [
     "DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS",
     "DEFAULT_RESEARCH_POOL_GAIN_TOP",
     "DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS",
+    "DEFAULT_RESEARCH_POOL_MA_MODE",
     "HEADLINE_THEME_SOURCE",
+    "RESEARCH_POOL_MA_NONE",
     "RESEARCH_POOL_THEME_SOURCE",
     "ResearchPoolProvider",
     "ResearchPoolSnapshot",
@@ -1176,6 +1302,8 @@ __all__ = [
     "materialize_research_pool_theme_members",
     "materialize_headline_theme_role_evidence",
     "materialize_research_pool_snapshot",
+    "normalize_research_pool_ma_mode",
+    "research_pool_system_label",
     "research_pool_codes",
     "research_pool_cte",
     "research_pool_snapshot_cte",
