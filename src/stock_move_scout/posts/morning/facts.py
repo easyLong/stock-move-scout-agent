@@ -83,6 +83,8 @@ def read_market_acceleration_model(config: Any | None, trade_day: date) -> dict[
         ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY captured_at DESC, id DESC) rn
       FROM market_width_snapshots m
       WHERE trade_date < {sql_string(trade_day.isoformat())}
+        AND m.pool_mode='bear'
+        AND m.research_pool_ma_mode='none'
         AND ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00')
           OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00'))
     )
@@ -304,7 +306,9 @@ def read_top3_concept_new_high(config: Any | None, root: Path, trade_day: date) 
     day_sql = f"""
     SELECT DATE_FORMAT(MAX(trade_date), '%Y-%m-%d')
     FROM kpl_plate_featured_details
-    WHERE trade_date < {sql_string(trade_day.isoformat())};
+    WHERE trade_date < {sql_string(trade_day.isoformat())}
+      AND pool_mode='bear'
+      AND research_pool_ma_mode='none';
     """
     try:
         day_rows = mysql_rows(run_mysql(config, day_sql, batch=True, raw=True))
@@ -332,6 +336,8 @@ def read_top3_concept_new_high(config: Any | None, root: Path, trade_day: date) 
       SELECT captured_at
       FROM kpl_plate_featured_details
       WHERE trade_date = {sql_string(signal_date)}
+        AND pool_mode='bear'
+        AND research_pool_ma_mode='none'
       GROUP BY captured_at
       ORDER BY COUNT(*) DESC, captured_at DESC
       LIMIT 1
@@ -347,6 +353,8 @@ def read_top3_concept_new_high(config: Any | None, root: Path, trade_day: date) 
     FROM kpl_plate_featured_details d
     JOIN picked p ON p.captured_at = d.captured_at
     WHERE d.trade_date = {sql_string(signal_date)}
+      AND d.pool_mode='bear'
+      AND d.research_pool_ma_mode='none'
     ORDER BY d.row_rank ASC;
     """
     try:

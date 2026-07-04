@@ -53,6 +53,11 @@ def build_service_context(config: MySqlConfig, service_trade_date: str, *, ma_mo
     phase = service_market_phase(service_trade_date)
     day = sql_string(service_trade_date)
     resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
+    pool_mode = "bull" if resolved_ma_mode != "none" else "bear"
+    market_width_pool_filter = (
+        f"trade_date={{day}} AND pool_mode={sql_string(pool_mode)} "
+        f"AND research_pool_ma_mode={sql_string(resolved_ma_mode)}"
+    )
     sql = f"""
     SELECT JSON_OBJECT(
       'service_trade_date', DATE_FORMAT({day}, '%Y-%m-%d'),
@@ -82,12 +87,12 @@ def build_service_context(config: MySqlConfig, service_trade_date: str, *, ma_mo
           UNION ALL
           SELECT MAX(ended_at) AS ts FROM windows WHERE DATE(ended_at)={day} AND status='done'
           UNION ALL
-          SELECT MAX(captured_at) AS ts FROM market_width_snapshots WHERE trade_date={day}
+          SELECT MAX(captured_at) AS ts FROM market_width_snapshots WHERE {market_width_pool_filter.format(day=day)}
         ) realtime_ts
       ),
       'daily_close_ready', IF(EXISTS(
         SELECT 1 FROM market_width_snapshots
-        WHERE trade_date={day}
+        WHERE {market_width_pool_filter.format(day=day)}
           AND source='stock_daily_bars_close'
         LIMIT 1
       ), TRUE, FALSE)
@@ -117,7 +122,7 @@ def build_service_context(config: MySqlConfig, service_trade_date: str, *, ma_mo
             "service_trade_date": str(context.get("service_trade_date") or service_trade_date),
             "base_trade_date": base_trade_date,
             "research_pool_ma_mode": resolved_ma_mode,
-            "research_pool_system": "bull" if resolved_ma_mode != "none" else "bear",
+            "research_pool_system": pool_mode,
             "research_pool_system_label": research_pool_system_label(resolved_ma_mode),
             "phase": phase["phase"],
             "phase_label": phase["phase_label"],

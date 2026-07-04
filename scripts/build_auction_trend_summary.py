@@ -77,7 +77,8 @@ def read_minute_rows(config: Any, trade_date: str) -> list[dict[str, Any]]:
       COALESCE(sector_hot_count, 0),
       COALESCE(concept_hot_count, 0),
       COALESCE(score, 0),
-      COALESCE(risk_flags, '')
+      COALESCE(NULLIF(risk_flags, ''), '-'),
+      COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(raw_json, '$.seal_amount')), ''), '0')
     FROM auction_minute_analysis
     WHERE trade_date = {sql_string(trade_date)}
     ORDER BY snapshot_minute ASC, analysis_kind ASC, rank_no ASC;
@@ -104,6 +105,7 @@ def read_minute_rows(config: Any, trade_date: str) -> list[dict[str, Any]]:
         "concept_hot_count",
         "score",
         "risk_flags",
+        "raw_seal_amount",
     ]
     rows: list[dict[str, Any]] = []
     for row in mysql_rows(run_mysql(config, sql, batch=True)):
@@ -117,12 +119,15 @@ def read_minute_rows(config: Any, trade_date: str) -> list[dict[str, Any]]:
             "matched_volume",
             "seal_volume",
             "seal_amount",
+            "raw_seal_amount",
             "theme_score",
             "sector_hot_count",
             "concept_hot_count",
             "score",
         ]:
             item[key] = to_float(item.get(key))
+        if item["seal_amount"] <= 0 and item["raw_seal_amount"] > 0:
+            item["seal_amount"] = item["raw_seal_amount"]
         item["theme_matches"] = parse_json_text(str(item.get("theme_matches") or "")) or []
         rows.append(item)
     return rows
@@ -141,14 +146,15 @@ def read_candidate_rows(config: Any, trade_date: str) -> dict[str, dict[str, Any
       COALESCE(sector_hot_count, 0),
       COALESCE(concept_hot_count, 0),
       COALESCE(score, 0),
-      COALESCE(risk_flags, '')
+      COALESCE(NULLIF(risk_flags, ''), '-'),
+      COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(raw_json, '$.seal_amount')), ''), '0')
     FROM auction_candidates
     WHERE trade_date = {sql_string(trade_date)}
     ORDER BY rank_no ASC;
     """
     result: dict[str, dict[str, Any]] = {}
     for row in mysql_rows(run_mysql(config, sql, batch=True)):
-        if len(row) < 11:
+        if len(row) < 12:
             continue
         item = {
             "final_candidate_rank": to_int(row[0]),
@@ -162,6 +168,7 @@ def read_candidate_rows(config: Any, trade_date: str) -> dict[str, dict[str, Any
             "concept_hot_count": to_int(row[8]),
             "final_score": to_float(row[9]),
             "risk_flags": row[10],
+            "final_seal_amount": to_float(row[11]),
         }
         result[item["code"]] = item
     return result
@@ -277,8 +284,10 @@ def build_summary_rows(args: argparse.Namespace, config: Any) -> tuple[list[dict
         growth = amount_delta / first_amount if first_amount > 0 else (1.0 if last_amount > 0 else 0.0)
         stock_name = str((candidate or rows[-1] if rows else candidate).get("stock_name") or "")
         best_pct_rank = min([to_int(row.get("rank_no")) for row in pct_rows if to_int(row.get("rank_no")) > 0] or [0])
-        last_seal = to_float(up_rows[-1].get("seal_amount")) if up_rows else 0.0
-        max_seal = max([to_float(row.get("seal_amount")) for row in up_rows] or [0.0])
+        candidate_seal = to_float(candidate.get("final_seal_amount"))
+        last_seal = candidate_seal or (to_float(up_rows[-1].get("seal_amount")) if up_rows else 0.0)
+        max_seal = max([to_float(row.get("seal_amount")) for row in up_rows] + [candidate_seal, 0.0])
+        limit_up_count = len(up_rows) or (1 if candidate_seal > 0 else 0)
         summary = {
             "trade_date": trade_date,
             "code": code,
@@ -287,7 +296,7 @@ def build_summary_rows(args: argparse.Namespace, config: Any) -> tuple[list[dict
             "last_seen_minute": rows[-1].get("snapshot_minute", "") if rows else "",
             "minute_count": len({row.get("snapshot_minute") for row in rows}),
             "pct_top_count": len(pct_rows),
-            "limit_up_count": len(up_rows),
+            "limit_up_count": limit_up_count,
             "limit_down_count": len(down_rows),
             "best_pct_rank": best_pct_rank,
             "final_candidate_rank": to_int(candidate.get("final_candidate_rank")),

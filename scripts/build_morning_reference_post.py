@@ -371,7 +371,11 @@ def read_previous_market_context(config: Any, trade_day: date) -> dict[str, Any]
       SELECT MAX(trade_date)
       FROM market_width_snapshots
       WHERE trade_date < {sql_string(trade_day.isoformat())}
+        AND pool_mode='bear'
+        AND research_pool_ma_mode='none'
     )
+      AND pool_mode='bear'
+      AND research_pool_ma_mode='none'
       AND ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00')
         OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00'))
     ORDER BY captured_at DESC
@@ -392,7 +396,11 @@ def read_previous_market_context(config: Any, trade_day: date) -> dict[str, Any]
       SELECT MAX(trade_date)
       FROM market_width_snapshots
       WHERE trade_date < {sql_string(trade_day.isoformat())}
+        AND pool_mode='bear'
+        AND research_pool_ma_mode='none'
     )
+      AND pool_mode='bear'
+      AND research_pool_ma_mode='none'
       AND ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00')
         OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00'))
     GROUP BY trade_date;

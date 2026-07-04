@@ -20,7 +20,6 @@ HTML = r"""<!doctype html>
       --accent: #2563eb;
       --scan: #596579;
       --window: #b4553a;
-      --auction: #a15c22;
       --anchor-text: #08736b;
       --anchor-bg: #edfdfa;
       --anchor-line: #a7f3e8;
@@ -174,6 +173,9 @@ HTML = r"""<!doctype html>
     .pool-toggle button.active {
       background: #1f2937;
       color: #fff;
+    }
+    .toolbar .pool-toggle {
+      display: none;
     }
     .intel-layout {
       display: grid;
@@ -1519,7 +1521,6 @@ HTML = r"""<!doctype html>
       background: var(--accent);
     }
     .kind.window { background: var(--window); }
-    .kind.auction { background: var(--auction); }
     .kind.scan { background: var(--scan); }
     .kind.hot_concept { background: #0f766e; }
     .kind.market_news { background: #3867b7; }
@@ -1731,6 +1732,7 @@ HTML = r"""<!doctype html>
       <a class="nav-link" href="/leaders">领头羊</a>
       <a class="nav-link" href="/kpl-leaders">开盘啦领头羊</a>
       <a class="nav-link" href="/plate-breakouts">板块爆发榜</a>
+      <a class="nav-link" href="/auction-detail">竞价详情</a>
       <span><span class="dot"></span> 自动刷新</span>
       <span id="refreshText">等待数据</span>
     </div>
@@ -3259,20 +3261,15 @@ HTML = r"""<!doctype html>
     function metricChipsHtml(row) {
       const change = pctText(row.change_pct);
       const speed = pctText(row.speed_pct);
-      const isAuction = row.kind === "auction";
-      const changeLabel = row.kind === "window" ? "高" : (isAuction ? "竞" : "现");
+      const changeLabel = row.kind === "window" ? "高" : "现";
       const tags = parseTags(row.tags).map(tagText);
       const appearance = tags.find(tag => tag.startsWith("出现:"));
-      const seal = tags.find(tag => tag.startsWith("封单:"));
       const windowRank = row.kind === "window" && row.sort_rank ? `Top${row.sort_rank}` : "";
-      const auctionRank = isAuction && row.sort_rank ? `Top${row.sort_rank}` : "";
       return [
-        auctionRank ? `<span class="metric-chip">${esc(auctionRank)}</span>` : "",
-        isAuction && seal ? `<span class="metric-chip change">${esc(seal.replace(":", " "))}</span>` : "",
         windowRank ? `<span class="metric-chip">${esc(windowRank)}</span>` : "",
         row.kind === "window" && appearance ? `<span class="metric-chip">${esc(appearance.replace(":", " "))}</span>` : "",
         change ? `<span class="metric-chip change">${esc(changeLabel)} ${esc(change)}</span>` : "",
-        !isAuction && speed ? `<span class="metric-chip speed">速 ${esc(speed)}</span>` : ""
+        speed ? `<span class="metric-chip speed">速 ${esc(speed)}</span>` : ""
       ].filter(Boolean).join("");
     }
     function highlightText(row) {
@@ -3317,8 +3314,7 @@ HTML = r"""<!doctype html>
       }
       const anchorSummary = anchors.length ? `头条题材 ${anchors.slice(0, 3).join(" / ")}` : "未命中头条题材";
       const isWindow = clean(row.kind) === "window";
-      const isAuction = clean(row.kind) === "auction";
-      const summary = isWindow ? `开盘至今累计强度 Top5 · 动态更新` : (isAuction ? `涨停封单 Top3 · 09:15-09:25` : `${rows.length}只 · ${anchorSummary}`);
+      const summary = isWindow ? `开盘至今累计强度 Top5 · 动态更新` : `${rows.length}只 · ${anchorSummary}`;
       return `<div class="stream-group-title">
         <span>${esc(timeText(row.event_time))}</span>
         <span class="kind ${esc(row.kind)}">${esc(row.kind_label || row.kind)}</span>
@@ -3515,6 +3511,539 @@ HTML = r"""<!doctype html>
 </html>"""
 
 
+AUCTION_DETAIL_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>竞价详情</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --line: #e2e8f0;
+      --line-strong: #cbd5e1;
+      --text: #172033;
+      --muted: #64748b;
+      --red: #a85a55;
+      --green: #4f8d76;
+      --blue: #2563eb;
+      --amber: #a16207;
+      --soft: #f8fafc;
+      --shadow: 0 10px 24px rgba(15, 23, 42, 0.055);
+      font-family: "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-size: 14px; letter-spacing: 0; }
+    .topbar {
+      position: sticky; top: 0; z-index: 10;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      min-height: 56px; padding: 10px 20px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.96); backdrop-filter: blur(12px);
+    }
+    h1 { margin: 0; font-size: 19px; line-height: 1.2; }
+    .actions { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; flex-wrap: wrap; justify-content: flex-end; }
+    .nav-link, .btn, .date-input, .search, .select {
+      height: 32px; border: 1px solid var(--line); border-radius: 8px; background: #fff;
+      color: #334155; padding: 0 10px; font: inherit; font-size: 13px; text-decoration: none;
+    }
+    .nav-link, .btn { display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font-weight: 750; }
+    .btn:hover, .nav-link:hover { border-color: #bfdbfe; color: var(--blue); }
+    .date-step { width: 32px; padding: 0; font-size: 18px; line-height: 1; }
+    main { max-width: 1680px; margin: 0 auto; padding: 12px 16px 24px; }
+    .summary {
+      display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr));
+      gap: 8px; margin-bottom: 12px;
+    }
+    .stat {
+      min-height: 66px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+      padding: 10px 12px; box-shadow: var(--shadow);
+    }
+    .stat span { display: block; color: var(--muted); font-size: 12px; }
+    .stat strong { display: block; margin-top: 4px; font-size: 21px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+    .notice {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+      margin: -2px 0 12px; padding: 9px 12px; border: 1px solid var(--line);
+      border-radius: 8px; background: #fff; color: #334155; box-shadow: var(--shadow);
+    }
+    .notice small { color: var(--muted); }
+    .chip-row { display: flex; gap: 6px; flex-wrap: wrap; }
+    .chip { display: inline-flex; align-items: center; min-height: 24px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); background: #f8fafc; color: #475569; font-size: 12px; font-weight: 800; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(380px, 0.7fr); gap: 12px; align-items: start; }
+    .panel {
+      border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+      box-shadow: var(--shadow); overflow: hidden;
+    }
+    .panel-head {
+      min-height: 44px; padding: 9px 12px; border-bottom: 1px solid var(--line);
+      display: flex; align-items: center; justify-content: space-between; gap: 8px; background: #fbfcfe;
+    }
+    .panel-head strong { font-size: 15px; }
+    .panel-head small { color: var(--muted); }
+    .rank-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .rank-controls strong { color: #334155; }
+    .select { min-width: 150px; }
+    .table-wrap { overflow: auto; max-height: calc(100vh - 226px); }
+    table { width: 100%; border-collapse: collapse; min-width: 980px; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; white-space: nowrap; }
+    th { position: sticky; top: 0; z-index: 1; background: #f8fafc; color: #475569; font-size: 12px; font-weight: 800; }
+    tr { cursor: pointer; }
+    tr:hover td, tr.active td { background: #f8fbff; }
+    tr.side-up td { background: #fffafa; }
+    tr.side-up:hover td, tr.side-up.active td { background: #fff5f5; }
+    tr.side-down td { background: #f8fdfb; }
+    tr.side-down:hover td, tr.side-down.active td { background: #f1faf6; }
+    .stock a { color: #172033; font-weight: 850; text-decoration: none; }
+    .stock small { display: block; color: var(--muted); font-size: 12px; font-weight: 500; }
+    .tag { display: inline-flex; align-items: center; min-height: 22px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); background: #fff; font-size: 12px; font-weight: 800; }
+    .tag.strong { color: #9f4f4a; background: #fff7f7; border-color: #f5d7d5; }
+    .tag.watch { color: var(--blue); background: #eff6ff; border-color: #bfdbfe; }
+    .tag.risk { color: #3f806b; background: #f4fbf8; border-color: #d2eadf; }
+    .tag.normal { color: #475569; background: #f8fafc; }
+    .num { font-variant-numeric: tabular-nums; font-weight: 800; }
+    .red { color: var(--red); } .green { color: var(--green); } .orange { color: #b45309; } .muted { color: var(--muted); }
+    .detail-body { padding: 12px; }
+    .title-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+    .title-line h2 { margin: 0; font-size: 20px; }
+    .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; background: #fff; }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; margin-top: 3px; font-size: 16px; font-variant-numeric: tabular-nums; }
+    .reason-box { border: 1px solid var(--line); border-radius: 8px; background: #fbfcfe; padding: 10px 12px; margin-bottom: 12px; color: #334155; }
+    .reason-box strong { display: block; margin-bottom: 4px; color: #172033; }
+    .timeline { display: grid; gap: 8px; margin-bottom: 12px; }
+    .bar-row { display: grid; grid-template-columns: 48px 1fr 86px; gap: 8px; align-items: center; font-size: 12px; }
+    .bar-track { height: 10px; border-radius: 999px; background: #eef2f7; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #f3c9c6, #c87973); }
+    .bar-fill.down { background: linear-gradient(90deg, #c7e8d9, #6fa891); }
+    .mini-table { min-width: 0; }
+    .mini-table th, .mini-table td { padding: 7px 8px; }
+    .empty, .error { padding: 24px; color: var(--muted); text-align: center; }
+    .error { color: var(--red); }
+    @media (max-width: 980px) {
+      .topbar { align-items: flex-start; flex-direction: column; }
+      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .workspace { grid-template-columns: 1fr; }
+      .table-wrap { max-height: none; }
+      .metrics { grid-template-columns: 1fr; }
+      main { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1>竞价详情</h1>
+    <div class="actions">
+      <a class="nav-link" href="/">异动情报</a>
+      <a class="nav-link" href="/market-width">市场概览</a>
+      <a class="nav-link" href="/leaders">领头羊</a>
+      <a class="nav-link" href="/plate-breakouts">板块爆发榜</a>
+      <button class="btn date-step" id="prevDateBtn" type="button">‹</button>
+      <input class="date-input" id="tradeDate" type="date" />
+      <button class="btn date-step" id="nextDateBtn" type="button">›</button>
+      <button class="btn" id="refreshBtn" type="button">刷新</button>
+      <span id="refreshText">等待数据</span>
+    </div>
+  </header>
+  <main>
+    <section class="summary">
+      <div class="stat"><span>最新快照</span><strong id="statRows">-</strong></div>
+      <div class="stat"><span>涨停封单</span><strong id="statFinal">-</strong></div>
+      <div class="stat"><span>跌停封单</span><strong id="statStrong">-</strong></div>
+      <div class="stat"><span>过程记录</span><strong id="statRisk">-</strong></div>
+      <div class="stat"><span>采集时段</span><strong id="statMinutes">-</strong></div>
+    </section>
+    <section class="notice">
+      <div><strong id="coverageTitle">竞价覆盖</strong><br><small id="coverageHint">等待数据</small></div>
+      <div class="chip-row" id="labelChips"></div>
+    </section>
+    <section class="workspace">
+      <section class="panel">
+        <div class="panel-head">
+          <strong>重点追踪</strong>
+          <small id="dataSource">-</small>
+        </div>
+        <div class="rank-controls">
+          <strong>榜单依据</strong>
+          <select class="select" id="rankBasis" aria-label="榜单依据">
+            <option value="current">当前封单</option>
+            <option value="seal19">19封单</option>
+            <option value="seal20">20封单</option>
+            <option value="change1920">19-20</option>
+            <option value="change20latest">20-最新</option>
+          </select>
+          <span>按所选字段分别取机会Top3和风险Top3</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>股票</th>
+                <th>方向</th>
+                <th>当前排名</th>
+                <th>当前封单</th>
+                <th>19封单</th>
+                <th>20封单</th>
+                <th>19-20</th>
+                <th>20-最新</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="rowsBody"></tbody>
+          </table>
+        </div>
+      </section>
+      <aside class="panel">
+        <div class="panel-head">
+          <strong>个股拆解</strong>
+          <small id="activeHint">点击左侧股票</small>
+        </div>
+        <div class="detail-body" id="detailBody"></div>
+      </aside>
+    </section>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+    const state = { rows: [], timeline: [], dates: [], activeKey: "", rankBasis: "current", lastData: null };
+    const params = new URLSearchParams(location.search);
+    const fmt = (value, digits = 2) => Number(value || 0).toFixed(digits);
+    const hasNum = value => value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
+    const fmtMaybe = (value, digits = 2) => hasNum(value) ? Number(value).toFixed(digits) : "-";
+    const yiMaybe = value => hasNum(value) ? `${Number(value).toFixed(2)}亿` : "-";
+    const signedYi = value => {
+      if (!hasNum(value)) return "-";
+      const num = Number(value);
+      return `${num > 0 ? "+" : ""}${num.toFixed(2)}亿`;
+    };
+    const deltaClass = value => !hasNum(value) ? "" : Number(value) > 0 ? "green" : Number(value) < 0 ? "red" : "";
+    const sidePositiveClass = row => row.auction_side === "down" ? "green" : "red";
+    const sideNegativeClass = row => row.auction_side === "down" ? "red" : "green";
+    const sideDeltaClass = (row, value) => {
+      if (!hasNum(value)) return "";
+      const num = Number(value);
+      if (num > 0) return sidePositiveClass(row);
+      if (num < 0) return sideNegativeClass(row);
+      return "";
+    };
+    const pct = value => `${fmt(Number(value || 0) * 100, 0)}%`;
+    const pctRaw = value => hasNum(value) ? `${fmt(value, 2)}%` : "-";
+    const pricePctClass = value => !hasNum(value) ? "" : Number(value) > 0 ? "red" : Number(value) < 0 ? "green" : "";
+    const xqSymbol = code => {
+      const c = String(code || "");
+      if (/^(600|601|603|605|688|689)/.test(c)) return `SH${c}`;
+      if (/^(8|4|920)/.test(c)) return `BJ${c}`;
+      return `SZ${c}`;
+    };
+    const stockLink = row => `https://xueqiu.com/S/${xqSymbol(row.code)}`;
+    const rowKey = row => `${row.auction_side || "up"}:${row.code || ""}`;
+    const sideText = row => row.auction_side === "down" ? "跌停封单" : "涨停封单";
+    const timelineSide = row => row.auction_side || "up";
+    const rowPoints = row => state.timeline
+      .filter(item => item.code === row.code && item.limit_side === timelineSide(row))
+      .slice()
+      .sort((a, b) => String(a.minute || "").localeCompare(String(b.minute || "")));
+    const latestPoint = row => {
+      const points = rowPoints(row);
+      if (points.length) return points[points.length - 1];
+      if (hasNum(row.seal_25_yi)) {
+        return {
+          minute: "09:25",
+          rank_no: row.rank_25 || row.final_candidate_rank || row.risk_rank || row.last_rank || 0,
+          seal_yi: row.seal_25_yi,
+          amount_yi: row.amount_25_yi,
+          auction_pct: row.pct_25,
+          limit_side: timelineSide(row),
+          code: row.code
+        };
+      }
+      return null;
+    };
+    const pointAtMinute = (row, minute) => rowPoints(row).find(item => item.minute === minute) || null;
+    const currentSeal = row => {
+      const point = latestPoint(row);
+      return point ? point.seal_yi : null;
+    };
+    const currentRank = row => {
+      const point = latestPoint(row);
+      return point ? point.rank_no : (row.rank_25 || row.final_candidate_rank || row.risk_rank || row.last_rank || "");
+    };
+    const currentMinute = row => {
+      const point = latestPoint(row);
+      return point ? point.minute : "";
+    };
+    const currentAmount = row => {
+      const point = latestPoint(row);
+      return point ? point.amount_yi : row.amount_25_yi;
+    };
+    const currentPct = row => {
+      const point = latestPoint(row);
+      return point ? point.auction_pct : row.pct_25;
+    };
+    const change20Current = row => {
+      const seal = currentSeal(row);
+      if (!hasNum(row.seal_20_yi) || !hasNum(seal)) return null;
+      return Number(seal) - Number(row.seal_20_yi);
+    };
+    const statusText = row => {
+      const cur = currentSeal(row);
+      const ch1920 = row.change_19_20_yi;
+      const ch20 = change20Current(row);
+      const minute = currentMinute(row);
+      if (!hasNum(cur)) return "无当前";
+      if (!hasNum(row.seal_20_yi)) return minute && minute < "09:20" ? "等待20" : "20缺失";
+      if (Number(row.seal_20_yi) <= 0 && hasNum(row.seal_19_yi) && Number(row.seal_19_yi) > 0) return "20前归零";
+      if (hasNum(ch1920) && Number(ch1920) < 0 && hasNum(ch20) && Number(ch20) > 0) return "20前撤后加强";
+      if (hasNum(ch1920) && Number(ch1920) > 0 && hasNum(ch20) && Number(ch20) > 0) return "持续加强";
+      if (hasNum(ch1920) && Number(ch1920) > 0 && hasNum(ch20) && Number(ch20) < 0) return "20后消耗";
+      if (hasNum(ch1920) && Number(ch1920) < 0 && hasNum(ch20) && Number(ch20) < 0) return "持续走弱";
+      if (hasNum(ch20) && Number(ch20) > 0) return "20后加强";
+      if (hasNum(ch20) && Number(ch20) < 0) return "20后消耗";
+      return "持平";
+    };
+    const statusClass = row => {
+      const status = statusText(row);
+      if (["持续加强", "20前撤后加强", "20后加强"].includes(status)) return "green";
+      if (["20后消耗", "持续走弱", "20前归零"].includes(status)) return "red";
+      return "";
+    };
+    const sideStatusClass = row => {
+      const ch1920 = row.change_19_20_yi;
+      const ch20 = change20Current(row);
+      if (hasNum(row.seal_20_yi) && Number(row.seal_20_yi) <= 0 && hasNum(row.seal_19_yi) && Number(row.seal_19_yi) > 0) return sideNegativeClass(row);
+      if (hasNum(ch1920) && Number(ch1920) < 0 && hasNum(ch20) && Number(ch20) > 0) return sidePositiveClass(row);
+      if (hasNum(ch1920) && Number(ch1920) > 0 && hasNum(ch20) && Number(ch20) > 0) return sidePositiveClass(row);
+      if (hasNum(ch1920) && Number(ch1920) > 0 && hasNum(ch20) && Number(ch20) < 0) return sideNegativeClass(row);
+      if (hasNum(ch1920) && Number(ch1920) < 0 && hasNum(ch20) && Number(ch20) < 0) return sideNegativeClass(row);
+      if (hasNum(ch20) && Number(ch20) > 0) return sidePositiveClass(row);
+      if (hasNum(ch20) && Number(ch20) < 0) return sideNegativeClass(row);
+      return "";
+    };
+    const basisLabel = () => ({
+      current: "当前封单",
+      seal19: "19封单",
+      seal20: "20封单",
+      change1920: "19-20",
+      change20latest: "20-最新"
+    }[state.rankBasis] || "当前封单");
+    const latestMinute = () => {
+      const minutes = state.timeline.map(item => item.minute).filter(Boolean).sort();
+      return minutes.length ? minutes[minutes.length - 1] : "";
+    };
+    const currentBoard = side => state.timeline
+      .filter(item => item.limit_side === side && item.minute === latestMinute())
+      .slice()
+      .sort((a, b) => Number(a.rank_no || 9999) - Number(b.rank_no || 9999) || Number(b.seal_yi || 0) - Number(a.seal_yi || 0));
+    const rowForPoint = point => state.rows.find(row => row.code === point.code && timelineSide(row) === point.limit_side) || {
+      auction_side: point.limit_side,
+      code: point.code,
+      stock_name: point.stock_name,
+      industry: ""
+    };
+    const sideRows = side => state.rows
+      .filter(row => timelineSide(row) === side)
+      .filter(row => {
+        const minute = latestMinute();
+        if (state.rankBasis === "current") return minute ? Boolean(pointAtMinute(row, minute)) : hasNum(currentSeal(row));
+        if (state.rankBasis === "seal19") return hasNum(row.seal_19_yi);
+        if (state.rankBasis === "seal20") return hasNum(row.seal_20_yi);
+        if (state.rankBasis === "change1920") return hasNum(row.change_19_20_yi);
+        if (state.rankBasis === "change20latest") return hasNum(change20Current(row));
+        return false;
+      });
+    const basisValue = row => {
+      if (state.rankBasis === "seal19") return Number(row.seal_19_yi || 0);
+      if (state.rankBasis === "seal20") return Number(row.seal_20_yi || 0);
+      if (state.rankBasis === "change1920") return Number(row.change_19_20_yi || 0);
+      if (state.rankBasis === "change20latest") return Number(change20Current(row) || 0);
+      return Number(currentSeal(row) || 0);
+    };
+    const trackedRows = () => [
+      ...sideRows("up").sort((a, b) => basisValue(b) - basisValue(a) || Number(currentRank(a) || 9999) - Number(currentRank(b) || 9999)).slice(0, 3),
+      ...sideRows("down").sort((a, b) => basisValue(b) - basisValue(a) || Number(currentRank(a) || 9999) - Number(currentRank(b) || 9999)).slice(0, 3)
+    ];
+    function currentDate() {
+      return $("tradeDate").value || params.get("trade_date") || "";
+    }
+    function setQueryDate(value) {
+      const next = new URL(location.href);
+      if (value) next.searchParams.set("trade_date", value);
+      else next.searchParams.delete("trade_date");
+      history.replaceState(null, "", next.toString());
+    }
+    function visibleRows() {
+      const sideOrder = row => row.auction_side === "down" ? 1 : 0;
+      return trackedRows().sort((a, b) => sideOrder(a) - sideOrder(b) || basisValue(b) - basisValue(a) || Number(currentRank(a) || 9999) - Number(currentRank(b) || 9999));
+    }
+    function renderRows() {
+      const rows = visibleRows();
+      if (!rows.length) {
+        $("rowsBody").innerHTML = `<tr><td colspan="9"><div class="empty">暂无竞价数据</div></td></tr>`;
+        renderDetail(null);
+        return;
+      }
+      if (!rows.some(row => rowKey(row) === state.activeKey)) state.activeKey = rowKey(rows[0]);
+      $("rowsBody").innerHTML = rows.map(row => `
+        <tr data-key="${esc(rowKey(row))}" class="side-${row.auction_side === "down" ? "down" : "up"} ${rowKey(row) === state.activeKey ? "active" : ""}">
+          <td class="stock"><a href="${stockLink(row)}" target="_blank" rel="noreferrer">${esc(row.stock_name || "-")}</a><small>${esc(row.code || "")} ${esc(sideText(row))} ${esc(row.industry || "")}</small></td>
+          <td><span class="tag ${row.auction_side === "down" ? "risk" : "strong"}">${esc(sideText(row))}</span></td>
+          <td><span class="num">#${esc(currentRank(row) || "-")}</span><small class="muted">${esc(currentMinute(row) || "")}</small></td>
+          <td><span class="num">${yiMaybe(currentSeal(row))}</span></td>
+          <td><span class="num">${yiMaybe(row.seal_19_yi)}</span></td>
+          <td><span class="num">${yiMaybe(row.seal_20_yi)}</span></td>
+          <td><span class="num ${sideDeltaClass(row, row.change_19_20_yi)}">${signedYi(row.change_19_20_yi)}</span></td>
+          <td><span class="num ${sideDeltaClass(row, change20Current(row))}">${signedYi(change20Current(row))}</span></td>
+          <td><span class="num ${sideStatusClass(row)}">${esc(statusText(row))}</span></td>
+        </tr>`).join("");
+      renderDetail(rows.find(row => rowKey(row) === state.activeKey) || rows[0]);
+    }
+    function renderDetail(row) {
+      if (!row) {
+        $("detailBody").innerHTML = `<div class="empty">暂无可展示的股票</div>`;
+        $("activeHint").textContent = "";
+        return;
+      }
+      $("activeHint").textContent = `${row.code} ${sideText(row)} ${row.first_minute || "-"}-${row.last_minute || "-"}`;
+      const points = state.timeline.filter(item => item.code === row.code && (!row.auction_side || item.limit_side === row.auction_side));
+      const maxSeal = Math.max(...points.map(item => Number(item.seal_yi || 0)), Number(row.max_seal_yi || 0), 0.01);
+      $("detailBody").innerHTML = `
+        <div class="title-line">
+          <h2>${esc(row.stock_name || "-")} <span class="muted">${esc(row.code || "")}</span></h2>
+          <span class="tag ${row.auction_side === "down" ? "risk" : "strong"}">${esc(sideText(row))}</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><span>19封单</span><strong>${yiMaybe(row.seal_19_yi)}</strong></div>
+          <div class="metric"><span>20封单</span><strong>${yiMaybe(row.seal_20_yi)}</strong></div>
+          <div class="metric"><span>当前封单</span><strong>${yiMaybe(currentSeal(row))}</strong></div>
+          <div class="metric"><span>当前排名</span><strong>#${esc(currentRank(row) || "-")}</strong></div>
+          <div class="metric"><span>19-20变化</span><strong class="${sideDeltaClass(row, row.change_19_20_yi)}">${signedYi(row.change_19_20_yi)}</strong></div>
+          <div class="metric"><span>20-最新变化</span><strong class="${sideDeltaClass(row, change20Current(row))}">${signedYi(change20Current(row))}</strong></div>
+          <div class="metric"><span>当前涨幅</span><strong class="${pricePctClass(currentPct(row))}">${pctRaw(currentPct(row))}</strong></div>
+          <div class="metric"><span>当前成交额</span><strong>${yiMaybe(currentAmount(row))}</strong></div>
+          <div class="metric"><span>状态</span><strong class="${sideStatusClass(row)}">${esc(statusText(row))}</strong></div>
+        </div>
+        <div class="reason-box"><strong>时间线</strong>
+          <div class="timeline">
+            ${points.length ? points.map(item => `
+              <div class="bar-row">
+                <span>${esc(item.minute)}</span>
+                <div class="bar-track"><div class="bar-fill ${row.auction_side === "down" ? "down" : ""}" style="width:${Math.max(2, Number(item.seal_yi || 0) / maxSeal * 100)}%"></div></div>
+                <span class="num">${fmt(item.seal_yi, 2)}亿</span>
+              </div>`).join("") : `<div class="empty">暂无分钟记录</div>`}
+          </div>
+        </div>
+        <table class="mini-table">
+          <thead><tr><th>分钟</th><th>排名</th><th>竞价涨幅</th><th>封单额</th></tr></thead>
+          <tbody>${points.map(item => `<tr><td>${esc(item.minute)}</td><td>#${item.rank_no || "-"}</td><td>${pctRaw(item.auction_pct)}</td><td>${fmt(item.seal_yi, 2)}亿</td></tr>`).join("")}</tbody>
+        </table>`;
+    }
+    function renderStats(data) {
+      $("statRows").textContent = data.row_count ?? "-";
+      const minute = latestMinute();
+      const up = currentBoard("up");
+      const down = currentBoard("down");
+      const upTotal = up.reduce((sum, item) => sum + Number(item.seal_yi || 0), 0);
+      const downTotal = down.reduce((sum, item) => sum + Number(item.seal_yi || 0), 0);
+      $("statRows").textContent = minute || "-";
+      $("statFinal").textContent = `${up.length} / ${upTotal.toFixed(1)}亿`;
+      $("statStrong").textContent = `${down.length} / ${downTotal.toFixed(1)}亿`;
+      $("statRisk").textContent = Array.isArray(data.timeline) ? data.timeline.length : "-";
+      $("statMinutes").textContent = Array.isArray(data.minutes) && data.minutes.length ? `${data.minutes[0]}-${data.minutes[data.minutes.length - 1]}` : "-";
+      $("dataSource").textContent = data.source || "-";
+      const depth = Number(data.minute_rank_depth || 0);
+      $("coverageTitle").textContent = "竞价覆盖：分钟封单记录";
+      $("coverageHint").textContent = depth >= 20
+        ? "当前口径可以更好观察最终Top榜的完整封单过程。"
+        : "历史数据深度偏浅，主要适合看最强封单队列；后续交易日已改为全量封单采集。";
+      $("labelChips").innerHTML = [
+        `榜单依据：${basisLabel()}`,
+        "19封单",
+        "20封单",
+        "当前封单",
+        "19-20变化",
+        "20-最新变化",
+        "当前成交额"
+      ].map(label => `<span class="chip">${label}</span>`).join("");
+    }
+    function updateDateButtons() {
+      const index = state.dates.indexOf($("tradeDate").value);
+      $("prevDateBtn").disabled = index < 0 || index >= state.dates.length - 1;
+      $("nextDateBtn").disabled = index <= 0;
+    }
+    async function loadDates() {
+      const response = await fetch("/api/trade_dates", { cache: "no-store" });
+      const data = await response.json();
+      state.dates = Array.isArray(data.dates) ? data.dates : [];
+      if (!$("tradeDate").value) $("tradeDate").value = params.get("trade_date") || data.latest || "";
+      updateDateButtons();
+    }
+    async function load() {
+      try {
+        const date = currentDate();
+        const query = new URLSearchParams();
+        if (date) query.set("trade_date", date);
+        const response = await fetch(`/api/auction-detail?${query.toString()}`, { cache: "no-store" });
+        const data = await response.json();
+        if (data.trade_date) {
+          $("tradeDate").value = data.trade_date;
+          setQueryDate(data.trade_date);
+        }
+        state.lastData = data;
+        state.rows = Array.isArray(data.rows) ? data.rows : [];
+        state.timeline = Array.isArray(data.timeline) ? data.timeline : [];
+        renderStats(data);
+        renderRows();
+        updateDateButtons();
+        $("refreshText").textContent = `已刷新 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+      } catch (error) {
+        $("rowsBody").innerHTML = `<tr><td colspan="9"><div class="error">${esc(error)}</div></td></tr>`;
+        $("detailBody").innerHTML = `<div class="error">${esc(error)}</div>`;
+        $("refreshText").textContent = "刷新失败";
+      }
+    }
+      $("rowsBody").addEventListener("click", event => {
+      const row = event.target.closest("tr[data-key]");
+      if (!row) return;
+      state.activeKey = row.dataset.key || "";
+      renderRows();
+    });
+    $("rankBasis").addEventListener("change", event => {
+      state.rankBasis = event.target.value || "current";
+      state.activeKey = "";
+      renderStats(state.lastData || { timeline: state.timeline, minutes: [] });
+      renderRows();
+    });
+    $("tradeDate").addEventListener("change", event => {
+      setQueryDate(event.target.value);
+      load();
+    });
+    $("prevDateBtn").addEventListener("click", () => {
+      const index = state.dates.indexOf($("tradeDate").value);
+      if (index >= 0 && index < state.dates.length - 1) {
+        $("tradeDate").value = state.dates[index + 1];
+        setQueryDate($("tradeDate").value);
+        load();
+      }
+    });
+    $("nextDateBtn").addEventListener("click", () => {
+      const index = state.dates.indexOf($("tradeDate").value);
+      if (index > 0) {
+        $("tradeDate").value = state.dates[index - 1];
+        setQueryDate($("tradeDate").value);
+        load();
+      }
+    });
+    $("refreshBtn").addEventListener("click", load);
+    loadDates().then(load);
+  </script>
+</body>
+</html>"""
+
+
 MARKET_WIDTH_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -3614,6 +4143,9 @@ MARKET_WIDTH_HTML = r"""<!doctype html>
     .pool-toggle button.active {
       background: #1f2937;
       color: #fff;
+    }
+    .actions .pool-toggle {
+      display: none;
     }
     .date-nav {
       display: inline-flex;

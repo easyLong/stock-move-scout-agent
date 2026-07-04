@@ -218,22 +218,34 @@ src/stock_move_scout/web/templates
 
 3. 给双口径研究池补表维度
 
-现在 `research_pool_items` 是单口径覆盖。未来牛市/熊市要并存，需要在相关产物表加入：
+第一阶段已落地到页面依赖的结果表。口径边界如下：
+
+- 市场概览、异动情报流：固定使用最全研究池，也就是 `bear/none`。
+- 领头羊、爆发板：允许按牛市/熊市系统切换。
+
+允许切换的结果表按同一组口径字段过滤：
 
 ```text
 pool_mode
-ma_mode
+research_pool_ma_mode
 ```
 
-优先表：
+已完成：
+
+```text
+kpl_plate_featured_details
+kpl_stock_featured_sections
+leaderboard_snapshots
+```
+
+仍待拆分：
 
 ```text
 research_pool_snapshots
 research_pool_items
-kpl_plate_featured_details
-market_width_snapshots
-leaderboard_snapshots
 ```
+
+当前策略是先保证页面结果表双口径并存；研究池主表仍保持可重建口径，生成 bull 快照后再恢复 bear 默认口径，避免一次性改动主链路主键。
 
 4. 统一任务定义
 

@@ -13,8 +13,8 @@ from stock_move_scout.research_pool import (
     DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     DEFAULT_RESEARCH_POOL_GAIN_TOP,
     DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
-    DEFAULT_RESEARCH_POOL_RULE,
-    ResearchPoolProvider,
+    normalize_research_pool_ma_mode,
+    research_pool_cte,
 )
 
 
@@ -29,6 +29,7 @@ class KplFeaturedSectionConfig:
     pause: float = 0.08
     limit: int = 0
     code: str = ""
+    ma_mode: str = "none"
     user_agent: str = "lhb/5.2.9 (com.kaipanla.www; build:0; iOS 15.1.0) Alamofire/5.2.9"
 
 
@@ -39,6 +40,8 @@ def ensure_kpl_featured_section_table(config: MySqlConfig) -> None:
         CREATE TABLE IF NOT EXISTS kpl_stock_featured_sections (
           trade_date DATE NOT NULL,
           captured_at DATETIME(3) NOT NULL,
+          pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear',
+          research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none',
           code CHAR(6) NOT NULL,
           stock_name VARCHAR(64) NOT NULL DEFAULT '',
           pool_rank INT NOT NULL DEFAULT 0,
@@ -55,28 +58,72 @@ def ensure_kpl_featured_section_table(config: MySqlConfig) -> None:
           raw_json JSON NULL,
           created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
           updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-          PRIMARY KEY (trade_date, code, section_code),
-          KEY idx_kpl_featured_day_section (trade_date, section_name, section_rank),
-          KEY idx_kpl_featured_day_code (trade_date, code, section_rank),
-          KEY idx_kpl_featured_leader (trade_date, leader_code)
+          PRIMARY KEY (trade_date, pool_mode, research_pool_ma_mode, code, section_code),
+          KEY idx_kpl_featured_day_section (trade_date, pool_mode, research_pool_ma_mode, section_name, section_rank),
+          KEY idx_kpl_featured_day_code (trade_date, pool_mode, research_pool_ma_mode, code, section_rank),
+          KEY idx_kpl_featured_leader (trade_date, pool_mode, research_pool_ma_mode, leader_code)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
           COMMENT='KPL featured sections returned by GetFeaturedSection for research-pool stocks.';
         """,
     )
+    ensure_kpl_featured_section_column(config, "pool_mode", "VARCHAR(16) NOT NULL DEFAULT 'bear' AFTER captured_at")
+    ensure_kpl_featured_section_column(config, "research_pool_ma_mode", "VARCHAR(64) NOT NULL DEFAULT 'none' AFTER pool_mode")
+    ensure_kpl_featured_section_primary_key(config)
 
 
-def load_research_pool_rows(config: MySqlConfig, trade_date: str, *, code: str = "", limit: int = 0) -> list[dict[str, Any]]:
-    ResearchPoolProvider(config).latest_snapshot(trade_date)
+def ensure_kpl_featured_section_column(config: MySqlConfig, column_name: str, column_sql: str) -> None:
+    sql = f"""
+    SELECT COUNT(*)
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'kpl_stock_featured_sections'
+      AND COLUMN_NAME = {sql_string(column_name)};
+    """
+    exists = (run_mysql(config, sql, batch=True, raw=True) or "").splitlines()[-1].strip() == "1"
+    if not exists:
+        run_mysql(config, f"ALTER TABLE kpl_stock_featured_sections ADD COLUMN {column_name} {column_sql};")
+
+
+def ensure_kpl_featured_section_primary_key(config: MySqlConfig) -> None:
+    sql = """
+    SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)
+    FROM INFORMATION_SCHEMA.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'kpl_stock_featured_sections'
+      AND INDEX_NAME = 'PRIMARY';
+    """
+    current = (run_mysql(config, sql, batch=True, raw=True) or "").strip()
+    expected = "trade_date,pool_mode,research_pool_ma_mode,code,section_code"
+    if current != expected:
+        run_mysql(
+            config,
+            """
+            ALTER TABLE kpl_stock_featured_sections
+              DROP PRIMARY KEY,
+              ADD PRIMARY KEY (trade_date, pool_mode, research_pool_ma_mode, code, section_code);
+            """,
+        )
+
+
+def pool_mode_from_ma_mode(ma_mode: str) -> str:
+    return "bull" if normalize_research_pool_ma_mode(ma_mode) != "none" else "bear"
+
+
+def load_research_pool_rows(config: MySqlConfig, trade_date: str, *, code: str = "", limit: int = 0, ma_mode: str = "none") -> list[dict[str, Any]]:
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
     code_filter = f"AND code={sql_string(code)}" if code else ""
     limit_sql = f"LIMIT {max(1, int(limit))}" if int(limit or 0) > 0 else ""
     sql = f"""
-    SELECT code, stock_name, pool_rank, source_kind
-    FROM research_pool_items
-    WHERE trade_date={sql_string(trade_date)}
-      AND rule={sql_string(DEFAULT_RESEARCH_POOL_RULE)}
-      AND limit_up_days={sql_int(DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS)}
-      AND gain_period_days={sql_int(DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS)}
-      AND gain_top={sql_int(DEFAULT_RESEARCH_POOL_GAIN_TOP)}
+    WITH {research_pool_cte(
+        trade_date,
+        limit_up_days=DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
+        gain_period_days=DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
+        gain_top=DEFAULT_RESEARCH_POOL_GAIN_TOP,
+        ma_mode=resolved_ma_mode,
+    )}
+    SELECT code, name AS stock_name, pool_rank, source_kind
+    FROM research_pool
+    WHERE 1=1
       {code_filter}
     ORDER BY pool_rank ASC, code ASC
     {limit_sql};
@@ -157,6 +204,8 @@ def replace_stock_sections(
     stock: dict[str, Any],
     sections: list[dict[str, Any]],
     payload: dict[str, Any],
+    pool_mode: str,
+    ma_mode: str,
 ) -> int:
     code = str(stock.get("code") or "").strip()
     if not code:
@@ -165,6 +214,8 @@ def replace_stock_sections(
         f"""
         DELETE FROM kpl_stock_featured_sections
         WHERE trade_date={sql_string(trade_date)}
+          AND pool_mode={sql_string(pool_mode)}
+          AND research_pool_ma_mode={sql_string(ma_mode)}
           AND code={sql_string(code)};
         """
     ]
@@ -177,11 +228,12 @@ def replace_stock_sections(
         statements.append(
             f"""
             INSERT INTO kpl_stock_featured_sections(
-              trade_date, captured_at, code, stock_name, pool_rank, pool_source_kind,
+              trade_date, captured_at, pool_mode, research_pool_ma_mode, code, stock_name, pool_rank, pool_source_kind,
               section_code, section_name, section_rank, section_score,
               leader_code, leader_name, leader_pct, leader_flag, source, raw_json
             ) VALUES (
-              {sql_string(trade_date)}, {sql_string(captured_at)}, {sql_string(code)},
+              {sql_string(trade_date)}, {sql_string(captured_at)},
+              {sql_string(pool_mode)}, {sql_string(ma_mode)}, {sql_string(code)},
               {sql_string(stock.get("stock_name") or "")}, {sql_int(stock.get("pool_rank"))},
               {sql_string(stock.get("source_kind") or "")},
               {sql_string(section.get("section_code") or "")},
@@ -218,11 +270,18 @@ def replace_stock_sections(
 
 def collect_kpl_stock_featured_sections(config: MySqlConfig, cfg: KplFeaturedSectionConfig) -> dict[str, Any]:
     ensure_kpl_featured_section_table(config)
-    stocks = load_research_pool_rows(config, cfg.trade_date, code=cfg.code, limit=cfg.limit)
+    ma_mode = normalize_research_pool_ma_mode(cfg.ma_mode)
+    pool_mode = pool_mode_from_ma_mode(ma_mode)
+    stocks = load_research_pool_rows(config, cfg.trade_date, code=cfg.code, limit=cfg.limit, ma_mode=ma_mode)
     if not cfg.code and int(cfg.limit or 0) <= 0:
         run_mysql(
             config,
-            f"DELETE FROM kpl_stock_featured_sections WHERE trade_date={sql_string(cfg.trade_date)};",
+            f"""
+            DELETE FROM kpl_stock_featured_sections
+            WHERE trade_date={sql_string(cfg.trade_date)}
+              AND pool_mode={sql_string(pool_mode)}
+              AND research_pool_ma_mode={sql_string(ma_mode)};
+            """,
         )
     captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     imported = 0
@@ -246,6 +305,8 @@ def collect_kpl_stock_featured_sections(config: MySqlConfig, cfg: KplFeaturedSec
                 stock=stock,
                 sections=sections,
                 payload=payload,
+                pool_mode=pool_mode,
+                ma_mode=ma_mode,
             )
             ok_count += 1
             if not sections:
@@ -258,6 +319,8 @@ def collect_kpl_stock_featured_sections(config: MySqlConfig, cfg: KplFeaturedSec
         "ok": not failed,
         "trade_date": cfg.trade_date,
         "captured_at": captured_at,
+        "pool_mode": pool_mode,
+        "research_pool_ma_mode": ma_mode,
         "stock_count": len(stocks),
         "ok_count": ok_count,
         "empty_count": empty_count,

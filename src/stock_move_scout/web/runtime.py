@@ -56,18 +56,9 @@ def latest_data_date(config: MySqlConfig, upper_bound: str | None = "") -> str:
          OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
           OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))
       UNION ALL
-      SELECT trade_date AS day_value
+      SELECT DISTINCT trade_date AS day_value
       FROM stock_daily_bars
-      GROUP BY trade_date
-      HAVING COUNT(*) >= 1000
-      UNION ALL
-      SELECT DATE(scanned_at) AS day_value FROM scan_runs WHERE accepted=1
-      UNION ALL
-      SELECT DATE(ended_at) AS day_value FROM windows WHERE status='done'
-      UNION ALL
-      SELECT trade_date AS day_value FROM research_pool_items WHERE trade_date <= CURDATE()
-      UNION ALL
-      SELECT trade_date AS day_value FROM stock_root_evidence_cache WHERE trade_date <= CURDATE()
+      WHERE trade_date <= CURDATE()
     ) days
     {where_clause};
     """

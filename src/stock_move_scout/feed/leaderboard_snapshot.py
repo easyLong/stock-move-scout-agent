@@ -12,6 +12,8 @@ from stock_move_scout.research_pool import (
     DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
     DEFAULT_RESEARCH_POOL_RULE,
     materialize_research_pool_snapshot,
+    normalize_research_pool_ma_mode,
+    research_pool_system_label,
 )
 from stock_move_scout.web.runtime import parse_json_output
 from stock_move_scout.web.runtime import assert_weekday_trade_date
@@ -19,6 +21,66 @@ from stock_move_scout.web.runtime import assert_weekday_trade_date
 
 SNAPSHOT_SOURCE = "post_close_confirm"
 KPL_SNAPSHOT_SOURCE = "kpl_primary_theme"
+_LEADERBOARD_SCHEMA_READY = False
+
+
+def _pool_mode_from_ma_mode(ma_mode: str | None = "") -> str:
+    return "bull" if normalize_research_pool_ma_mode(ma_mode) != "none" else "bear"
+
+
+def _snapshot_mode_sql(ma_mode: str | None = "") -> str:
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
+    return (
+        f"pool_mode={sql_string(_pool_mode_from_ma_mode(resolved_ma_mode))} "
+        f"AND research_pool_ma_mode={sql_string(resolved_ma_mode)}"
+    )
+
+
+def _column_exists(config: MySqlConfig, column_name: str) -> bool:
+    sql = f"""
+    SELECT COUNT(*)
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA=DATABASE()
+      AND TABLE_NAME='leaderboard_snapshots'
+      AND COLUMN_NAME={sql_string(column_name)};
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    return bool(rows and rows[0] and rows[0][0] != "0")
+
+
+def _primary_key_columns(config: MySqlConfig) -> str:
+    sql = """
+    SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)
+    FROM INFORMATION_SCHEMA.STATISTICS
+    WHERE TABLE_SCHEMA=DATABASE()
+      AND TABLE_NAME='leaderboard_snapshots'
+      AND INDEX_NAME='PRIMARY';
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    return str(rows[0][0] or "") if rows and rows[0] else ""
+
+
+def ensure_leaderboard_snapshot_mode_columns(config: MySqlConfig) -> None:
+    if not _column_exists(config, "pool_mode"):
+        run_mysql(config, "ALTER TABLE leaderboard_snapshots ADD COLUMN pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear' AFTER source;")
+    if not _column_exists(config, "research_pool_ma_mode"):
+        run_mysql(
+            config,
+            "ALTER TABLE leaderboard_snapshots ADD COLUMN research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none' AFTER pool_mode;",
+        )
+    expected = "trade_date,rule,limit_up_days,gain_period_days,gain_top,source,pool_mode,research_pool_ma_mode"
+    if _primary_key_columns(config) != expected:
+        run_mysql(
+            config,
+            """
+            ALTER TABLE leaderboard_snapshots
+              DROP PRIMARY KEY,
+              ADD PRIMARY KEY (
+                trade_date, rule, limit_up_days, gain_period_days, gain_top,
+                source, pool_mode, research_pool_ma_mode
+              );
+            """,
+        )
 
 
 def post_close_dependency_status(config: MySqlConfig, trade_date: str) -> dict[str, Any]:
@@ -70,11 +132,16 @@ def assert_post_close_dependencies(config: MySqlConfig, trade_date: str) -> dict
 
 
 def ensure_leaderboard_snapshot_table(config: MySqlConfig) -> None:
+    global _LEADERBOARD_SCHEMA_READY
+    if _LEADERBOARD_SCHEMA_READY:
+        return
     # Avoid taking metadata locks when the table already exists.
     # Some environments can accumulate long-running sessions that block DDL,
     # while normal SELECT/INSERT is still healthy.
     try:
         run_mysql(config, "SELECT 1 FROM leaderboard_snapshots LIMIT 1;")
+        ensure_leaderboard_snapshot_mode_columns(config)
+        _LEADERBOARD_SCHEMA_READY = True
         return
     except Exception as exc:
         if "doesn't exist" not in str(exc):
@@ -89,19 +156,47 @@ def ensure_leaderboard_snapshot_table(config: MySqlConfig) -> None:
           gain_period_days INT NOT NULL DEFAULT 5,
           gain_top INT NOT NULL DEFAULT 30,
           source VARCHAR(64) NOT NULL DEFAULT 'post_close_confirm',
+          pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear',
+          research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none',
           leader_count INT NOT NULL DEFAULT 0,
           scope_count INT NOT NULL DEFAULT 0,
           source_hash CHAR(64) NOT NULL DEFAULT '',
           payload_json JSON NOT NULL,
           generated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
           updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-          PRIMARY KEY (trade_date, rule, limit_up_days, gain_period_days, gain_top, source),
+          PRIMARY KEY (trade_date, rule, limit_up_days, gain_period_days, gain_top, source, pool_mode, research_pool_ma_mode),
           KEY idx_leaderboard_snapshots_generated (generated_at),
-          KEY idx_leaderboard_snapshots_source (source, trade_date)
+          KEY idx_leaderboard_snapshots_source (source, pool_mode, research_pool_ma_mode, trade_date)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
           COMMENT='Post-close confirmed leaderboard payload snapshots.';
         """,
     )
+    _LEADERBOARD_SCHEMA_READY = True
+
+
+def latest_leaderboard_snapshot_trade_date(
+    config: MySqlConfig,
+    service_trade_date: str,
+    *,
+    source: str = SNAPSHOT_SOURCE,
+    exact: bool = False,
+    ma_mode: str = "none",
+) -> str:
+    ensure_leaderboard_snapshot_table(config)
+    day_predicate = (
+        f"trade_date = {sql_string(service_trade_date)}"
+        if exact
+        else f"trade_date <= {sql_string(service_trade_date)}"
+    )
+    sql = f"""
+    SELECT COALESCE(DATE_FORMAT(MAX(trade_date), '%Y-%m-%d'), '')
+    FROM leaderboard_snapshots
+    WHERE {day_predicate}
+      AND source={sql_string(source)}
+      AND {_snapshot_mode_sql(ma_mode)};
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    return str(rows[0][0] or "").strip() if rows and rows[0] else ""
 
 
 def _payload_counts(payload: dict[str, Any]) -> tuple[int, int]:
@@ -130,19 +225,27 @@ def upsert_leaderboard_snapshot_payload(
     limit_up_days: int = DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
     gain_period_days: int = DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     gain_top: int = DEFAULT_RESEARCH_POOL_GAIN_TOP,
+    ma_mode: str = "none",
 ) -> dict[str, Any]:
     ensure_leaderboard_snapshot_table(config)
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
+    pool_mode = _pool_mode_from_ma_mode(resolved_ma_mode)
     payload = dict(payload or {})
     payload["trade_date"] = payload.get("trade_date") or trade_date
+    payload["pool_mode"] = pool_mode
+    payload["research_pool_ma_mode"] = resolved_ma_mode
+    payload["research_pool_system"] = pool_mode
+    payload["research_pool_system_label"] = research_pool_system_label(resolved_ma_mode)
     scope_count, leader_count = _payload_counts(payload)
     source_hash = _payload_hash(payload)
     sql = f"""
     INSERT INTO leaderboard_snapshots(
-      trade_date, rule, limit_up_days, gain_period_days, gain_top, source,
+      trade_date, rule, limit_up_days, gain_period_days, gain_top, source, pool_mode, research_pool_ma_mode,
       leader_count, scope_count, source_hash, payload_json, generated_at
     ) VALUES (
       {sql_string(trade_date)}, {sql_string(DEFAULT_RESEARCH_POOL_RULE)},
       {sql_int(limit_up_days)}, {sql_int(gain_period_days)}, {sql_int(gain_top)}, {sql_string(source)},
+      {sql_string(pool_mode)}, {sql_string(resolved_ma_mode)},
       {sql_int(leader_count)}, {sql_int(scope_count)}, {sql_string(source_hash)}, {sql_json(payload)}, CURRENT_TIMESTAMP(3)
     )
     ON DUPLICATE KEY UPDATE
@@ -169,6 +272,8 @@ def upsert_leaderboard_snapshot_payload(
                 f"gain_period_days={sql_int(gain_period_days)}",
                 f"gain_top={sql_int(gain_top)}",
                 f"source={sql_string(source)}",
+                f"pool_mode={sql_string(pool_mode)}",
+                f"research_pool_ma_mode={sql_string(resolved_ma_mode)}",
             ]
         )
         run_mysql(config, f"DELETE FROM leaderboard_snapshots WHERE {delete_sql};")
@@ -176,11 +281,12 @@ def upsert_leaderboard_snapshot_payload(
             config,
             f"""
             INSERT INTO leaderboard_snapshots(
-              trade_date, rule, limit_up_days, gain_period_days, gain_top, source,
+              trade_date, rule, limit_up_days, gain_period_days, gain_top, source, pool_mode, research_pool_ma_mode,
               leader_count, scope_count, source_hash, payload_json, generated_at
             ) VALUES (
               {sql_string(trade_date)}, {sql_string(DEFAULT_RESEARCH_POOL_RULE)},
               {sql_int(limit_up_days)}, {sql_int(gain_period_days)}, {sql_int(gain_top)}, {sql_string(source)},
+              {sql_string(pool_mode)}, {sql_string(resolved_ma_mode)},
               {sql_int(leader_count)}, {sql_int(scope_count)}, {sql_string(source_hash)}, {sql_json(payload)}, CURRENT_TIMESTAMP(3)
             );
             """,
@@ -188,6 +294,8 @@ def upsert_leaderboard_snapshot_payload(
     return {
         "trade_date": trade_date,
         "source": source,
+        "pool_mode": pool_mode,
+        "research_pool_ma_mode": resolved_ma_mode,
         "source_hash": source_hash,
         "scope_count": scope_count,
         "leader_count": leader_count,
@@ -204,9 +312,12 @@ def materialize_leaderboard_snapshot(
     force: bool = False,
     rebuild_research_pool: bool = True,
     check_dependencies: bool = True,
+    ma_mode: str = "none",
 ) -> dict[str, Any]:
     assert_weekday_trade_date(trade_date)
     ensure_leaderboard_snapshot_table(config)
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
+    pool_mode = _pool_mode_from_ma_mode(resolved_ma_mode)
     dependencies = assert_post_close_dependencies(config, trade_date) if check_dependencies else post_close_dependency_status(config, trade_date)
     if rebuild_research_pool:
         pool_result = materialize_research_pool_snapshot(
@@ -215,6 +326,7 @@ def materialize_leaderboard_snapshot(
             limit_up_days=limit_up_days,
             gain_period_days=gain_period_days,
             gain_top=gain_top,
+            ma_mode=resolved_ma_mode,
             force=force,
         )
     else:
@@ -229,6 +341,8 @@ def materialize_leaderboard_snapshot(
     payload["leader_data_source"] = SNAPSHOT_SOURCE
     payload["leader_data_label"] = f"{trade_date} 收盘确认"
     payload["leader_snapshot_generated_at"] = ""
+    payload["pool_mode"] = pool_mode
+    payload["research_pool_ma_mode"] = resolved_ma_mode
 
     scope_count, leader_count = _payload_counts(payload)
     source_hash = _payload_hash(payload)
@@ -240,6 +354,7 @@ def materialize_leaderboard_snapshot(
             f"gain_period_days={sql_int(gain_period_days)}",
             f"gain_top={sql_int(gain_top)}",
             f"source={sql_string(SNAPSHOT_SOURCE)}",
+            _snapshot_mode_sql(resolved_ma_mode),
         ]
     )
     if not force:
@@ -254,6 +369,8 @@ def materialize_leaderboard_snapshot(
         if existing and str(existing[0][0] or "") == source_hash:
             return {
                 "trade_date": trade_date,
+                "pool_mode": pool_mode,
+                "research_pool_ma_mode": resolved_ma_mode,
                 "generated": False,
                 "unchanged": True,
                 "source_hash": source_hash,
@@ -271,9 +388,12 @@ def materialize_leaderboard_snapshot(
         limit_up_days=limit_up_days,
         gain_period_days=gain_period_days,
         gain_top=gain_top,
+        ma_mode=resolved_ma_mode,
     )
     return {
         "trade_date": trade_date,
+        "pool_mode": pool_mode,
+        "research_pool_ma_mode": resolved_ma_mode,
         "generated": True,
         "unchanged": False,
         "source_hash": upsert_result.get("source_hash", source_hash),
@@ -290,8 +410,10 @@ def latest_leaderboard_snapshot_payload_by_source(
     *,
     source: str = SNAPSHOT_SOURCE,
     exact: bool = False,
+    ma_mode: str = "none",
 ) -> dict[str, Any] | None:
     ensure_leaderboard_snapshot_table(config)
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
     day_predicate = (
         f"trade_date = {sql_string(service_trade_date)}"
         if exact
@@ -302,6 +424,7 @@ def latest_leaderboard_snapshot_payload_by_source(
     gain_period_days = sql_int(DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS)
     gain_top = sql_int(DEFAULT_RESEARCH_POOL_GAIN_TOP)
     source_sql = sql_string(source)
+    mode_sql = _snapshot_mode_sql(resolved_ma_mode)
     sql = f"""
     SELECT JSON_OBJECT(
       'trade_date', DATE_FORMAT(s.trade_date, '%Y-%m-%d'),
@@ -310,7 +433,7 @@ def latest_leaderboard_snapshot_payload_by_source(
     )
     FROM leaderboard_snapshots s
     JOIN (
-      SELECT trade_date, rule, limit_up_days, gain_period_days, gain_top, source
+      SELECT trade_date, rule, limit_up_days, gain_period_days, gain_top, source, pool_mode, research_pool_ma_mode
       FROM leaderboard_snapshots
       WHERE {day_predicate}
         AND rule={rule}
@@ -318,6 +441,7 @@ def latest_leaderboard_snapshot_payload_by_source(
         AND gain_period_days={gain_period_days}
         AND gain_top={gain_top}
         AND source={source_sql}
+        AND {mode_sql}
       ORDER BY trade_date DESC
       LIMIT 1
     ) latest
@@ -326,7 +450,9 @@ def latest_leaderboard_snapshot_payload_by_source(
      AND latest.limit_up_days=s.limit_up_days
      AND latest.gain_period_days=s.gain_period_days
      AND latest.gain_top=s.gain_top
-     AND latest.source=s.source;
+     AND latest.source=s.source
+     AND latest.pool_mode=s.pool_mode
+     AND latest.research_pool_ma_mode=s.research_pool_ma_mode;
     """
     rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
     if not rows or not rows[0]:
@@ -344,6 +470,10 @@ def latest_leaderboard_snapshot_payload_by_source(
     payload["leader_data_source"] = source
     payload["leader_data_label"] = f"{leader_day} 收盘确认" if leader_day else "收盘确认"
     payload["leader_snapshot_generated_at"] = generated_at
+    payload["pool_mode"] = _pool_mode_from_ma_mode(resolved_ma_mode)
+    payload["research_pool_ma_mode"] = resolved_ma_mode
+    payload["research_pool_system"] = payload["pool_mode"]
+    payload["research_pool_system_label"] = research_pool_system_label(resolved_ma_mode)
     return payload
 
 
@@ -351,8 +481,17 @@ def latest_leaderboard_snapshot_payload(config: MySqlConfig, service_trade_date:
     return latest_leaderboard_snapshot_payload_by_source(config, service_trade_date, source=SNAPSHOT_SOURCE)
 
 
-def materialize_kpl_leaderboard_snapshot(config: MySqlConfig, trade_date: str) -> dict[str, Any]:
-    output = run_mysql(config, kpl_leaderboard_sql(trade_date), batch=True, raw=True)
+def materialize_kpl_leaderboard_snapshot(
+    config: MySqlConfig,
+    trade_date: str,
+    *,
+    ma_mode: str = "none",
+    force_research_pool: bool = True,
+) -> dict[str, Any]:
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
+    if force_research_pool:
+        materialize_research_pool_snapshot(config, trade_date, ma_mode=resolved_ma_mode, force=True)
+    output = run_mysql(config, kpl_leaderboard_sql(trade_date, ma_mode=resolved_ma_mode), batch=True, raw=True)
     payload = parse_json_output(output)
     if not isinstance(payload, dict):
         payload = {}
@@ -361,6 +500,6 @@ def materialize_kpl_leaderboard_snapshot(config: MySqlConfig, trade_date: str) -
     payload["leader_data_source"] = KPL_SNAPSHOT_SOURCE
     payload["leader_data_label"] = f"{trade_date} 收盘确认"
     payload["leader_snapshot_generated_at"] = ""
-    result = upsert_leaderboard_snapshot_payload(config, trade_date, payload, source=KPL_SNAPSHOT_SOURCE)
+    result = upsert_leaderboard_snapshot_payload(config, trade_date, payload, source=KPL_SNAPSHOT_SOURCE, ma_mode=resolved_ma_mode)
     result["generated"] = True
     return result

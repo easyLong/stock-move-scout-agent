@@ -12,6 +12,8 @@ def ensure_market_width_tables(config: MySqlConfig) -> None:
       captured_at DATETIME(3) NOT NULL,
       source VARCHAR(64) NOT NULL DEFAULT 'akshare_stock_zh_a_spot',
       market_scope VARCHAR(32) NOT NULL DEFAULT 'cn_a_main',
+      pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear',
+      research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none',
       total_count INT NOT NULL DEFAULT 0,
       up_count INT NOT NULL DEFAULT 0,
       down_count INT NOT NULL DEFAULT 0,
@@ -52,6 +54,7 @@ def ensure_market_width_tables(config: MySqlConfig) -> None:
       PRIMARY KEY (id),
       UNIQUE KEY uk_market_width_snapshot_id (snapshot_id),
       KEY idx_market_width_trade_time (trade_date, captured_at),
+      KEY idx_market_width_trade_time_mode (trade_date, pool_mode, research_pool_ma_mode, captured_at),
       KEY idx_market_width_created_at (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
       COMMENT='盘中市场概览快照：全市场、成交额Top50、研究池宽度统计';
@@ -96,8 +99,22 @@ def _column_exists(config: MySqlConfig, table_name: str, column_name: str) -> bo
     return bool(rows and rows[0] and rows[0][0] != "0")
 
 
+def _index_exists(config: MySqlConfig, table_name: str, index_name: str) -> bool:
+    sql = f"""
+    SELECT COUNT(*)
+    FROM INFORMATION_SCHEMA.STATISTICS
+    WHERE TABLE_SCHEMA=DATABASE()
+      AND TABLE_NAME={sql_string(table_name)}
+      AND INDEX_NAME={sql_string(index_name)};
+    """
+    rows = mysql_rows(run_mysql(config, sql, batch=True, raw=True))
+    return bool(rows and rows[0] and rows[0][0] != "0")
+
+
 def ensure_market_width_snapshot_columns(config: MySqlConfig) -> None:
     columns = {
+        "pool_mode": "VARCHAR(16) NOT NULL DEFAULT 'bear' AFTER market_scope",
+        "research_pool_ma_mode": "VARCHAR(64) NOT NULL DEFAULT 'none' AFTER pool_mode",
         "amount_top50_count": "INT NOT NULL DEFAULT 0 AFTER limit_down_count",
         "up5_count": "INT NOT NULL DEFAULT 0 AFTER down3_count",
         "down5_count": "INT NOT NULL DEFAULT 0 AFTER up5_count",
@@ -131,3 +148,8 @@ def ensure_market_width_snapshot_columns(config: MySqlConfig) -> None:
     ]
     if statements:
         run_mysql(config, "\n".join(statements))
+    if not _index_exists(config, "market_width_snapshots", "idx_market_width_trade_time_mode"):
+        run_mysql(
+            config,
+            "ALTER TABLE market_width_snapshots ADD KEY idx_market_width_trade_time_mode (trade_date, pool_mode, research_pool_ma_mode, captured_at);",
+        )

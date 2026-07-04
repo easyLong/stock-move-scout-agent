@@ -10,6 +10,7 @@ from typing import Any
 import requests
 
 from stock_move_scout.db import MySqlConfig, mysql_rows, run_mysql, sql_int, sql_json, sql_number, sql_string
+from stock_move_scout.research_pool import normalize_research_pool_ma_mode
 from stock_move_scout.sources.kpl_plate_strength import KPL_PLATE_STRENGTH_HIS_URL, KPL_PLATE_STRENGTH_URL
 
 
@@ -23,6 +24,7 @@ class KplPlateDetailConfig:
     pause: float = 0.05
     limit: int = 5
     plate_code: str = ""
+    ma_mode: str = "none"
     version: str = "5.11.0.1"
     api_version: str = "w33"
     user_agent: str = "lhb/5.11.1 (com.kaipanla.www; build:0; iOS 14.6.0) Alamofire/5.11.1"
@@ -35,6 +37,8 @@ def ensure_kpl_plate_detail_table(config: MySqlConfig) -> None:
         CREATE TABLE IF NOT EXISTS kpl_plate_featured_details (
           trade_date DATE NOT NULL,
           captured_at DATETIME(3) NOT NULL,
+          pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear',
+          research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none',
           source_snapshot_at DATETIME(3) NULL,
           row_rank INT NOT NULL DEFAULT 0,
           plate_code VARCHAR(32) NOT NULL,
@@ -50,16 +54,19 @@ def ensure_kpl_plate_detail_table(config: MySqlConfig) -> None:
           raw_json JSON NULL,
           created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
           updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-          PRIMARY KEY (trade_date, captured_at, plate_code),
-          KEY idx_kpl_plate_detail_latest (trade_date, captured_at, row_rank),
-          KEY idx_kpl_plate_detail_plate (plate_code, trade_date, captured_at),
-          KEY idx_kpl_plate_detail_snapshot (trade_date, source_snapshot_at, row_rank)
+          PRIMARY KEY (trade_date, pool_mode, research_pool_ma_mode, captured_at, plate_code),
+          KEY idx_kpl_plate_detail_latest (trade_date, pool_mode, research_pool_ma_mode, captured_at, row_rank),
+          KEY idx_kpl_plate_detail_plate (plate_code, trade_date, pool_mode, research_pool_ma_mode, captured_at),
+          KEY idx_kpl_plate_detail_snapshot (trade_date, pool_mode, research_pool_ma_mode, source_snapshot_at, row_rank)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
           COMMENT='KPL featured plate detail rows from clicked plate page; stores explosion reason when returned and sub-plate breakdown.';
         """,
     )
+    ensure_kpl_plate_detail_column(config, "pool_mode", "VARCHAR(16) NOT NULL DEFAULT 'bear' AFTER captured_at")
+    ensure_kpl_plate_detail_column(config, "research_pool_ma_mode", "VARCHAR(64) NOT NULL DEFAULT 'none' AFTER pool_mode")
     ensure_kpl_plate_detail_column(config, "top_research_pool_stocks", "JSON NULL")
     ensure_kpl_plate_detail_column(config, "top_research_pool_stocks_by_sub_plate", "JSON NULL")
+    ensure_kpl_plate_detail_primary_key(config)
 
 
 def ensure_kpl_plate_detail_column(config: MySqlConfig, column_name: str, column_sql: str) -> None:
@@ -73,6 +80,31 @@ def ensure_kpl_plate_detail_column(config: MySqlConfig, column_name: str, column
     exists = (run_mysql(config, sql, batch=True, raw=True) or "").splitlines()[-1].strip() == "1"
     if not exists:
         run_mysql(config, f"ALTER TABLE kpl_plate_featured_details ADD COLUMN {column_name} {column_sql};")
+
+
+def ensure_kpl_plate_detail_primary_key(config: MySqlConfig) -> None:
+    sql = """
+    SELECT GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)
+    FROM INFORMATION_SCHEMA.STATISTICS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'kpl_plate_featured_details'
+      AND INDEX_NAME = 'PRIMARY';
+    """
+    current = (run_mysql(config, sql, batch=True, raw=True) or "").strip()
+    expected = "trade_date,pool_mode,research_pool_ma_mode,captured_at,plate_code"
+    if current != expected:
+        run_mysql(
+            config,
+            """
+            ALTER TABLE kpl_plate_featured_details
+              DROP PRIMARY KEY,
+              ADD PRIMARY KEY (trade_date, pool_mode, research_pool_ma_mode, captured_at, plate_code);
+            """,
+        )
+
+
+def pool_mode_from_ma_mode(ma_mode: str) -> str:
+    return "bull" if normalize_research_pool_ma_mode(ma_mode) != "none" else "bear"
 
 
 def _headers(user_agent: str) -> dict[str, str]:
@@ -586,6 +618,8 @@ def load_top_research_pool_stocks_by_sub_plate(
     plate_code: str,
     plate_name: str,
     sub_plates: list[dict[str, Any]],
+    pool_mode: str = "bear",
+    ma_mode: str = "none",
     limit: int = 5,
 ) -> list[dict[str, Any]]:
     picked_sub_plates = [
@@ -607,6 +641,8 @@ def load_top_research_pool_stocks_by_sub_plate(
             sub_plate_name=section_name,
             sub_plate_rank=index,
             sub_plate_strength=sub_plate.get("strength"),
+            pool_mode=pool_mode,
+            ma_mode=ma_mode,
             limit=limit,
         )
         if ranked:
@@ -632,6 +668,8 @@ def load_top_research_pool_stocks_by_sub_plate(
         sub_plate_name="双创",
         sub_plate_rank=len(groups) + 1,
         sub_plate_strength="科创+创业",
+        pool_mode=pool_mode,
+        ma_mode=ma_mode,
         limit=limit,
         section_codes=twenty_cm_section_codes,
         only_20cm=True,
@@ -658,6 +696,8 @@ def load_sub_plate_leader_top_stocks(
     sub_plate_name: str,
     sub_plate_rank: int,
     sub_plate_strength: Any,
+    pool_mode: str = "bear",
+    ma_mode: str = "none",
     limit: int = 5,
     section_codes: list[str] | None = None,
     only_20cm: bool = False,
@@ -702,6 +742,8 @@ def load_sub_plate_leader_top_stocks(
         ON db.code=k.code
        AND db.trade_date=CAST({day} AS DATE)
       WHERE k.trade_date=CAST({day} AS DATE)
+        AND k.pool_mode={sql_string(pool_mode)}
+        AND k.research_pool_ma_mode={sql_string(ma_mode)}
         AND {section_condition}
         AND COALESCE(k.code, '') <> ''
         {stock_code_filter}
@@ -1149,6 +1191,8 @@ def save_plate_details(
     *,
     trade_date: str,
     captured_at: str,
+    pool_mode: str,
+    ma_mode: str,
     rows: list[dict[str, Any]],
 ) -> int:
     statements: list[str] = []
@@ -1156,11 +1200,12 @@ def save_plate_details(
         statements.append(
             f"""
             INSERT INTO kpl_plate_featured_details(
-              trade_date, captured_at, source_snapshot_at, row_rank, plate_code, plate_name,
+              trade_date, captured_at, pool_mode, research_pool_ma_mode, source_snapshot_at, row_rank, plate_code, plate_name,
               strength, change_pct, speed, reason_text, sub_plates, top_research_pool_stocks,
               top_research_pool_stocks_by_sub_plate, source, raw_json
             ) VALUES (
               {sql_string(trade_date)}, {sql_string(captured_at)},
+              {sql_string(pool_mode)}, {sql_string(ma_mode)},
               {sql_string(row.get("source_snapshot_at") or "")},
               {sql_int(row.get("row_rank"))},
               {sql_string(row.get("plate_code") or "")},
@@ -1198,6 +1243,8 @@ def save_plate_details(
 
 def collect_kpl_plate_details(config: MySqlConfig, cfg: KplPlateDetailConfig) -> dict[str, Any]:
     ensure_kpl_plate_detail_table(config)
+    ma_mode = normalize_research_pool_ma_mode(cfg.ma_mode)
+    pool_mode = pool_mode_from_ma_mode(ma_mode)
     plate_rows = load_latest_plate_rows(config, cfg)
     captured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     session = requests.Session()
@@ -1232,6 +1279,8 @@ def collect_kpl_plate_details(config: MySqlConfig, cfg: KplPlateDetailConfig) ->
                 plate_code=code,
                 plate_name=str(plate.get("plate_name") or ""),
                 sub_plates=sub_plates,
+                pool_mode=pool_mode,
+                ma_mode=ma_mode,
                 limit=5,
             )
             top_stocks = [
@@ -1258,6 +1307,8 @@ def collect_kpl_plate_details(config: MySqlConfig, cfg: KplPlateDetailConfig) ->
                     "raw_json": {
                         "son_plate_info": payload,
                         "reason_source": reason_source,
+                        "pool_mode": pool_mode,
+                        "research_pool_ma_mode": ma_mode,
                         "top_stock_rule": "top2_sub_plates plus fixed dual-growth group -> each group kpl_stock_featured_sections research-pool intersection -> emotion top3 + trend top1",
                     },
                 }
@@ -1266,11 +1317,20 @@ def collect_kpl_plate_details(config: MySqlConfig, cfg: KplPlateDetailConfig) ->
             failed.append({"plate_code": code, "error": f"{type(exc).__name__}: {str(exc)[:300]}"})
         if cfg.pause > 0 and index < len(plate_rows):
             time.sleep(float(cfg.pause))
-    imported = save_plate_details(config, trade_date=cfg.trade_date, captured_at=captured_at, rows=imported_rows)
+    imported = save_plate_details(
+        config,
+        trade_date=cfg.trade_date,
+        captured_at=captured_at,
+        pool_mode=pool_mode,
+        ma_mode=ma_mode,
+        rows=imported_rows,
+    )
     return {
         "ok": not failed,
         "trade_date": cfg.trade_date,
         "captured_at": captured_at,
+        "pool_mode": pool_mode,
+        "research_pool_ma_mode": ma_mode,
         "source": KPL_PLATE_DETAIL_SOURCE,
         "plate_count": len(plate_rows),
         "imported": imported,

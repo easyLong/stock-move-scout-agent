@@ -1,4 +1,4 @@
-# MySQL 表职责
+﻿# MySQL 表职责
 
 ## 研究池
 
@@ -20,6 +20,8 @@
 | `market_width_amount_top50` | 每个市场概览快照的成交额 Top50 |
 | `kpl_market_capacity_snapshots` | 开盘啦预测量能快照 |
 | `kpl_market_capacity_trends` | 开盘啦预测量能分时趋势 |
+
+市场概览运行时固定使用最全研究池口径，也就是 `pool_mode='bear'`、`research_pool_ma_mode='none'`；`market_width_amount_top50` 通过 `snapshot_id` 跟随快照口径。保留口径字段是为了兼容历史数据和排查，不作为页面切换维度。
 
 新逻辑只使用研究池口径字段，不再使用旧问财 Top50 口径。
 
@@ -52,6 +54,18 @@
 | `kpl_replay_limit_theme_stocks` | 分组下的涨停股票和说明 |
 | `kpl_stock_limit_up_reasons` | 个股涨停原因 |
 
+`kpl_plate_featured_details` 和 `kpl_stock_featured_sections` 使用 `pool_mode` + `research_pool_ma_mode` 保存不同研究池口径下的结果，爆发板页面查询时必须带对应口径。
+
+## 集合竞价
+
+| 表 | 用途 |
+| --- | --- |
+| `auction_minute_analysis` | 09:15-09:25 分钟封单雷达，当前采集所有涨停/跌停封单 |
+| `auction_candidates` | 最终涨停封单候选，当前只保留 Top3 |
+| `auction_trend_summary` | 竞价详情摘要，压缩封单稳定性、撤单风险、最终突入、尾盘掉榜等标签 |
+
+历史竞价只能基于已保存的分钟明细补 `auction_trend_summary`，不能倒采当时没有保存的竞价快照。
+
 ## 有效事实和证据缓存
 
 | 表/视图 | 用途 |
@@ -66,6 +80,8 @@
 | 表 | 用途 |
 | --- | --- |
 | `leaderboard_snapshots` | 收盘确认版领头羊整页快照 |
+
+`leaderboard_snapshots` 使用 `pool_mode` + `research_pool_ma_mode` 同时保存牛市/熊市系统下的同花顺领头羊和开盘啦领头羊快照，Web 优先读取对应口径快照。
 
 快照来源：
 

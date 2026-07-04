@@ -22,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trade-date", default=date.today().isoformat())
     parser.add_argument("--code", default="", help="Collect a single stock code for debugging.")
     parser.add_argument("--limit", type=int, default=0, help="Limit research-pool stocks for smoke tests.")
+    parser.add_argument("--ma-mode", default="none", help="Research-pool MA mode: none/bear or ma5_10_20_30_up/bull.")
+    parser.add_argument("--pool-mode", default="", help="Alias for --ma-mode, accepts bear/bull.")
     parser.add_argument("--timeout", type=int, default=8)
     parser.add_argument("--pause", type=float, default=0.08)
     return parser.parse_args()
@@ -43,6 +45,7 @@ def main() -> int:
             pause=max(0.0, float(args.pause)),
             limit=max(0, int(args.limit)),
             code=str(args.code or "").strip(),
+            ma_mode=str(args.pool_mode or args.ma_mode),
         ),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

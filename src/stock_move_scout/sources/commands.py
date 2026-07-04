@@ -351,6 +351,8 @@ def build_source_command(
             "--pause",
             str(float(payload.get("pause", 0.05))),
         ]
+        if payload.get("pool_mode") or payload.get("ma_mode"):
+            command.extend(["--ma-mode", str(payload.get("pool_mode") or payload.get("ma_mode"))])
         if payload.get("plate_code"):
             command.extend(["--plate-code", str(payload.get("plate_code"))])
         return command + mysql_args
@@ -379,6 +381,8 @@ def build_source_command(
             "--pause",
             str(float(payload.get("pause", 0.08))),
         ]
+        if payload.get("pool_mode") or payload.get("ma_mode"):
+            command.extend(["--ma-mode", str(payload.get("pool_mode") or payload.get("ma_mode"))])
         if payload.get("code"):
             command.extend(["--code", str(payload.get("code"))])
         if payload.get("limit"):
@@ -402,6 +406,10 @@ def build_source_command(
             command.append("--force")
         if payload.get("skip_research_pool"):
             command.append("--skip-research-pool")
+        if payload.get("all_pool_modes"):
+            command.append("--all-pool-modes")
+        elif payload.get("pool_mode") or payload.get("ma_mode"):
+            command.extend(["--ma-mode", str(payload.get("pool_mode") or payload.get("ma_mode"))])
         return command + mysql_args
 
     if kind == "kpl_leaderboard_snapshot":
@@ -412,6 +420,10 @@ def build_source_command(
             str(payload.get("trade_date") or current_time.strftime("%Y-%m-%d")),
             "--kpl-only",
         ]
+        if payload.get("all_pool_modes"):
+            command.append("--all-pool-modes")
+        elif payload.get("pool_mode") or payload.get("ma_mode"):
+            command.extend(["--ma-mode", str(payload.get("pool_mode") or payload.get("ma_mode"))])
         return command + mysql_args
 
     if kind == "ths_stock_concepts":
@@ -506,9 +518,9 @@ def build_source_command(
         if payload.get("max_minute_runs"):
             command.extend(["--max-minute-runs", str(int(payload.get("max_minute_runs", 0)))])
         if payload.get("minute_top"):
-            command.extend(["--minute-top", str(int(payload.get("minute_top", 10)))])
+            command.extend(["--minute-top", str(int(payload.get("minute_top", 20)))])
         if payload.get("seal_top"):
-            command.extend(["--seal-top", str(int(payload.get("seal_top", 3)))])
+            command.extend(["--seal-top", str(int(payload.get("seal_top", 0)))])
         if payload.get("include_st"):
             command.append("--include-st")
         if payload.get("trade_date"):

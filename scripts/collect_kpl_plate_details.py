@@ -19,6 +19,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trade-date", default=date.today().isoformat())
     parser.add_argument("--limit", type=int, default=5, help="Top N featured plates from latest strength snapshot.")
     parser.add_argument("--plate-code", default="", help="Collect one plate only, e.g. 801001.")
+    parser.add_argument("--ma-mode", default="none", help="Research-pool MA mode: none/bear or ma5_10_20_30_up/bull.")
+    parser.add_argument("--pool-mode", default="", help="Alias for --ma-mode, accepts bear/bull.")
     parser.add_argument("--timeout", type=int, default=8)
     parser.add_argument("--pause", type=float, default=0.05)
     return parser.parse_args()
@@ -40,6 +42,7 @@ def main() -> int:
             pause=max(0.0, float(args.pause)),
             limit=max(1, int(args.limit)),
             plate_code=str(args.plate_code or "").strip(),
+            ma_mode=str(args.pool_mode or args.ma_mode),
         ),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

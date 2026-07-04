@@ -20,7 +20,7 @@ import pandas as pd
 import requests
 
 from stock_move_scout.market_width import ensure_market_width_tables
-from stock_move_scout.research_pool import ResearchPoolProvider
+from stock_move_scout.research_pool import ResearchPoolProvider, normalize_research_pool_ma_mode
 from stock_move_scout.sources import (
     DEFAULT_TDX_SERVERS,
     QuoteProviderConfig,
@@ -318,10 +318,17 @@ def width_stats(rows: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
-def load_research_pool_codes(config: Any, trade_day: date) -> tuple[str, list[str], dict[str, Any]]:
-    snapshot = ResearchPoolProvider(config).latest_snapshot(trade_day.isoformat())
+def pool_mode_from_ma_mode(ma_mode: str) -> str:
+    return "bull" if normalize_research_pool_ma_mode(ma_mode) != "none" else "bear"
+
+
+def load_research_pool_codes(config: Any, trade_day: date, *, ma_mode: str) -> tuple[str, list[str], dict[str, Any]]:
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
+    snapshot = ResearchPoolProvider(config).latest_snapshot(trade_day.isoformat(), ma_mode=resolved_ma_mode)
     return snapshot.trade_date, list(snapshot.codes), {
         "rule": snapshot.rule,
+        "pool_mode": pool_mode_from_ma_mode(resolved_ma_mode),
+        "ma_mode": resolved_ma_mode,
         "code_count": snapshot.code_count,
         "source_dates": snapshot.source_dates,
         "codes_by_source_count": {key: len(values) for key, values in snapshot.codes_by_source.items()},
@@ -335,6 +342,8 @@ def build_snapshot(
     captured_at: datetime,
     source: str,
     market_scope: str,
+    pool_mode: str,
+    ma_mode: str,
     research_pool_trade_date: str,
     research_pool_codes: list[str],
     research_pool_meta: dict[str, Any] | None = None,
@@ -355,6 +364,8 @@ def build_snapshot(
         "captured_at": captured_at.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
         "source": source,
         "market_scope": market_scope,
+        "pool_mode": pool_mode,
+        "research_pool_ma_mode": ma_mode,
         "total_count": market["count"],
         "up_count": market["up_count"],
         "down_count": market["down_count"],
@@ -394,9 +405,13 @@ def build_snapshot(
             "row_count": len(rows),
             "top50_count": len(top50),
             "research_pool_trade_date": research_pool_trade_date,
+            "pool_mode": pool_mode,
+            "research_pool_ma_mode": ma_mode,
             "research_pool_quote_count": research_pool_stats["count"],
             "research_pool_meta": {
                 "rule": (research_pool_meta or {}).get("rule"),
+                "pool_mode": (research_pool_meta or {}).get("pool_mode"),
+                "ma_mode": (research_pool_meta or {}).get("ma_mode"),
                 "code_count": (research_pool_meta or {}).get("code_count"),
                 "source_dates": (research_pool_meta or {}).get("source_dates"),
                 "codes_by_source_count": (research_pool_meta or {}).get("codes_by_source_count"),
@@ -419,7 +434,7 @@ def build_snapshot(
 def insert_snapshot(config: Any, snapshot: dict[str, Any], top50: list[dict[str, Any]]) -> None:
     snapshot_sql = f"""
     INSERT INTO market_width_snapshots(
-      snapshot_id, trade_date, captured_at, source, market_scope,
+      snapshot_id, trade_date, captured_at, source, market_scope, pool_mode, research_pool_ma_mode,
       total_count, up_count, down_count, flat_count, up3_count, down3_count,
       up5_count, down5_count,
       limit_up_count, limit_down_count,
@@ -437,6 +452,8 @@ def insert_snapshot(config: Any, snapshot: dict[str, Any], top50: list[dict[str,
       {sql_string(snapshot['captured_at'])},
       {sql_string(snapshot['source'])},
       {sql_string(snapshot['market_scope'])},
+      {sql_string(snapshot.get('pool_mode') or "bear")},
+      {sql_string(snapshot.get('research_pool_ma_mode') or "none")},
       {sql_int(snapshot['total_count'])},
       {sql_int(snapshot['up_count'])},
       {sql_int(snapshot['down_count'])},
@@ -483,6 +500,8 @@ def insert_snapshot(config: Any, snapshot: dict[str, Any], top50: list[dict[str,
       down3_count=VALUES(down3_count),
       up5_count=VALUES(up5_count),
       down5_count=VALUES(down5_count),
+      pool_mode=VALUES(pool_mode),
+      research_pool_ma_mode=VALUES(research_pool_ma_mode),
       limit_up_count=VALUES(limit_up_count),
       limit_down_count=VALUES(limit_down_count),
       amount_top50_count=VALUES(amount_top50_count),
@@ -601,6 +620,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tdx-dir", type=Path, default=DEFAULT_TDX_DIR)
     parser.add_argument("--universe-csv", type=Path, default=root / "data" / "stock" / "tdx_a_stock_universe.csv")
     parser.add_argument("--output-json", type=Path, default=root / "runs" / "data_tasks" / "market_width_latest.json")
+    parser.add_argument("--ma-mode", default="none", help="Research-pool MA mode: none/bear or ma5_10_20_30_up/bull.")
+    parser.add_argument("--pool-mode", default="", help="Alias for --ma-mode, accepts bear/bull.")
     parser.add_argument("--skip-kpl-market-capacity", action="store_true", help="Do not collect KPL market capacity in the same snapshot batch.")
     parser.add_argument("--skip-ensure-tables", action="store_true", help="Skip DDL checks when tables are already initialized.")
     parser.add_argument("--kpl-timeout", type=int, default=8)
@@ -633,15 +654,19 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False))
         return 0
 
-    snapshot_id = captured_at.strftime("%Y%m%d%H%M%S%f")[:20]
+    ma_mode = normalize_research_pool_ma_mode(args.pool_mode or args.ma_mode)
+    pool_mode = pool_mode_from_ma_mode(ma_mode)
+    snapshot_id = f"{captured_at.strftime('%Y%m%d%H%M%S%f')[:20]}_{pool_mode}"
     source, rows, source_meta = fetch_market_rows(args)
-    research_pool_trade_date, research_pool_codes, research_pool_meta = load_research_pool_codes(config, captured_at.date())
+    research_pool_trade_date, research_pool_codes, research_pool_meta = load_research_pool_codes(config, captured_at.date(), ma_mode=ma_mode)
     snapshot, top50 = build_snapshot(
         rows,
         snapshot_id=snapshot_id,
         captured_at=captured_at,
         source=source,
         market_scope="cn_a_all" if args.include_bj else "cn_a_main",
+        pool_mode=pool_mode,
+        ma_mode=ma_mode,
         research_pool_trade_date=research_pool_trade_date,
         research_pool_codes=research_pool_codes,
         research_pool_meta=research_pool_meta,
@@ -686,7 +711,22 @@ def main() -> int:
     }
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"ok": True, "snapshot_id": snapshot_id, "trade_date": date.today().isoformat(), "rows": len(rows), "top50": len(top50), "source": source, "kpl_capacity": kpl_capacity}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "snapshot_id": snapshot_id,
+                "trade_date": date.today().isoformat(),
+                "pool_mode": pool_mode,
+                "research_pool_ma_mode": ma_mode,
+                "rows": len(rows),
+                "top50": len(top50),
+                "source": source,
+                "kpl_capacity": kpl_capacity,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

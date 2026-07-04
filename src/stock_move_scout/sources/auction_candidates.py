@@ -43,8 +43,8 @@ class AuctionCandidateConfig:
     loop_until: str = ""
     minute_interval: int = 60
     max_minute_runs: int = 0
-    minute_top: int = 10
-    seal_top: int = 3
+    minute_top: int = 20
+    seal_top: int = 0
     exclude_st: bool = True
     refresh_universe: bool = False
     servers: tuple[tuple[str, int], ...] = DEFAULT_TDX_SERVERS
@@ -388,20 +388,30 @@ class AuctionCandidateService:
 
     def build_minute_analysis_rows(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         rows, meta = self.fetch_enriched_rows()
+        seal_top = int(self.config.seal_top or 0)
         up_seals = sorted(
             [row for row in rows if row.get("limit_side") == "up" and to_float(row.get("seal_volume")) > 0],
             key=lambda item: (-to_float(item.get("seal_amount")), -to_float(item.get("seal_volume"))),
-        )[: int(self.config.seal_top)]
+        )
+        down_seals = sorted(
+            [row for row in rows if row.get("limit_side") == "down" and to_float(row.get("seal_volume")) > 0],
+            key=lambda item: (-to_float(item.get("seal_amount")), -to_float(item.get("seal_volume"))),
+        )
+        if seal_top > 0:
+            up_seals = up_seals[:seal_top]
+            down_seals = down_seals[:seal_top]
         analysis_rows = []
         analysis_rows.extend(with_analysis_rank(up_seals, "limit_up_order", "up"))
+        analysis_rows.extend(with_analysis_rank(down_seals, "limit_down_order", "down"))
         meta.update(
             {
                 "analysis_row_count": len(analysis_rows),
                 "pct_top_count": 0,
                 "limit_up_order_count": len(up_seals),
-                "limit_down_order_count": 0,
+                "limit_down_order_count": len(down_seals),
                 "minute_top": self.config.minute_top,
-                "seal_top": self.config.seal_top,
+                "seal_top": seal_top,
+                "seal_scope": "all" if seal_top <= 0 else f"top{seal_top}",
             }
         )
         return analysis_rows, meta
@@ -455,12 +465,30 @@ class AuctionCandidateService:
             summaries.append(summary)
         return summaries
 
-    def should_continue_loop(self, runs: int) -> bool:
+    def should_continue_loop(self, runs: int, last_snapshot_minute: str = "") -> bool:
         if self.config.max_minute_runs and runs >= self.config.max_minute_runs:
             return False
         if not self.config.loop_until:
             return False
-        return datetime.now().time() < parse_hhmm(self.config.loop_until)
+        target = parse_hhmm(self.config.loop_until)
+        if last_snapshot_minute:
+            try:
+                captured = datetime.strptime(str(last_snapshot_minute), "%Y-%m-%d %H:%M:%S").time()
+                if captured >= target:
+                    return False
+            except ValueError:
+                pass
+        return datetime.now().time() <= clock_time(target.hour, target.minute, 59)
+
+    def sleep_before_next_minute(self, last_snapshot_minute: str = "") -> None:
+        if last_snapshot_minute:
+            try:
+                captured = datetime.strptime(str(last_snapshot_minute), "%Y-%m-%d %H:%M:%S")
+                if minute_floor(datetime.now()) > captured:
+                    return
+            except ValueError:
+                pass
+        time.sleep(seconds_to_next_minute(int(self.config.minute_interval)))
 
     def run(self, on_minute_payload: Callable[[dict[str, Any]], None] | None = None) -> AuctionCandidateResult:
         needs_minute_window = self.config.minute_analysis or bool(self.config.loop_until)
@@ -492,9 +520,9 @@ class AuctionCandidateService:
                             "limit_down_order": minute_meta.get("limit_down_order_count"),
                         }
                     )
-                if not self.should_continue_loop(runs):
+                if not self.should_continue_loop(runs, str(minute_meta.get("snapshot_minute") or "")):
                     break
-                time.sleep(seconds_to_next_minute(int(self.config.minute_interval)))
+                self.sleep_before_next_minute(str(minute_meta.get("snapshot_minute") or ""))
 
         rows, meta = self.build_rows()
         payload = {
@@ -514,7 +542,6 @@ class AuctionCandidateService:
             summary_imported = import_auction_trend_summary_rows(self.mysql_config, summary_rows)
         else:
             delete_auction_candidates_for_date(self.mysql_config, str(meta["trade_date"]))
-            delete_auction_trend_summary_for_date(self.mysql_config, str(meta["trade_date"]))
             imported = 0
             summary_imported = 0
         return AuctionCandidateResult(

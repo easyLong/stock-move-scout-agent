@@ -1,5 +1,5 @@
 param(
-    [string]$WorkerTypes = "maintenance,cold,warm",
+    [string]$WorkerTypes = "hot,maintenance,cold,warm",
     [string]$WorkerId = "",
     [string]$MysqlUser = "root",
     [string]$MysqlPassword = $env:MYSQL_PWD,

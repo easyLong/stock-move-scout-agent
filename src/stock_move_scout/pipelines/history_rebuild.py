@@ -83,6 +83,7 @@ def rebuild_trade_date(config: MySqlConfig, trade_date: str, cfg: HistoryRebuild
                     timeout=cfg.kpl_featured_timeout,
                     pause=cfg.kpl_featured_pause,
                     limit=cfg.kpl_featured_limit,
+                    ma_mode=ma_mode,
                 ),
             ),
         )
@@ -110,6 +111,7 @@ def rebuild_trade_date(config: MySqlConfig, trade_date: str, cfg: HistoryRebuild
                     limit=cfg.kpl_plate_detail_limit,
                     timeout=cfg.kpl_plate_detail_timeout,
                     pause=cfg.kpl_plate_detail_pause,
+                    ma_mode=ma_mode,
                 ),
             ),
         )

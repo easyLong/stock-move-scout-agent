@@ -15,6 +15,7 @@ from stock_move_scout.research_pool import (
     DEFAULT_RESEARCH_POOL_GAIN_PERIOD_DAYS,
     DEFAULT_RESEARCH_POOL_GAIN_TOP,
     DEFAULT_RESEARCH_POOL_LIMIT_UP_DAYS,
+    normalize_research_pool_ma_mode,
 )
 
 
@@ -30,7 +31,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-dependency-check", action="store_true", help="Allow snapshot generation before post-close source tables are complete.")
     parser.add_argument("--include-kpl", action="store_true", help="Also materialize the KPL featured-plate leaderboard cache.")
     parser.add_argument("--kpl-only", action="store_true", help="Only materialize the KPL featured-plate leaderboard cache.")
+    parser.add_argument("--ma-mode", default="none", help="Research-pool MA mode, e.g. none or ma5_10_20_30_up.")
+    parser.add_argument("--pool-mode", default="", help="Alias for --ma-mode: bear or bull.")
+    parser.add_argument("--all-pool-modes", action="store_true", help="Materialize bull and bear snapshots; bear runs last to restore the default pool.")
     return parser.parse_args()
+
+
+def selected_ma_modes(args: argparse.Namespace) -> list[str]:
+    if args.all_pool_modes:
+        return [normalize_research_pool_ma_mode("bull"), normalize_research_pool_ma_mode("bear")]
+    return [normalize_research_pool_ma_mode(args.pool_mode or args.ma_mode)]
 
 
 def main() -> int:
@@ -42,9 +52,15 @@ def main() -> int:
     if not args.mysql_enabled:
         raise SystemExit("--mysql-enabled is required")
     config = mysql_config_from_args(args)
-    if args.kpl_only:
-        result = {"kpl": materialize_kpl_leaderboard_snapshot(config, str(args.trade_date))}
-    else:
+    modes = selected_ma_modes(args)
+    results: dict[str, object] = {}
+    for ma_mode in modes:
+        pool_key = "bull" if ma_mode != "none" else "bear"
+        if args.kpl_only:
+            results[pool_key] = {
+                "kpl": materialize_kpl_leaderboard_snapshot(config, str(args.trade_date), ma_mode=ma_mode)
+            }
+            continue
         result = materialize_leaderboard_snapshot(
             config,
             str(args.trade_date),
@@ -52,11 +68,14 @@ def main() -> int:
             gain_period_days=max(1, int(args.gain_period_days)),
             gain_top=max(1, int(args.gain_top)),
             force=bool(args.force),
-            rebuild_research_pool=not bool(args.skip_research_pool),
+            rebuild_research_pool=not bool(args.skip_research_pool) or bool(args.all_pool_modes),
             check_dependencies=not bool(args.skip_dependency_check),
+            ma_mode=ma_mode,
         )
         if args.include_kpl:
-            result["kpl"] = materialize_kpl_leaderboard_snapshot(config, str(args.trade_date))
+            result["kpl"] = materialize_kpl_leaderboard_snapshot(config, str(args.trade_date), ma_mode=ma_mode)
+        results[pool_key] = result
+    result = results if len(results) > 1 else next(iter(results.values()))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

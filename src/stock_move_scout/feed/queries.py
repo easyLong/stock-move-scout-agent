@@ -3,7 +3,21 @@ from __future__ import annotations
 from datetime import date
 
 from stock_move_scout.db import sql_string
-from stock_move_scout.research_pool import research_pool_snapshot_cte
+from stock_move_scout.research_pool import normalize_research_pool_ma_mode, research_pool_snapshot_cte
+
+
+def _pool_mode_from_ma_mode(ma_mode: str | None = "") -> str:
+    return "bull" if normalize_research_pool_ma_mode(ma_mode) != "none" else "bear"
+
+
+def _pool_mode_filter(alias: str = "", ma_mode: str | None = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    resolved_ma_mode = normalize_research_pool_ma_mode(ma_mode)
+    pool_mode = _pool_mode_from_ma_mode(resolved_ma_mode)
+    return (
+        f"{prefix}pool_mode={sql_string(pool_mode)} "
+        f"AND {prefix}research_pool_ma_mode={sql_string(resolved_ma_mode)}"
+    )
 
 
 def _json_source_fields(
@@ -85,18 +99,9 @@ def trade_dates_sql() -> str:
            OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
             OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))
         UNION ALL
-        SELECT trade_date AS day_value
+        SELECT DISTINCT trade_date AS day_value
         FROM stock_daily_bars
-        GROUP BY trade_date
-        HAVING COUNT(*) >= 1000
-        UNION ALL
-        SELECT DATE(scanned_at) AS day_value FROM scan_runs WHERE accepted=1
-        UNION ALL
-        SELECT DATE(ended_at) AS day_value FROM windows WHERE status='done' AND aggregate_count > 0
-        UNION ALL
-        SELECT trade_date AS day_value FROM research_pool_items
-        UNION ALL
-        SELECT trade_date AS day_value FROM stock_root_evidence_cache
+        WHERE trade_date <= CURDATE()
       ) days
       WHERE day_value IS NOT NULL
         AND day_value <= CURDATE()
@@ -984,9 +989,11 @@ def _replace_sql_block(sql: str, start_marker: str, end_marker: str, replacement
     return sql[:start] + replacement + sql[end:]
 
 
-def kpl_leaderboard_sql(trade_date: str | None = "") -> str:
+def kpl_leaderboard_sql(trade_date: str | None = "", *, ma_mode: str = "") -> str:
     day = sql_string(trade_date or date.today().strftime("%Y-%m-%d"))
     sql = leaderboard_sql(trade_date)
+    section_pool_filter = _pool_mode_filter(ma_mode=ma_mode)
+    section_pool_filter_k = _pool_mode_filter("k", ma_mode)
     kpl_theme_block = f"""
     kpl_plate_snapshot AS (
       SELECT trade_date, captured_at, source_table
@@ -1062,6 +1069,7 @@ def kpl_leaderboard_sql(trade_date: str | None = "") -> str:
       SELECT MAX(trade_date) AS trade_date
       FROM kpl_stock_featured_sections
       WHERE trade_date <= {day}
+        AND {section_pool_filter}
     ),
     kpl_primary_trade_days AS (
       SELECT trade_date
@@ -1149,6 +1157,7 @@ def kpl_leaderboard_sql(trade_date: str | None = "") -> str:
           ) AS rn
         FROM kpl_stock_sections_day sd
         JOIN kpl_stock_featured_sections k ON k.trade_date=sd.trade_date
+         AND {section_pool_filter_k}
         JOIN leader_research_pool rp ON rp.code=k.code
         LEFT JOIN kpl_plate_latest pl ON pl.theme_id=k.section_code
         WHERE COALESCE(k.section_name, '') <> ''
@@ -1384,8 +1393,10 @@ def kpl_leaderboard_sql(trade_date: str | None = "") -> str:
     return sql
 
 
-def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
+def kpl_plate_breakout_sql(trade_date: str | None = "", *, ma_mode: str = "") -> str:
     day = sql_string(trade_date or date.today().strftime("%Y-%m-%d"))
+    pool_filter = _pool_mode_filter(ma_mode=ma_mode)
+    pool_filter_p = _pool_mode_filter("p", ma_mode)
     return f"""
     SET SESSION group_concat_max_len=1048576;
 
@@ -1393,6 +1404,7 @@ def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
       SELECT trade_date, MAX(captured_at) AS captured_at
       FROM kpl_plate_featured_details
       WHERE trade_date=CAST({day} AS DATE)
+        AND {pool_filter}
         AND (
           COALESCE(JSON_LENGTH(sub_plates), 0) > 0
           OR
@@ -1406,6 +1418,8 @@ def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
       'breakout_data_trade_date', COALESCE((SELECT DATE_FORMAT(trade_date, '%Y-%m-%d') FROM latest_snapshot LIMIT 1), DATE_FORMAT(CAST({day} AS DATE), '%Y-%m-%d')),
       'breakout_captured_at', COALESCE((SELECT DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s') FROM latest_snapshot LIMIT 1), ''),
       'source', 'kpl_plate_featured_details',
+      'pool_mode', {sql_string(_pool_mode_from_ma_mode(ma_mode))},
+      'research_pool_ma_mode', {sql_string(normalize_research_pool_ma_mode(ma_mode))},
       'rule', '开盘啦精选强度Top5板块；爆发原因仅展示不参与筛选；取最强两个子板块；每个子板块只保留研究池交集股票，并按情绪Top3+趋势Top1展示',
       'plates', COALESCE((
         SELECT CAST(CONCAT(
@@ -1445,6 +1459,7 @@ def kpl_plate_breakout_sql(trade_date: str | None = "") -> str:
             ON s.trade_date=p.trade_date
            AND s.captured_at=p.captured_at
           WHERE p.trade_date=CAST({day} AS DATE)
+            AND {pool_filter_p}
             AND (
               COALESCE(JSON_LENGTH(p.sub_plates), 0) > 0
               OR
@@ -1536,10 +1551,11 @@ def status_sql(trade_date: str | None = "") -> str:
     """
 
 
-def market_width_latest_sql(trade_date: str | None = "") -> str:
+def market_width_latest_sql(trade_date: str | None = "", *, ma_mode: str = "") -> str:
     filters = [
         "((source='stock_daily_bars_close' AND total_count >= 4800) OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999') OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999')))"
     ]
+    filters.append(_pool_mode_filter(ma_mode=ma_mode))
     if trade_date:
         filters.append(f"trade_date={sql_string(trade_date)}")
     where_day = "WHERE " + " AND ".join(filters)
@@ -1550,6 +1566,8 @@ def market_width_latest_sql(trade_date: str | None = "") -> str:
       'captured_at', DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s'),
       'source', source,
       'market_scope', market_scope,
+      'pool_mode', pool_mode,
+      'research_pool_ma_mode', research_pool_ma_mode,
       'total_count', total_count,
       'up_count', up_count,
       'down_count', down_count,
@@ -1637,10 +1655,11 @@ def market_width_latest_sql(trade_date: str | None = "") -> str:
     """
 
 
-def market_width_series_sql(trade_date: str | None = "", limit: int = 240) -> str:
+def market_width_series_sql(trade_date: str | None = "", limit: int = 240, *, ma_mode: str = "") -> str:
     filters = []
     if trade_date:
         filters.append(f"trade_date={sql_string(trade_date)}")
+    filters.append(_pool_mode_filter(ma_mode=ma_mode))
     filters.append("((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999') OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))")
     where_clause = "WHERE " + " AND ".join(filters)
     return f"""
@@ -1648,6 +1667,8 @@ def market_width_series_sql(trade_date: str | None = "", limit: int = 240) -> st
     FROM (
       SELECT JSON_OBJECT(
         'snapshot_id', snapshot_id,
+        'pool_mode', pool_mode,
+        'research_pool_ma_mode', research_pool_ma_mode,
         'time', DATE_FORMAT(captured_at, '%H:%i'),
         'captured_at', DATE_FORMAT(captured_at, '%Y-%m-%d %H:%i:%s'),
         'up_count', up_count,
@@ -1740,8 +1761,9 @@ def market_width_series_sql(trade_date: str | None = "", limit: int = 240) -> st
     """
 
 
-def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5) -> str:
+def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5, *, ma_mode: str = "") -> str:
     day_filter = f"s.trade_date <= {sql_string(trade_date)}" if trade_date else "1=1"
+    pool_filter = _pool_mode_filter("s", ma_mode)
     return f"""
     SELECT COALESCE(JSON_ARRAYAGG(item), JSON_ARRAY())
     FROM (
@@ -1799,6 +1821,7 @@ def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5) -> st
               ) AS row_no
             FROM market_width_snapshots s
             WHERE {day_filter}
+              AND {pool_filter}
               AND (
                 (s.source='stock_daily_bars_close' AND s.total_count >= 4800)
                 OR (
@@ -1817,7 +1840,8 @@ def market_width_cycle_5d_sql(trade_date: str | None = "", limit: int = 5) -> st
     """
 
 
-def market_width_top50_sql(snapshot_id: str | None = "", trade_date: str | None = "") -> str:
+def market_width_top50_sql(snapshot_id: str | None = "", trade_date: str | None = "", *, ma_mode: str = "") -> str:
+    pool_filter = _pool_mode_filter(ma_mode=ma_mode)
     if snapshot_id:
         snapshot_filter = f"snapshot_id={sql_string(snapshot_id)}"
     elif trade_date:
@@ -1825,6 +1849,7 @@ def market_width_top50_sql(snapshot_id: str | None = "", trade_date: str | None 
           SELECT snapshot_id
           FROM market_width_snapshots
           WHERE trade_date={sql_string(trade_date)}
+            AND {pool_filter}
             AND (source='stock_daily_bars_close'
               OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
                 OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999')))
@@ -1832,12 +1857,13 @@ def market_width_top50_sql(snapshot_id: str | None = "", trade_date: str | None 
           LIMIT 1
         )"""
     else:
-        snapshot_filter = """snapshot_id=(
+        snapshot_filter = f"""snapshot_id=(
           SELECT snapshot_id
           FROM market_width_snapshots
-          WHERE source='stock_daily_bars_close'
+          WHERE {pool_filter}
+            AND (source='stock_daily_bars_close'
              OR ((TIME(captured_at) >= '09:30:00' AND TIME(captured_at) <= '11:30:00.999')
-              OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999'))
+              OR (TIME(captured_at) >= '13:00:00' AND TIME(captured_at) <= '15:00:00.999')))
           ORDER BY trade_date DESC, captured_at DESC
           LIMIT 1
         )"""
@@ -2976,15 +3002,6 @@ def intel_feed_sql(
       SELECT event_time, kind, kind_label, code, name, sort_rank, title, summary, detail, evidence_items, display_contract,
         intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
         evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
-      FROM auction_ranked
-      WHERE rn <= 3
-        {auction_detail_filter}
-
-      UNION ALL
-
-      SELECT event_time, kind, kind_label, code, name, sort_rank, title, summary, detail, evidence_items, display_contract,
-        intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
-        evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
       FROM scan_ranked
       WHERE rn <= {rank_limit}
         {scan_detail_filter}
@@ -2999,8 +3016,7 @@ def intel_feed_sql(
         {window_detail_filter}
 
       ORDER BY event_time DESC,
-        CASE kind WHEN 'scan' THEN 3 WHEN 'auction' THEN 2 WHEN 'window' THEN 1 ELSE 0 END DESC,
-        CASE kind WHEN 'auction' THEN sort_rank ELSE 0 END ASC,
+        CASE kind WHEN 'scan' THEN 2 WHEN 'window' THEN 1 ELSE 0 END DESC,
         score DESC
     ) feed;
     """
@@ -3359,14 +3375,6 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
       SELECT event_time, kind, kind_label, code, name, sort_rank, title, summary, detail, evidence_items, display_contract,
         intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
         evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
-      FROM auction_ranked
-      WHERE rn <= 3
-
-      UNION ALL
-
-      SELECT event_time, kind, kind_label, code, name, sort_rank, title, summary, detail, evidence_items, display_contract,
-        intraday_source_updated_at, judgement_updated_at, async_evidence_updated_at, period_rank_updated_at, lhb_updated_at,
-        evidence_layer_updated_at, latest_source_updated_at, score, change_pct, speed_pct, amount_yi, tags
       FROM scan_ranked
       WHERE rn <= 9999
 
@@ -3378,9 +3386,8 @@ def intel_feed_list_sql(trade_date: str | None = "", window_count: int = 240) ->
       FROM window_ranked
       WHERE rn <= 9999
 
-      ORDER BY CASE kind WHEN 'window' THEN 3 WHEN 'auction' THEN 2 WHEN 'scan' THEN 1 ELSE 0 END DESC,
+      ORDER BY CASE kind WHEN 'window' THEN 2 WHEN 'scan' THEN 1 ELSE 0 END DESC,
         CASE kind WHEN 'window' THEN sort_rank ELSE 0 END ASC,
-        CASE kind WHEN 'auction' THEN sort_rank ELSE 0 END ASC,
         event_time DESC,
         score DESC
     ) feed;

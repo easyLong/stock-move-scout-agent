@@ -408,6 +408,8 @@ CREATE TABLE IF NOT EXISTS market_width_snapshots (
   captured_at DATETIME(3) NOT NULL,
   source VARCHAR(64) NOT NULL DEFAULT 'akshare_stock_zh_a_spot',
   market_scope VARCHAR(32) NOT NULL DEFAULT 'cn_a_main',
+  pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear',
+  research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none',
   total_count INT NOT NULL DEFAULT 0,
   up_count INT NOT NULL DEFAULT 0,
   down_count INT NOT NULL DEFAULT 0,
@@ -448,6 +450,7 @@ CREATE TABLE IF NOT EXISTS market_width_snapshots (
   PRIMARY KEY (id),
   UNIQUE KEY uk_market_width_snapshot_id (snapshot_id),
   KEY idx_market_width_trade_time (trade_date, captured_at),
+  KEY idx_market_width_trade_time_mode (trade_date, pool_mode, research_pool_ma_mode, captured_at),
   KEY idx_market_width_created_at (created_at)
 ) ENGINE=InnoDB COMMENT='盘中市场概览快照：全市场、成交额Top50、研究池宽度统计';
 
@@ -1452,6 +1455,8 @@ CREATE TABLE IF NOT EXISTS research_pool_theme_members (
 CREATE TABLE IF NOT EXISTS kpl_stock_featured_sections (
   trade_date DATE NOT NULL,
   captured_at DATETIME(3) NOT NULL,
+  pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear',
+  research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none',
   code CHAR(6) NOT NULL,
   stock_name VARCHAR(64) NOT NULL DEFAULT '',
   pool_rank INT NOT NULL DEFAULT 0,
@@ -1468,10 +1473,10 @@ CREATE TABLE IF NOT EXISTS kpl_stock_featured_sections (
   raw_json JSON NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (trade_date, code, section_code),
-  KEY idx_kpl_featured_day_section (trade_date, section_name, section_rank),
-  KEY idx_kpl_featured_day_code (trade_date, code, section_rank),
-  KEY idx_kpl_featured_leader (trade_date, leader_code)
+  PRIMARY KEY (trade_date, pool_mode, research_pool_ma_mode, code, section_code),
+  KEY idx_kpl_featured_day_section (trade_date, pool_mode, research_pool_ma_mode, section_name, section_rank),
+  KEY idx_kpl_featured_day_code (trade_date, pool_mode, research_pool_ma_mode, code, section_rank),
+  KEY idx_kpl_featured_leader (trade_date, pool_mode, research_pool_ma_mode, leader_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   COMMENT='KPL featured sections returned by GetFeaturedSection for research-pool stocks.';
 
@@ -1503,6 +1508,8 @@ CREATE TABLE IF NOT EXISTS kpl_plate_featured_strengths (
 CREATE TABLE IF NOT EXISTS kpl_plate_featured_details (
   trade_date DATE NOT NULL,
   captured_at DATETIME(3) NOT NULL,
+  pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear',
+  research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none',
   source_snapshot_at DATETIME(3) NULL,
   row_rank INT NOT NULL DEFAULT 0,
   plate_code VARCHAR(32) NOT NULL,
@@ -1513,14 +1520,15 @@ CREATE TABLE IF NOT EXISTS kpl_plate_featured_details (
   reason_text TEXT NULL,
   sub_plates JSON NULL,
   top_research_pool_stocks JSON NULL,
+  top_research_pool_stocks_by_sub_plate JSON NULL,
   source VARCHAR(64) NOT NULL DEFAULT 'kpl_son_plate_info',
   raw_json JSON NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (trade_date, captured_at, plate_code),
-  KEY idx_kpl_plate_detail_latest (trade_date, captured_at, row_rank),
-  KEY idx_kpl_plate_detail_plate (plate_code, trade_date, captured_at),
-  KEY idx_kpl_plate_detail_snapshot (trade_date, source_snapshot_at, row_rank)
+  PRIMARY KEY (trade_date, pool_mode, research_pool_ma_mode, captured_at, plate_code),
+  KEY idx_kpl_plate_detail_latest (trade_date, pool_mode, research_pool_ma_mode, captured_at, row_rank),
+  KEY idx_kpl_plate_detail_plate (plate_code, trade_date, pool_mode, research_pool_ma_mode, captured_at),
+  KEY idx_kpl_plate_detail_snapshot (trade_date, pool_mode, research_pool_ma_mode, source_snapshot_at, row_rank)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   COMMENT='KPL featured plate detail rows from clicked plate page; stores explosion reason when returned and sub-plate breakdown.';
 
@@ -1655,15 +1663,17 @@ CREATE TABLE IF NOT EXISTS leaderboard_snapshots (
   gain_period_days INT NOT NULL DEFAULT 5,
   gain_top INT NOT NULL DEFAULT 30,
   source VARCHAR(64) NOT NULL DEFAULT 'post_close_confirm',
+  pool_mode VARCHAR(16) NOT NULL DEFAULT 'bear',
+  research_pool_ma_mode VARCHAR(64) NOT NULL DEFAULT 'none',
   leader_count INT NOT NULL DEFAULT 0,
   scope_count INT NOT NULL DEFAULT 0,
   source_hash CHAR(64) NOT NULL DEFAULT '',
   payload_json JSON NOT NULL,
   generated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (trade_date, rule, limit_up_days, gain_period_days, gain_top, source),
+  PRIMARY KEY (trade_date, rule, limit_up_days, gain_period_days, gain_top, source, pool_mode, research_pool_ma_mode),
   KEY idx_leaderboard_snapshots_generated (generated_at),
-  KEY idx_leaderboard_snapshots_source (source, trade_date)
+  KEY idx_leaderboard_snapshots_source (source, pool_mode, research_pool_ma_mode, trade_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   COMMENT='Post-close confirmed leaderboard payload snapshots.';
 
